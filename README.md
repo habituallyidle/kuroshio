@@ -1,11 +1,19 @@
-<img src="assets/logo.png" width="112" align="right" alt="Kuroshio logo: a dark river in pixel art">
+<p align="center">
+  <img src="assets/logo.png" width="160" alt="Kuroshio logo: a dark river in pixel art">
+</p>
 
-# Kuroshio 黒潮
+<h1 align="center">Kuroshio 黒潮</h1>
 
-An inference engine for [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) written for exactly
-one GPU: the RTX 5090. One binary, an OpenAI-compatible server, nothing to configure.
+<p align="center"><em>The "black current": the fast, warm stream off Japan's Pacific coast. Dark as ink, and full of squid.</em></p>
 
-*Kuroshio*, the "black current", is the fast warm stream off Japan's Pacific coast: dark as ink, and full of squid.
+**Run [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on your RTX 5090, faster than vLLM.**
+Kuroshio is an inference engine built for exactly one model and one GPU: hand-written CUDA kernels for Blackwell's
+tensor cores behind an OpenAI-compatible server. One binary, nothing to configure.
+
+- **21% faster** on one stream, **4x faster** at reading prompts
+- **240K tokens** of context, lossless, and follow-up turns answer in milliseconds
+- **Tool calls that parse**: 24 of 24 where the reference stack manages 9
+- **Shares the card**: takes memory as conversations grow, and survives another program filling the GPU
 
 ## Headline
 

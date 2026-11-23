@@ -597,17 +597,24 @@ fn scheduler(eng: &mut Engine, rx: mpsc::Receiver<Job>, cfg: Options, max_ctx: u
                     let (mut n, mut last) = (0usize, None);
                     if forcing {
                         n = k; // supplied tokens are taken as they are
-                    } else if sampled {
+                    } else if sampled && sampled_draft {
+                        // Drafts drawn from the drafter's distribution q: kept with probability min(1, p / q); a rejected
+                        // position takes the row's sample from the leftover distribution.
                         while n < k {
-                            // A most-likely-token draft d is kept with probability p(d); a sampled one with min(1, p(d) / q(d)).
                             let p = res[r0 + n].logp_excl.exp();
-                            let keep = if sampled_draft { (p / confs[n].max(1e-30)).min(1.0) } else { p };
-                            if (a.rng.uniform() as f32) < keep {
+                            if (a.rng.uniform() as f32) < (p / confs[n].max(1e-30)).min(1.0) {
                                 n += 1;
                             } else {
                                 last = Some(res[r0 + n].sample_excl);
                                 break;
                             }
+                        }
+                    } else if sampled {
+                        // A draft is kept exactly when it is the token the sampler draws at that position anyway. That
+                        // happens with probability p(draft), and it makes the output depend only on the seed: the
+                        // same text with any number of drafts verified, or none.
+                        while n < k && res[r0 + n].sample == drafts[n] {
+                            n += 1;
                         }
                     } else {
                         while n < k && res[r0 + n].greedy == drafts[n] {

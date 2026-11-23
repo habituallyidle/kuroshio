@@ -298,16 +298,21 @@ impl Engine {
         let qrows: Vec<i32> = (0..=k).map(|i| if sampled && i < k { i as i32 } else { -1 }).collect();
         let rows = self.forward_q(&toks, Some(&excl), None, Some(&qrows));
         let (mut n, mut last) = (0, None);
-        if self.temperature > 0.0 {
+        if self.temperature > 0.0 && sampled {
+            // Drafts drawn from the drafter's distribution q: kept with probability min(1, p / q).
             while n < k {
-                // A most-likely-token draft d is kept with probability p(d); a sampled one with min(1, p(d) / q(d)).
-                let keep = if sampled { (rows[n].logp_excl.exp() / confs[n].max(1e-30)).min(1.0) } else { rows[n].logp_excl.exp() };
-                if uniform() < keep {
+                if uniform() < (rows[n].logp_excl.exp() / confs[n].max(1e-30)).min(1.0) {
                     n += 1;
                 } else {
                     last = Some(rows[n].sample_excl);
                     break;
                 }
+            }
+        } else if self.temperature > 0.0 {
+            // A draft is kept exactly when it is the token the sampler draws at that position anyway (probability
+            // p(draft)), so the output depends only on the seed, not on how much was speculated.
+            while n < k && rows[n].sample == drafts[n] {
+                n += 1;
             }
         } else {
             while n < k && rows[n].greedy == drafts[n] {

@@ -16,6 +16,11 @@ echo "== conversations advanced together must match separate runs"
 $BIN interleave 3 1300 2>/dev/null | tail -1 | grep -q IDENTICAL || { echo "FAIL: interleaved conversations differ from separate runs"; exit 1; }; echo "ok"
 echo "== drafts computed for several conversations at once must match one at a time"
 $BIN draftcheck 42 2>/dev/null | tail -1 | grep -q IDENTICAL || { echo "FAIL: batched drafts differ"; exit 1; }; echo "ok"
+echo "== with a seed, sampling must give the same text with and without speculation"
+A=$(INK_TEMP=0.8 INK_SEED=7 INK_SPEC=0 $BIN gen "Tell a short story about a fox and a crow." none 160 2>/dev/null | md5sum)
+B=$(INK_TEMP=0.8 INK_SEED=7 INK_SPEC=7 INK_TAU=0 $BIN gen "Tell a short story about a fox and a crow." none 160 2>/dev/null | md5sum)
+C=$(INK_TEMP=0.8 INK_SEED=7 INK_SPEC=3 INK_TAU=0.5 $BIN gen "Tell a short story about a fox and a crow." none 160 2>/dev/null | md5sum)
+[ "$A" = "$B" ] && [ "$A" = "$C" ] || { echo "FAIL: seeded sampling depends on speculation"; exit 1; }; echo "ok"
 echo "== recorded step graphs must not grow without bound (each holds GPU memory)"
 INK_GRAPH_CAP=8 $BIN graphmem 2>/dev/null | tail -1 | awk '{ exit !($(NF-1) < 80) }' || { echo "FAIL: graph memory is not bounded"; exit 1; }; echo "ok"
 echo "== speculation must not change greedy output (short and long prompt, lossless and 8-bit modes)"
