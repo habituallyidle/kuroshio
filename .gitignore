@@ -1,0 +1,11 @@
+.toolchain/
+weights/
+target/
+build/
+# vLLM's implementation, copied out of its Docker image for study: third-party code, not ours to publish
+reference/
+*.log
+runs-*.log
+.refenv/
+serve.pid
+__pycache__/

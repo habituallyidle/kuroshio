@@ -1,0 +1,19 @@
+[package]
+name = "kuroshio"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "An inference engine for Inkling 2 Mini on one RTX 5090"
+
+[[bin]]
+name = "kuroshio"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+memmap2 = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+minijinja = { version = "2", features = ["json", "loop_controls", "preserve_order"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
