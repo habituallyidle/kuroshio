@@ -13,6 +13,7 @@ extern "C" {
     fn ink_draft_seq(e: *mut c_void, seq: c_int, anchor: c_int, l: c_int, ndraft: c_int, tokens: *mut c_int, conf: *mut f32, temp: f32, seed: u32, top: *mut f32) -> c_int;
     fn ink_nseq(e: *mut c_void) -> c_int;
     fn ink_max_rewind_run() -> c_int;
+    fn ink_headcheck(e: *mut c_void, out: *mut f64) -> c_int;
     fn ink_vram_free() -> usize;
     fn ink_draft_batch(e: *mut c_void, n: c_int, seqs: *const c_int, anchors: *const c_int, ls: *const c_int, ndraft: c_int, tokens: *mut c_int, conf: *mut f32, temps: *const f32, seeds: *const u32, top: *mut f32) -> c_int;
     fn ink_snapshot(e: *mut c_void, seq: c_int) -> c_int;
@@ -190,10 +191,20 @@ impl Engine {
         let (tp, sp) = if sampling.is_some() { (temps.as_ptr(), seeds.as_ptr()) } else { (std::ptr::null(), std::ptr::null()) };
         assert!(excl.map_or(true, |e| e.len() >= rows.len()) && sampling.map_or(true, |s| s.len() >= rows.len()) && qrows.map_or(true, |q| q.len() >= rows.len()));
         let qr = qrows.map(|q| q.as_ptr()).unwrap_or(std::ptr::null());
-        let rc = unsafe { ink_step(self.raw, rows.len() as c_int, toks.as_ptr(), seqs.as_ptr(), pos.as_ptr(), ex, res.as_mut_ptr(), std::ptr::null_mut(), head as c_int, tp, sp, qr) };
+        // Callers of this function read each row's argmax and sample only - unless a row verifies a sampled draft,
+        // which needs probabilities. Without such rows the engine may use its two-stage output head (2).
+        let want = if !head { 0 } else if qrows.map_or(true, |q| q[..rows.len()].iter().all(|&x| x < 0)) { 2 } else { 1 };
+        let rc = unsafe { ink_step(self.raw, rows.len() as c_int, toks.as_ptr(), seqs.as_ptr(), pos.as_ptr(), ex, res.as_mut_ptr(), std::ptr::null_mut(), want as c_int, tp, sp, qr) };
         assert_eq!(rc, 0, "the engine rejected a step: rows must be grouped by conversation, at consecutive positions, in range");
         self.last_batch = rows.len();
         res.chunks(4).map(|r| Row { greedy: r[0] as u32, sample: r[1] as u32, sample_excl: r[2] as u32, logp_excl: f32::from_bits(r[3] as u32) }).collect()
+    }
+
+    /// Re-run the output head for the last step's rows both ways and compare (developer check). Returns
+    /// [rows that differ, worst (error - bound), worst error / bound, candidate blocks, overflowed].
+    pub fn headcheck(&mut self) -> Option<[f64; 5]> {
+        let mut out = [0f64; 5];
+        (unsafe { ink_headcheck(self.raw, out.as_mut_ptr()) } == 0).then_some(out)
     }
 
     /// Position at which `forward` continues (after rows were fed with `step_rows`).

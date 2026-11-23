@@ -1367,6 +1367,17 @@ fn completion(mut stream: &TcpStream, body: &[u8], sh: &Shared, sse_started: &mu
 }
 
 pub fn serve(addr: &str, model_name: &str, chat: Chat, eng: &mut Engine, max_ctx: usize, cfg: Options) -> Result<()> {
+    // Every connection gets a thread, and glibc gives threads their own allocation arenas (up to eight per core).
+    // Memory freed by a request stays with the arena that served it, so the process creeps up by a few MiB whenever
+    // a large request lands in an arena that had not seen one. Two arenas bound that; allocation speed is not what
+    // limits a connection thread.
+    extern "C" {
+        fn mallopt(param: std::os::raw::c_int, value: std::os::raw::c_int) -> std::os::raw::c_int;
+    }
+    #[cfg(target_env = "gnu")]
+    unsafe {
+        mallopt(-8, 2); // M_ARENA_MAX
+    }
     let listener = TcpListener::bind(addr)?;
     let _ = CORS.set(cfg.cors.clone());
     eprintln!(

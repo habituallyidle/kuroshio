@@ -23,11 +23,11 @@ KEY, TITLE = "perf", "Throughput and latency"
 WARN_FRAC, FAIL_FRAC = 0.15, 0.35
 
 # Figures claimed in README.md ("Headline" table and the bullets under it).
-CLAIM_DECODE_1 = 242.0        # "Decode, 1 stream (tok/s)", temperature 0.6, 512-token completions
-CLAIM_DECODE_2_TOTAL = 378.0  # "Decode, 2 streams, total"
-CLAIM_DECODE_4_TOTAL = 495.0  # "Decode, 4 streams, total"
-CLAIM_PREFILL_4K = 3150.0     # "Prompt processing (tok/s, 4K prompt)"
-CLAIM_SPEC0 = 158.0           # "Without speculative decoding ... 158 tok/s (--spec 0)"
+CLAIM_DECODE_1 = 252.0        # "Decode, 1 stream (tok/s)", temperature 0.6, 512-token completions
+CLAIM_DECODE_2_TOTAL = 395.0  # "Decode, 2 streams, total"
+CLAIM_DECODE_4_TOTAL = 500.0  # "Decode, 4 streams, total"
+CLAIM_PREFILL_4K = 3250.0     # "Prompt processing (tok/s, 4K prompt)"
+CLAIM_SPEC0 = 166.0           # "Without speculative decoding ... 158 tok/s (--spec 0)"
 CLAIM_8BIT_DECODE = 260.0     # "With --kv 8 --dense 8: ... about 260 tok/s"
 CLAIM_8BIT_PREFILL = 3500.0   # "... 3,500 tok/s prompt processing"
 CLAIM_FOLLOWUP_TTFT_MS = 50.0  # "typically 30-50 ms to first token in an agent loop": the upper end is the claim checked

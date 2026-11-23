@@ -10,7 +10,7 @@
 Kuroshio is an inference engine built for exactly one model and one GPU: hand-written CUDA kernels for Blackwell's
 tensor cores behind an OpenAI-compatible server. One binary, nothing to configure.
 
-- **21% faster** on one stream, **5x faster** at reading prompts
+- **26% faster** on one stream, **5.6x faster** at reading prompts
 - **240K tokens** of context, lossless, and follow-up turns answer in milliseconds
 - **Tool calls that parse**: 24 of 24 where the reference stack manages 9
 - **Shares the card**: takes memory as conversations grow, and survives another program filling the GPU
@@ -23,10 +23,10 @@ Same RTX 5090, same harness, temperature 0.6, 512-token completions, median of 3
 
 | | Kuroshio | vLLM | |
 |---|---:|---:|---:|
-| Decode, 1 stream (tok/s) | **242** | 200 | +21% |
-| Decode, 2 streams, total | **378** | 310 | +22% |
-| Decode, 4 streams, total | **495** | 431 | +15% |
-| Prompt processing (tok/s, 4K prompt) | **3,150** | 580 | 5.4x |
+| Decode, 1 stream (tok/s) | **252** | 200 | +26% |
+| Decode, 2 streams, total | **395** | 310 | +27% |
+| Decode, 4 streams, total | **500** | 431 | +16% |
+| Prompt processing (tok/s, 4K prompt) | **3,250** | 580 | 5.6x |
 | Well-formed tool calls (24 variants of one agent prompt, temperature 0) | **24 / 24** | 9 / 24 | |
 
 - Context: about 240K tokens for one conversation, lossless. With `--kv 8 --dense 8` (the 8-bit cache vLLM was run
@@ -40,8 +40,8 @@ Same RTX 5090, same harness, temperature 0.6, 512-token completions, median of 3
 - When the model repeats text it has already seen (rewriting a file with a small change, quoting a document,
   echoing tool output), tokens are verified up to 31 at a time: 480-620 tok/s on one stream, 15-25% more than the
   drafter alone manages there (8-13% more in total with 4 streams rewriting code). Ordinary prose is unaffected.
-- Single-stream runs vary by about ±5% with the text being generated (233-253 over four runs).
-- Without speculative decoding the two are level: 158 tok/s (`--spec 0`) against vLLM's 163.
+- Single-stream runs vary by about ±5% with the text being generated (241-257 over four runs).
+- Without speculative decoding the two are level: 166 tok/s (`--spec 0`) against vLLM's 163.
 
 ## Install
 
@@ -172,6 +172,9 @@ Set `reasoning_effort` per request, as a name or a number from 0 to 0.99:
 - **Copied drafts.** Agents repeat themselves: a file rewritten with one line changed, a quoted passage. When the
   last tokens match an earlier part of the conversation, what followed there is verified as a draft, up to 31 tokens
   in one step, with no drafter pass.
+- **A two-stage output head.** Finding the next token means scoring all 200,058 of them against a 0.9 GB
+  matrix. An 8-bit pass with a proven error bound narrows that to a handful of candidates, which are then scored
+  exactly: the same token, at half the memory traffic.
 - **256 prompt tokens per step**, so that each expert's weights are read once for many tokens, and a **prefix cache**
   that keeps each conversation's state between requests.
 

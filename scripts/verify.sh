@@ -20,8 +20,12 @@ for pre in 2304,256 2400,200 1408,129; do INK_PRE=$pre $BIN argmaxes 2600 > "$TM
   cmp -s <(cut -d' ' -f$((n + 1))- "$TMP/p16.txt") <(cut -d' ' -f$((n + 1))- "$TMP/bx.txt") || { echo "FAIL: after prompt steps of ${pre##*,} rows the tokens differ"; exit 1; }; done
 # the matrix kernel that packs its inputs first (batches of 9+) must agree with the plain one
 INK_PACK_MIN=999 INK_CHUNK=100 $BIN argmaxes 1500 > "$TMP/bx.txt" 2>/dev/null; cmp -s "$TMP/b16.txt" "$TMP/bx.txt" || { echo "FAIL: plain and packed-input matrix kernels differ"; exit 1; }; echo "ok"
+echo "== the two-stage output head must pick what the full head picks (argmax and samples; error bound never exceeded)"
+$BIN headcheck 1200 2>/dev/null | tail -1 | grep -q IDENTICAL || { echo "FAIL: two-stage head differs from the full head"; $BIN headcheck 1200 2>/dev/null | tail -3; exit 1; }; echo "ok"
 echo "== conversations advanced together must match separate runs"
 $BIN interleave 3 1300 2>/dev/null | tail -1 | grep -q IDENTICAL || { echo "FAIL: interleaved conversations differ from separate runs"; exit 1; }; echo "ok"
+# the same when the two-stage head always gives up and the full head runs after it (its overflow path)
+INK_HEAD_FALLBACK=1 $BIN interleave 3 500 2>/dev/null | tail -1 | grep -q IDENTICAL || { echo "FAIL: the output head's fall-back path gives different tokens"; exit 1; }; echo "ok"
 echo "== drafts computed for several conversations at once must match one at a time"
 $BIN draftcheck 42 2>/dev/null | tail -1 | grep -q IDENTICAL || { echo "FAIL: batched drafts differ"; exit 1; }; echo "ok"
 echo "== with a seed, sampling must give the same text with and without speculation"

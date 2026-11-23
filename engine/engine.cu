@@ -1236,19 +1236,19 @@ __global__ void k_samp_part(const float* logits, const float* sparam, const int*
         int v = part * HEAD_SPAN + tid + 1024 * k; if (v >= V0) break;
         float z = l[v] * invT; a.sum += expf(z - zmax);                       // relative to the row maximum: the sum is >= 1, never underflows
         float gz = z + gumbel(seed, (uint32_t)rows[t].pos, (uint32_t)v);
-        if (gz > a.b1) { a.b1 = gz; a.i1 = v; }
+        if (gz > a.b1 || (gz == a.b1 && v < a.i1)) { a.b1 = gz; a.i1 = v; }      // equal scores: the lower token id, as for the argmax
         if (v == x) a.lx = z; else if (gz > a.b2) { a.b2 = gz; a.i2 = v; }
     }
     a.sum = wsum(a.sum);
     for (int o = 16; o > 0; o >>= 1) {
         float ob1 = __shfl_down_sync(0xffffffffu, a.b1, o), ob2 = __shfl_down_sync(0xffffffffu, a.b2, o), olx = __shfl_down_sync(0xffffffffu, a.lx, o);
         int oi1 = __shfl_down_sync(0xffffffffu, a.i1, o), oi2 = __shfl_down_sync(0xffffffffu, a.i2, o);
-        if (ob1 > a.b1) { a.b1 = ob1; a.i1 = oi1; } if (ob2 > a.b2) { a.b2 = ob2; a.i2 = oi2; } a.lx = fmaxf(a.lx, olx);
+        if (ob1 > a.b1 || (ob1 == a.b1 && oi1 < a.i1)) { a.b1 = ob1; a.i1 = oi1; } if (ob2 > a.b2) { a.b2 = ob2; a.i2 = oi2; } a.lx = fmaxf(a.lx, olx);
     }
     if ((tid & 31) == 0) sp[tid >> 5] = a;
     __syncthreads();
     if (tid == 0) {
-        for (int w = 1; w < 32; w++) { a.sum += sp[w].sum; if (sp[w].b1 > a.b1) { a.b1 = sp[w].b1; a.i1 = sp[w].i1; } if (sp[w].b2 > a.b2) { a.b2 = sp[w].b2; a.i2 = sp[w].i2; } a.lx = fmaxf(a.lx, sp[w].lx); }
+        for (int w = 1; w < 32; w++) { a.sum += sp[w].sum; if (sp[w].b1 > a.b1 || (sp[w].b1 == a.b1 && sp[w].i1 < a.i1)) { a.b1 = sp[w].b1; a.i1 = sp[w].i1; } if (sp[w].b2 > a.b2) { a.b2 = sp[w].b2; a.i2 = sp[w].i2; } a.lx = fmaxf(a.lx, sp[w].lx); }
         parts[t * HEAD_PARTS + part] = a;
     }
 }
@@ -1256,12 +1256,12 @@ __global__ void k_samp_final(const SampPart* parts, const float* sparam, const i
     int t = blockIdx.x, lane = threadIdx.x; float invT = sparam[t * 2];
     if (invT <= 0.0f) { if (lane == 0) { res[t * 4] = arg[t]; res[t * 4 + 1] = arg[t]; res[t * 4 + 2] = arg[t]; res[t * 4 + 3] = 0; } return; }
     SampPart a; a.sum = 0; a.b1 = a.b2 = -FLT_MAX; a.i1 = a.i2 = 0x7fffffff; a.lx = -FLT_MAX;
-    for (int k = lane; k < HEAD_PARTS; k += 32) { SampPart q = parts[t * HEAD_PARTS + k]; a.sum += q.sum; if (q.b1 > a.b1) { a.b1 = q.b1; a.i1 = q.i1; } if (q.b2 > a.b2) { a.b2 = q.b2; a.i2 = q.i2; } a.lx = fmaxf(a.lx, q.lx); }
+    for (int k = lane; k < HEAD_PARTS; k += 32) { SampPart q = parts[t * HEAD_PARTS + k]; a.sum += q.sum; if (q.b1 > a.b1 || (q.b1 == a.b1 && q.i1 < a.i1)) { a.b1 = q.b1; a.i1 = q.i1; } if (q.b2 > a.b2) { a.b2 = q.b2; a.i2 = q.i2; } a.lx = fmaxf(a.lx, q.lx); }
     a.sum = wsum(a.sum);
     for (int o = 16; o > 0; o >>= 1) {
         float ob1 = __shfl_down_sync(0xffffffffu, a.b1, o), ob2 = __shfl_down_sync(0xffffffffu, a.b2, o), olx = __shfl_down_sync(0xffffffffu, a.lx, o);
         int oi1 = __shfl_down_sync(0xffffffffu, a.i1, o), oi2 = __shfl_down_sync(0xffffffffu, a.i2, o);
-        if (ob1 > a.b1) { a.b1 = ob1; a.i1 = oi1; } if (ob2 > a.b2) { a.b2 = ob2; a.i2 = oi2; } a.lx = fmaxf(a.lx, olx);
+        if (ob1 > a.b1 || (ob1 == a.b1 && oi1 < a.i1)) { a.b1 = ob1; a.i1 = oi1; } if (ob2 > a.b2) { a.b2 = ob2; a.i2 = oi2; } a.lx = fmaxf(a.lx, olx);
     }
     if (lane == 0) {
         float logp = a.lx == -FLT_MAX ? -FLT_MAX : fminf(a.lx - (rowmax[t] * invT + logf(a.sum)), 0.0f);
@@ -1269,6 +1269,166 @@ __global__ void k_samp_final(const SampPart* parts, const float* sparam, const i
         rowz[t] = a.sum;
     }
 }
+// =====================================================================================================
+// Two-stage output head. The full head reads the 922 MB unembedding matrix for every step (0.57 ms); only the
+// winner of each row is wanted: the largest logit, or with sampling the largest of logit / T + Gumbel noise.
+//   1. Approximate logits from the 8-bit copy of the matrix (the one the drafter uses) and 8-bit activations: 0.29 ms.
+//   2. For every token a bound on |approximate - exact|: with u the exact row, u~ the 8-bit row, h the exact and h~
+//      the 8-bit activation, |u.h - u~.h~| <= |u - u~| |h~| + |u| |h - h~| (Cauchy-Schwarz twice), plus an
+//      allowance for rounding in the two sums. |u - u~| and |u| are stored per token at load; the rest is per row.
+//   3. The exact logit of the approximate winner. No token whose approximate logit plus its bound stays below
+//      that can win; the others are candidates, a handful as a rule.
+//   4. Exact logits of the candidates' 16-row blocks, by the same operations in the same order as the full
+//      product (k_gemm_rows), and the winner among them. The result is the full head's, bit for bit.
+// More candidates than CAND_CAP blocks: the step reports it and the full head runs after all.
+// Not for rows that need a probability (a sampled draft's acceptance, the nll command): those take the full head.
+// =====================================================================================================
+const int FAST_T = 32, CAND_CAP = 4096;                   // most rows of a step using this head; most candidate blocks
+const float HEAD_ROUNDING = 5e-4f, HEAD_MARGIN = 1e-4f;   // rounding allowance (x |u| |h|); slack on the thresholds, in capped logits
+// Per row of an MXFP8 matrix: |row - quantised row| and |row|, rounded up. One warp per row.
+__global__ void k_fp8_rowerr(const uint16_t* src, const uint8_t* code, const uint8_t* scale, size_t R, int C, float* err, float* nrm) {
+    size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5); int lane = threadIdx.x & 31; if (row >= R) return;
+    double se = 0, sn = 0;
+    for (int c = lane; c < C; c += 32) {
+        float u = bf16w(src[row * C + c]), q = e4m3(code[row * C + c]) * scalbnf(1.0f, (int)scale[row * (C / 32) + c / 32] - 127);
+        double dl = (double)u - (double)q; se += dl * dl; sn += (double)u * (double)u;
+    }
+    for (int o = 16; o > 0; o >>= 1) { se += __shfl_down_sync(0xffffffffu, se, o); sn += __shfl_down_sync(0xffffffffu, sn, o); }
+    if (lane == 0) { err[row] = (float)(sqrt(se) * 1.0001) + 1e-20f; nrm[row] = (float)(sqrt(sn) * 1.0001); }
+}
+// Per row of the step: hb[t] = { |h~|, |h - h~| + HEAD_ROUNDING |h| } from the activations and their 8-bit codes.
+__global__ void k_hbound(const float* h, const uint8_t* code, const uint8_t* scale, float* hb) {
+    __shared__ double sd[8][3];
+    int t = blockIdx.x, tid = threadIdx.x; double a[3] = {0, 0, 0};                          // sums of h~^2, (h - h~)^2, h^2
+    for (int c = tid; c < D; c += 256) {
+        float x = h[(size_t)t * D + c], q = e4m3(code[(size_t)t * D + c]) * scalbnf(1.0f, (int)scale[(size_t)t * (D / 32) + c / 32] - 127);
+        double dl = (double)x - (double)q; a[0] += (double)q * q; a[1] += dl * dl; a[2] += (double)x * x;
+    }
+    for (int k = 0; k < 3; k++) for (int o = 16; o > 0; o >>= 1) a[k] += __shfl_down_sync(0xffffffffu, a[k], o);
+    if ((tid & 31) == 0) for (int k = 0; k < 3; k++) sd[tid >> 5][k] = a[k];
+    __syncthreads();
+    if (tid == 0) {
+        for (int w = 1; w < 8; w++) for (int k = 0; k < 3; k++) a[k] += sd[w][k];
+        hb[t * 2] = (float)(sqrt(a[0]) * 1.0001); hb[t * 2 + 1] = (float)((sqrt(a[1]) + (double)HEAD_ROUNDING * sqrt(a[2])) * 1.0001);
+    }
+}
+// The approximate winners of each row: by logit, and for a sampling row by capped logit / T + noise. Any token
+// would do as the source of the threshold; the approximate winner gives the tightest one.
+__global__ void k_apx_part(const float* apx, const float* sparam, const Row* rows, float* pv, int* pi) {
+    __shared__ float sv[32][2]; __shared__ int si[32][2];
+    int t = blockIdx.y, part = blockIdx.x, tid = threadIdx.x; const float* l = apx + (size_t)t * V0;
+    const float invT = sparam[t * 2]; const uint32_t seed = __float_as_uint(sparam[t * 2 + 1]), pos = (uint32_t)rows[t].pos;
+    float b[2] = {-FLT_MAX, -FLT_MAX}; int bi[2] = {0x7fffffff, 0x7fffffff};
+    for (int k = 0; k < 4; k++) {
+        int v = part * HEAD_SPAN + tid + 1024 * k; if (v >= V0) break;
+        float a = l[v]; if (a > b[0]) { b[0] = a; bi[0] = v; }
+        if (invT > 0.0f) { float z = 30.0f * tanhf(a * (1.0f / 30.0f)) * invT + gumbel(seed, pos, (uint32_t)v); if (z > b[1]) { b[1] = z; bi[1] = v; } }
+    }
+    for (int k = 0; k < 2; k++) for (int o = 16; o > 0; o >>= 1) { float ob = __shfl_down_sync(0xffffffffu, b[k], o); int oi = __shfl_down_sync(0xffffffffu, bi[k], o); if (ob > b[k] || (ob == b[k] && oi < bi[k])) { b[k] = ob; bi[k] = oi; } }
+    if ((tid & 31) == 0) for (int k = 0; k < 2; k++) { sv[tid >> 5][k] = b[k]; si[tid >> 5][k] = bi[k]; }
+    __syncthreads();
+    if (tid == 0) for (int k = 0; k < 2; k++) {
+        for (int w = 1; w < 32; w++) if (sv[w][k] > b[k] || (sv[w][k] == b[k] && si[w][k] < bi[k])) { b[k] = sv[w][k]; bi[k] = si[w][k]; }
+        pv[(t * HEAD_PARTS + part) * 2 + k] = b[k]; pi[(t * HEAD_PARTS + part) * 2 + k] = bi[k];
+    }
+}
+// win[2t], win[2t+1]: the two approximate winners of row t (the same token twice for a greedy row); list1: their blocks.
+__global__ void k_apx_final(const float* pv, const int* pi, const float* sparam, int* win, int* list1) {
+    int t = blockIdx.x, lane = threadIdx.x; float b[2] = {-FLT_MAX, -FLT_MAX}; int bi[2] = {0x7fffffff, 0x7fffffff};
+    for (int p = lane; p < HEAD_PARTS; p += 32) for (int k = 0; k < 2; k++) { float x = pv[(t * HEAD_PARTS + p) * 2 + k]; int i = pi[(t * HEAD_PARTS + p) * 2 + k]; if (x > b[k] || (x == b[k] && i < bi[k])) { b[k] = x; bi[k] = i; } }
+    for (int k = 0; k < 2; k++) for (int o = 16; o > 0; o >>= 1) { float ob = __shfl_down_sync(0xffffffffu, b[k], o); int oi = __shfl_down_sync(0xffffffffu, bi[k], o); if (ob > b[k] || (ob == b[k] && oi < bi[k])) { b[k] = ob; bi[k] = oi; } }
+    if (lane == 0) {
+        int g = bi[0], sm = sparam[t * 2] > 0.0f ? bi[1] : bi[0];
+        if ((unsigned)g >= (unsigned)V0) g = -1;        // no winner: every logit NaN. k_head_thr then lets nothing through, as the full head finds nothing
+        if ((unsigned)sm >= (unsigned)V0) sm = -1;
+        win[t * 2] = g; win[t * 2 + 1] = sm; list1[t * 2] = max(g, 0) >> 4; list1[t * 2 + 1] = max(sm, 0) >> 4;
+    }
+}
+// Thresholds from the exact logits of the approximate winners (ex1: [2 T blocks][16 rows][FAST_T]), in the units the
+// full head compares in: thr[2t] a capped logit, thr[2t+1] a sampling score (FLT_MAX for a greedy row). Both sit a
+// little below the winner's own value, for the last-digit wobble of tanh. Also empties the candidate list.
+__global__ void k_head_thr(const float* ex1, const int* win, const float* sparam, const Row* rows, float* thr, int* count) {
+    int t = blockIdx.x; if (threadIdx.x) return;
+    if (t == 0) *count = 0;
+    const float invT = sparam[t * 2]; const int g = win[t * 2], sm = win[t * 2 + 1];
+    thr[t * 2] = g < 0 ? -FLT_MAX : 30.0f * tanhf(ex1[((size_t)(t * 2) * 16 + (g & 15)) * FAST_T + t] * (1.0f / 30.0f)) - HEAD_MARGIN;
+    if (invT > 0.0f && sm >= 0) {
+        float e = ex1[((size_t)(t * 2 + 1) * 16 + (sm & 15)) * FAST_T + t];
+        thr[t * 2 + 1] = 30.0f * tanhf(e * (1.0f / 30.0f)) * invT + gumbel(__float_as_uint(sparam[t * 2 + 1]), (uint32_t)rows[t].pos, (uint32_t)sm) - HEAD_MARGIN * invT - 1e-4f;
+    } else thr[t * 2 + 1] = invT > 0.0f ? -FLT_MAX : FLT_MAX;
+}
+// Candidates: tokens whose approximate logit plus bound reaches a threshold. Their 16-row blocks go on the list
+// (a block can be listed more than once: harmless).
+__global__ void k_head_cand(const float* apx, const float* eu, const float* un, const float* hb, const float* thr, const float* sparam, const Row* rows, int* list, int* count) {
+    int t = blockIdx.y, part = blockIdx.x, tid = threadIdx.x; const float* l = apx + (size_t)t * V0;
+    const float invT = sparam[t * 2], nq = hb[t * 2], ne = hb[t * 2 + 1], tg = thr[t * 2], ts = thr[t * 2 + 1];
+    const uint32_t seed = __float_as_uint(sparam[t * 2 + 1]), pos = (uint32_t)rows[t].pos;
+    for (int k = 0; k < 4; k++) {
+        int v = part * HEAD_SPAN + tid + 1024 * k; if (v >= V0) break;
+        float up = 30.0f * tanhf((l[v] + (eu[v] * nq + un[v] * ne + 1e-3f)) * (1.0f / 30.0f));   // the most its capped logit can be
+        bool c = up >= tg;
+        if (!c && invT > 0.0f) c = up * invT + gumbel(seed, pos, (uint32_t)v) >= ts;
+        if (c) { int i = atomicAdd(count, 1); if (i < CAND_CAP) list[i] = v >> 4; }
+    }
+}
+// The rows of the 16-row blocks list[0..n) of a dense bf16 matrix times T activation rows: k_gemm_bf16's
+// operations in k_gemm_bf16's order, so each value is the full product's bit for bit. out: [n][16][ostride].
+template <int NCG> __global__ void k_gemm_rows(const uint16_t* W, int C, int T, const float* xb, int xstride, const int* list, const int* count, int nmax, float* out, int ostride) {
+    __shared__ float sh[16][32][4];
+    int n = count ? min(*count, nmax) : nmax; if ((int)blockIdx.x >= n) return;
+    int blk = list[blockIdx.x], lane = threadIdx.x & 31, warp = threadIdx.x >> 5, q = lane & 3, g = lane >> 2;
+    int KB = C / 16, kseg = KB / 16, kbase = warp * kseg;
+    const uint4* wt = (const uint4*)((const uint8_t*)W + ((size_t)blk * KB) * 512 + lane * 16);
+    float d[NCG][4]; for (int cg = 0; cg < NCG; cg++) for (int i = 0; i < 4; i++) d[cg][i] = 0;
+    for (int it = 0; it < kseg; it += 3) {
+        uint4 w[3]; uint32_t b0[NCG][3], b1[NCG][3];
+        for (int u = 0; u < 3; u++) {
+            int kb = kbase + it + u, k0 = kb * 16; bool live = it + u < kseg;
+            w[u] = live ? wt[(size_t)kb * 32] : make_uint4(0, 0, 0, 0);
+            for (int cg = 0; cg < NCG; cg++) {
+                int t = cg * 8 + g; b0[cg][u] = b1[cg][u] = 0;
+                if (t < T && live) { const float2* x = (const float2*)(xb + (size_t)t * xstride + k0 + 2 * q); float2 lo = x[0], hi = x[4]; b0[cg][u] = pack_bf16(lo.x, lo.y); b1[cg][u] = pack_bf16(hi.x, hi.y); }
+            }
+        }
+        for (int u = 0; u < 3; u++) for (int cg = 0; cg < NCG; cg++) mma_bf16(d[cg], w[u].x, w[u].y, w[u].z, w[u].w, b0[cg][u], b1[cg][u]);
+    }
+    for (int cg = 0; cg < NCG; cg++) {
+        for (int i = 0; i < 4; i++) sh[warp][lane][i] = d[cg][i];
+        __syncthreads();
+        if (warp == 0) for (int i = 0; i < 4; i++) {
+            int t = cg * 8 + 2 * q + (i & 1), r = g + (i >> 1) * 8;
+            if (t >= T) continue;
+            float v = 0; for (int w2 = 0; w2 < 16; w2++) v += sh[w2][lane][i];
+            out[((size_t)blockIdx.x * 16 + r) * ostride + t] = v;
+        }
+        __syncthreads();
+    }
+}
+// The winners among the candidates, from their exact logits (ex2: [blocks][16][FAST_T]), by the full head's rules:
+// soft cap, ties to the lower token id. res[4t..] = { argmax, sample, sample, 0 }; res[4T] = 1 if the list
+// overflowed (then nothing here is valid), res[4T+1] = candidate blocks listed.
+__global__ void k_head_pick(const float* ex2, const int* list, const int* count, const float* sparam, const Row* rows, int* res, int T) {
+    __shared__ float sv[32][2]; __shared__ int si[32][2];
+    int t = blockIdx.x, tid = threadIdx.x, n = min(*count, CAND_CAP) * 16;
+    const float invT = sparam[t * 2]; const uint32_t seed = __float_as_uint(sparam[t * 2 + 1]), pos = (uint32_t)rows[t].pos;
+    float b[2] = {-FLT_MAX, -FLT_MAX}; int bi[2] = {0x7fffffff, 0x7fffffff};
+    for (int e = tid; e < n; e += 1024) {
+        int v = list[e >> 4] * 16 + (e & 15); if (v >= V0) continue;
+        float x = 30.0f * tanhf(ex2[(size_t)e * FAST_T + t] * (1.0f / 30.0f));
+        if (x > b[0] || (x == b[0] && v < bi[0])) { b[0] = x; bi[0] = v; }
+        if (invT > 0.0f) { float z = x * invT + gumbel(seed, pos, (uint32_t)v); if (z > b[1] || (z == b[1] && v < bi[1])) { b[1] = z; bi[1] = v; } }
+    }
+    for (int k = 0; k < 2; k++) for (int o = 16; o > 0; o >>= 1) { float ob = __shfl_down_sync(0xffffffffu, b[k], o); int oi = __shfl_down_sync(0xffffffffu, bi[k], o); if (ob > b[k] || (ob == b[k] && oi < bi[k])) { b[k] = ob; bi[k] = oi; } }
+    if ((tid & 31) == 0) for (int k = 0; k < 2; k++) { sv[tid >> 5][k] = b[k]; si[tid >> 5][k] = bi[k]; }
+    __syncthreads();
+    if (tid == 0) {
+        for (int k = 0; k < 2; k++) for (int w = 1; w < 32; w++) if (sv[w][k] > b[k] || (sv[w][k] == b[k] && si[w][k] < bi[k])) { b[k] = sv[w][k]; bi[k] = si[w][k]; }
+        int sm = invT > 0.0f ? bi[1] : bi[0];
+        res[t * 4] = bi[0]; res[t * 4 + 1] = sm; res[t * 4 + 2] = sm; res[t * 4 + 3] = 0;
+        if (t == 0) { res[T * 4] = *count > CAND_CAP; res[T * 4 + 1] = *count; }
+    }
+}
+
 // A row that verifies a *sampled* draft (qrow[t] >= 0: index of the draft's logits in qlog) needs, in case the draft is
 // rejected, a token drawn from the leftover distribution max(0, p - q) / Z. Gumbel-max over log(p - q) does that.
 // The result replaces the row's "sample excluding the draft", which is the same thing for a most-likely-token draft.
@@ -1516,7 +1676,11 @@ struct Engine {
     } dr;
     float* feats;                                        // DSpark taps of the last forward: [4 taps][TMAX][D]
     uint8_t *xcode, *xscale, *acode, *ascale, *xcode8, *acode8;
-    cudaGraphExec_t graph[TMAX + 1][24][2] = {};             // per batch size, context bucket (1024 << b), and with/without the output head
+    cudaGraphExec_t graph[TMAX + 1][24][3] = {};             // per batch size, context bucket (1024 << b), and output head: none / full / two-stage
+    // two-stage head: per token |u - u~| and |u|; per row bounds, approximate winners, thresholds; candidate blocks and their exact logits
+    float *h_eu = nullptr, *h_un = nullptr, *h_hb = nullptr, *h_pv = nullptr, *h_thr = nullptr, *h_ex1 = nullptr, *h_ex2 = nullptr;
+    int *h_pi = nullptr, *h_win = nullptr, *h_l1 = nullptr, *h_l2 = nullptr, *h_cnt = nullptr;
+    bool head2 = false; long head2_fallbacks = 0;
     float* trace = nullptr;                              // host [48][4][D], filled for the last token of a call
 };
 
@@ -1602,10 +1766,12 @@ void launch_mix(int T, const MixArgs& a) {
 #undef C4_
 }
 
-Fp8Mat to_fp8(const uint16_t* src, size_t R, int C) {
+// err / nrm (optional, [R]): per row, the size of the quantisation error and of the row (see the two-stage head).
+Fp8Mat to_fp8(const uint16_t* src, size_t R, int C, float* err = nullptr, float* nrm = nullptr) {
     size_t R16 = ((R + 15) / 16) * 16, nb = C / 32; uint8_t *code, *scale;
     CK(cudaMalloc(&code, R16 * C)); CK(cudaMalloc(&scale, R16 * nb));
     k_to_mxfp8<<<(unsigned)((R16 * nb + 255) / 256), 256>>>(src, R, C, code, scale);
+    if (err) k_fp8_rowerr<<<(unsigned)((R + 7) / 8), 256>>>(src, code, scale, R, C, err, nrm);
     CK(cudaDeviceSynchronize());
     Fp8Mat m; m.R = (int)R; m.C = C; m.w = swizzle(code, R16, C); m.s = swizzle_scale(scale, R16, (int)nb, 1);
     return m;
@@ -1931,7 +2097,12 @@ void ink_finalize(void* ep) {
             CK(cudaMemcpy(dx, hb.data(), D * 4, cudaMemcpyHostToDevice));
             d.bvec = dalloc(V0); gemv(V0, 1, e->unembed, D, 1, dx, dx, dx, D, V0, V0, d.bvec, V0, 0);
             CK(cudaStreamSynchronize(g_stream)); CK(cudaFree(dx)); CK(cudaFree(tmp));
-            if (d.fp8) { d.f_M = to_fp8(M, V0, MR); d.f_un = to_fp8(e->unembed_rm, V0, D); }
+            if (d.fp8) {
+                d.f_M = to_fp8(M, V0, MR);
+                e->h_eu = dalloc(V0); e->h_un = dalloc(V0);
+                d.f_un = to_fp8(e->unembed_rm, V0, D, e->h_eu, e->h_un);
+                e->head2 = !e->fp8_head && getenv("INK_HEAD_FULL") == nullptr;   // the two-stage head needs this 8-bit copy and the exact matrix
+            }
             d.M = (uint16_t*)swizzle(M, V0, MR * 2);
         }
         const size_t T2 = TMAX;
@@ -1982,7 +2153,11 @@ void ink_finalize(void* ep) {
     e->xamax = dalloc(T); e->gu = dalloc(T * TOPK * D); e->act = dalloc(T * TOPK * I2); e->aq = dalloc(T * TOPK * I2); e->aamax = dalloc(T * TOPK);
     e->down = dalloc(T * TOPK * D); e->moe_out = dalloc(T * D); e->y = dalloc(T * D); e->out = dalloc(T * D); e->logits = dalloc(HMAX * (size_t)V0);
     CK(cudaMalloc(&e->tok, T * 4)); CK(cudaMalloc(&e->ids, T * TOPK * 4)); CK(cudaMalloc(&e->arg, T * 4)); CK(cudaMalloc(&e->rows, T * sizeof(Row))); e->feats = dalloc(4 * T * D); e->head_v = dalloc(T * HEAD_PARTS); e->rowmax = dalloc(T); CK(cudaMalloc(&e->head_i, T * HEAD_PARTS * 4));
-    CK(cudaMalloc(&e->sparts, T * HEAD_PARTS * sizeof(SampPart))); e->sparam = dalloc(2 * T); CK(cudaMalloc(&e->excl, 2 * TMAX * 4)); e->qrow = e->excl + TMAX; e->rowz = dalloc(T); CK(cudaMalloc(&e->rparts, (size_t)T * HEAD_PARTS * sizeof(ResPart))); CK(cudaMalloc(&e->sres, T * 16));
+    CK(cudaMalloc(&e->sparts, T * HEAD_PARTS * sizeof(SampPart))); e->sparam = dalloc(2 * T); CK(cudaMalloc(&e->excl, 2 * TMAX * 4)); e->qrow = e->excl + TMAX; e->rowz = dalloc(T); CK(cudaMalloc(&e->rparts, (size_t)T * HEAD_PARTS * sizeof(ResPart))); CK(cudaMalloc(&e->sres, T * 16 + 8));
+    e->h_hb = dalloc(2 * FAST_T); e->h_pv = dalloc((size_t)FAST_T * HEAD_PARTS * 2); e->h_thr = dalloc(2 * FAST_T);
+    e->h_ex1 = dalloc((size_t)2 * FAST_T * 16 * FAST_T); e->h_ex2 = dalloc((size_t)CAND_CAP * 16 * FAST_T);
+    CK(cudaMalloc(&e->h_pi, (size_t)FAST_T * HEAD_PARTS * 2 * 4)); CK(cudaMalloc(&e->h_win, 2 * FAST_T * 4)); CK(cudaMalloc(&e->h_l1, 2 * FAST_T * 4));
+    CK(cudaMalloc(&e->h_l2, CAND_CAP * 4)); CK(cudaMalloc(&e->h_cnt, 4)); CK(cudaMemset(e->h_cnt, 0, 4)); CK(cudaMemset(e->h_l2, 0, CAND_CAP * 4));
     CK(cudaMalloc(&e->tasks, T * TOPK * TASKW * 4)); CK(cudaMalloc(&e->ntasks, 4));
     CK(cudaMalloc(&e->xcode, T * (D / 2))); CK(cudaMalloc(&e->xscale, T * (D / 16)));
     CK(cudaMalloc(&e->xcode8, T * D)); CK(cudaMalloc(&e->acode8, T * TOPK * I2));
@@ -2004,7 +2179,47 @@ void ink_set_trace(void* ep, float* host_buf) { ((Engine*)ep)->trace = host_buf;
 // The kernel sequence for T tokens. It depends only on T (not on the position or the tokens, which the
 // kernels read from device memory), so it can be captured once as a CUDA graph and replayed.
 // v2: fused kernels (about half as many launches per token as v1).
-static void forward_body(Engine* e, int T, int gchunks, bool head) {
+// The output head for the last step's rows (e->out), in full: every logit, the soft cap, argmax, sampling.
+static void head_full(Engine* e, int T) {
+    if (e->fp8_head) {                                   // lossy option: 8-bit output head
+        k_quant8f<<<dim3((D) / 128, T), 32, 0, g_stream>>>(e->out, D, e->tq, e->ts, D);
+        gemm_fp8(e->f_head, D, T, e->tq, e->ts, e->logits, 0, V0);
+    } else gemv(V0, T, e->unembed, D, T, e->out, e->out, e->out, D, V0, V0, e->logits, V0, 0);
+    prof("unembed");
+    k_head_part<<<dim3(HEAD_PARTS, T), 1024, 0, g_stream>>>(e->logits, e->head_v, e->head_i);
+    k_head_final<<<T, 32, 0, g_stream>>>(e->head_v, e->head_i, e->arg, e->rowmax);
+    k_samp_part<<<dim3(HEAD_PARTS, T), 1024, 0, g_stream>>>(e->logits, e->sparam, e->excl, e->rows, e->rowmax, e->sparts);
+    k_samp_final<<<T, 32, 0, g_stream>>>(e->sparts, e->sparam, e->arg, e->rowmax, e->sres, e->rowz);
+    if (e->dr.on) {
+        k_resid_part<<<dim3(HEAD_PARTS, T), 1024, 0, g_stream>>>(e->logits, e->sparam, e->qrow, e->rows, e->rowmax, e->rowz, e->dr.qlog, e->dr.qz, e->dr.qit, e->rparts);
+        k_resid_final<<<T, 32, 0, g_stream>>>(e->rparts, e->qrow, e->sparam, e->sres);
+    }
+}
+static void gemm_rows(const uint16_t* W, int C, int T, const float* x, int xstride, const int* list, const int* count, int nmax, float* out, int ostride) {
+    switch ((T + 7) / 8) {
+        #define ROWS(n) case n: k_gemm_rows<n><<<nmax, 512, 0, g_stream>>>(W, C, T, x, xstride, list, count, nmax, out, ostride); break;
+        ROWS(1) ROWS(2) ROWS(3) default: ROWS(4)
+        #undef ROWS
+    }
+}
+// The two-stage head (see k_hbound and the kernels after it): the winners only, exactly, for T <= FAST_T rows.
+static void head_two_stage(Engine* e, int T) {
+    auto& d = e->dr;
+    k_quant8f<<<dim3((D) / 128, T), 32, 0, g_stream>>>(e->out, D, e->tq, e->ts, D);
+    gemm_fp8(d.f_un, D, T, e->tq, e->ts, e->logits, 0, V0);                              // approximate logits
+    prof("unembed");
+    k_hbound<<<T, 256, 0, g_stream>>>(e->out, e->tq, e->ts, e->h_hb);
+    k_apx_part<<<dim3(HEAD_PARTS, T), 1024, 0, g_stream>>>(e->logits, e->sparam, e->rows, e->h_pv, e->h_pi);
+    k_apx_final<<<T, 32, 0, g_stream>>>(e->h_pv, e->h_pi, e->sparam, e->h_win, e->h_l1);
+    gemm_rows(e->unembed, D, T, e->out, D, e->h_l1, nullptr, 2 * T, e->h_ex1, FAST_T);     // exact logits of the approximate winners
+    k_head_thr<<<T, 32, 0, g_stream>>>(e->h_ex1, e->h_win, e->sparam, e->rows, e->h_thr, e->h_cnt);
+    k_head_cand<<<dim3(HEAD_PARTS, T), 1024, 0, g_stream>>>(e->logits, e->h_eu, e->h_un, e->h_hb, e->h_thr, e->sparam, e->rows, e->h_l2, e->h_cnt);
+    gemm_rows(e->unembed, D, T, e->out, D, e->h_l2, e->h_cnt, CAND_CAP, e->h_ex2, FAST_T); // exact logits of the candidates
+    k_head_pick<<<T, 1024, 0, g_stream>>>(e->h_ex2, e->h_l2, e->h_cnt, e->sparam, e->rows, e->sres, T);
+}
+
+// hm: the output head to run - 0 none, 1 full, 2 two-stage.
+static void forward_body(Engine* e, int T, int gchunks, int hm) {
     // Prefetch plan (fractions of each matrix), tunable for experiments: INK_PF_WO=f, INK_PF_Q=a,b,c,d (cumulative).
     static const size_t WO_BYTES = (size_t)(D / 16) * (H * DH / 16) * 512, QKVR_BYTES_BF16 = (size_t)(410 + 64 + 64) * (D / 16) * 512;
     static double pf_wo = getenv("INK_PF_WO") ? atof(getenv("INK_PF_WO")) : 0.0, pf_q[4] = {0.1, 0.2, 0.3, 0.4};
@@ -2154,21 +2369,8 @@ static void forward_body(Engine* e, int T, int gchunks, bool head) {
         }
     }
     CK(cudaMemcpyAsync(e->feats + (size_t)3 * TMAX * D, e->out, (size_t)T * D * 4, cudaMemcpyDeviceToDevice, g_stream));   // 4th tap
-    if (head) {                                          // prompt chunks whose predictions nobody reads skip the 0.9 GB output head
-        if (e->fp8_head) {                                   // lossy option: 8-bit output head
-            k_quant8f<<<dim3((D) / 128, T), 32, 0, g_stream>>>(e->out, D, e->tq, e->ts, D);
-            gemm_fp8(e->f_head, D, T, e->tq, e->ts, e->logits, 0, V0);
-        } else gemv(V0, T, e->unembed, D, T, e->out, e->out, e->out, D, V0, V0, e->logits, V0, 0);
-        prof("unembed");
-        k_head_part<<<dim3(HEAD_PARTS, T), 1024, 0, g_stream>>>(e->logits, e->head_v, e->head_i);
-        k_head_final<<<T, 32, 0, g_stream>>>(e->head_v, e->head_i, e->arg, e->rowmax);
-        k_samp_part<<<dim3(HEAD_PARTS, T), 1024, 0, g_stream>>>(e->logits, e->sparam, e->excl, e->rows, e->rowmax, e->sparts);
-        k_samp_final<<<T, 32, 0, g_stream>>>(e->sparts, e->sparam, e->arg, e->rowmax, e->sres, e->rowz);
-        if (e->dr.on) {
-            k_resid_part<<<dim3(HEAD_PARTS, T), 1024, 0, g_stream>>>(e->logits, e->sparam, e->qrow, e->rows, e->rowmax, e->rowz, e->dr.qlog, e->dr.qz, e->dr.qit, e->rparts);
-            k_resid_final<<<T, 32, 0, g_stream>>>(e->rparts, e->qrow, e->sparam, e->sres);
-        }
-    }
+    if (hm == 2) head_two_stage(e, T);                   // prompt chunks whose predictions nobody reads skip the output head
+    else if (hm) head_full(e, T);
     if (e->dr.on) {                                      // draft-side context for these positions (7.3)
         auto& d = e->dr;
         k_dctx<<<dim3(T, 4), NT, 0, g_stream>>>(e->feats, d.alpha, d.ctx_norm, d.dctx);
@@ -2217,17 +2419,53 @@ int ink_step(void* ep, int T, const int* tokens, const int* seqs, const int* pos
     int bkt = 0; while ((1024 << bkt) < maxpos + 1) bkt++;
     int gchunks = std::min(1024 << bkt, e->max_ctx) / 32;
     bool head = want_head != 0 || logits_out != nullptr;
-    if (g_prof || e->trace || no_graph) forward_body(e, T, gchunks, head);
-    else run_graphed(&e->graph[T][bkt][head], [&] { forward_body(e, T, gchunks, head); });
+    // want_head 2: the caller only needs each row's argmax and sample, so the two-stage head will do.
+    int hm = !head ? 0 : (want_head == 2 && !logits_out && e->head2 && T <= FAST_T) ? 2 : 1;
+    if (g_prof || e->trace || no_graph) forward_body(e, T, gchunks, hm);
+    else run_graphed(&e->graph[T][bkt][hm], [&] { forward_body(e, T, gchunks, hm); });
     CK(cudaStreamSynchronize(g_stream));
     CK(cudaGetLastError());                              // a kernel that failed to launch must stop us, not hand back garbage
     prof("head+copy");
-    if (head) CK(cudaMemcpy(res_out, e->sres, T * 16, cudaMemcpyDeviceToHost)); else memset(res_out, 0, T * 16);
+    if (hm == 2) {
+        int tmp[FAST_T * 4 + 2]; CK(cudaMemcpy(tmp, e->sres, T * 16 + 8, cudaMemcpyDeviceToHost));
+        static const bool always = getenv("INK_HEAD_FALLBACK") != nullptr;   // testing: take the fall-back path every time
+        if (tmp[T * 4] || always) {                      // too many candidates: the full head after all (not part of the recorded graph)
+            if (e->head2_fallbacks++ == 0 && getenv("INK_HEAD_FALLBACK") == nullptr) fprintf(stderr, "note: a step had more output-head candidates than the two-stage head keeps (%d blocks); such steps use the full head\n", tmp[T * 4 + 1]);
+            head_full(e, T); CK(cudaStreamSynchronize(g_stream)); CK(cudaGetLastError());
+            CK(cudaMemcpy(res_out, e->sres, T * 16, cudaMemcpyDeviceToHost));
+        } else memcpy(res_out, tmp, T * 16);
+    } else if (head) CK(cudaMemcpy(res_out, e->sres, T * 16, cudaMemcpyDeviceToHost)); else memset(res_out, 0, T * 16);
     if (logits_out) CK(cudaMemcpy(logits_out, e->logits, (size_t)T * V0 * 4, cudaMemcpyDeviceToHost));
     e->last_T = T;
     return 0;
 }
 
+// Developer check of the two-stage head on the rows of the last step (which must have used a head): runs it
+// again, then the full head, and compares. out = { rows whose argmax or sample differ, the worst (|exact - approximate|
+// - bound) over all tokens (must be negative), the worst |error| / bound, candidate blocks, 1 if the list overflowed }.
+int ink_headcheck(void* ep, double* out) {
+    auto* e = (Engine*)ep; int T = e->last_T; if (!e->head2 || T < 1 || T > FAST_T) return 1;
+    std::vector<int> fast(T * 4 + 2), full(T * 4), step(T * 4); std::vector<float> apx((size_t)T * V0), ex((size_t)T * V0), eu(V0), un(V0), hb(2 * FAST_T);
+    CK(cudaMemcpy(step.data(), e->sres, T * 16, cudaMemcpyDeviceToHost));    // what the step itself returned (from its recorded graph)
+    head_two_stage(e, T); CK(cudaStreamSynchronize(g_stream)); CK(cudaGetLastError());
+    CK(cudaMemcpy(fast.data(), e->sres, T * 16 + 8, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(apx.data(), e->logits, (size_t)T * V0 * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(hb.data(), e->h_hb, 2 * FAST_T * 4, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(eu.data(), e->h_eu, V0 * 4, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(un.data(), e->h_un, V0 * 4, cudaMemcpyDeviceToHost));
+    gemv(V0, T, e->unembed, D, T, e->out, e->out, e->out, D, V0, V0, e->logits, V0, 0); CK(cudaStreamSynchronize(g_stream));
+    CK(cudaMemcpy(ex.data(), e->logits, (size_t)T * V0 * 4, cudaMemcpyDeviceToHost));
+    head_full(e, T); CK(cudaStreamSynchronize(g_stream)); CK(cudaGetLastError());
+    CK(cudaMemcpy(full.data(), e->sres, T * 16, cudaMemcpyDeviceToHost));
+    double worst = -1e30, ratio = 0; long diff = 0;
+    for (int t = 0; t < T; t++) {
+        for (int v = 0; v < V0; v++) {
+            double err = fabs((double)ex[(size_t)t * V0 + v] - (double)apx[(size_t)t * V0 + v]), b = (double)eu[v] * hb[t * 2] + (double)un[v] * hb[t * 2 + 1] + 1e-3;
+            worst = std::max(worst, err - b); ratio = std::max(ratio, err / b);
+        }
+        if (!fast[T * 4]) diff += (fast[t * 4] != full[t * 4]) + (fast[t * 4 + 1] != full[t * 4 + 1]);
+        diff += (step[t * 4] != full[t * 4]) + (step[t * 4 + 1] != full[t * 4 + 1]);
+    }
+    out[0] = (double)diff; out[1] = worst; out[2] = ratio; out[3] = fast[T * 4 + 1]; out[4] = fast[T * 4];
+    return 0;
+}
 // Single conversation (0), T consecutive positions from pos0.
 void ink_forward(void* ep, const int* tokens, int T, int pos0, const int* excl, int* res_out, float* logits_out, int want_head, const int* qrows) {
     int seqs[TMAX], pos[TMAX]; for (int t = 0; t < T && t < TMAX; t++) { seqs[t] = 0; pos[t] = pos0 + t; }

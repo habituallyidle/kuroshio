@@ -527,15 +527,31 @@ fn main() -> Result<()> {
             let toks: Vec<u32> = (0..engine::TMAX as u32).map(|i| 1000 + i).collect();
             let f0 = engine::vram_free();
             let mut last = f0;
+            // INK_GM_STEP=1: steps as the server runs them (the two-stage head for up to 32 rows) instead of `forward`
+            let as_step = std::env::var("INK_GM_STEP").is_ok();
+            let run = |eng: &mut engine::Engine, t: usize| {
+                eng.reset();
+                let t0 = std::time::Instant::now();
+                if as_step {
+                    let rows: Vec<(usize, usize, u32)> = (0..t).map(|i| (0, i, toks[i])).collect();
+                    eng.step_rows(&rows, None, true);
+                } else {
+                    eng.forward(&toks[..t], None);
+                }
+                t0.elapsed().as_secs_f64() * 1e3
+            };
+            // INK_GM_ROUNDS=n: go through all sizes n more times first (every step re-records an evicted graph) and print
+            // the process's own memory: a leak per recording would show as steady growth.
+            let rss = || std::fs::read_to_string("/proc/self/statm").ok().and_then(|s| s.split_whitespace().nth(1)?.parse::<f64>().ok()).unwrap_or(0.0) * 4096.0 / 1048576.0;
+            for round in 0..std::env::var("INK_GM_ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(0usize) {
+                for t in 1..=engine::TMAX {
+                    run(&mut eng, t);
+                }
+                println!("round {round}: host memory {:.0} MiB, GPU memory used by graphs {:.0} MiB", rss(), (f0 as f64 - engine::vram_free() as f64) / 1048576.0);
+            }
             for t in 1..=engine::TMAX {
-                eng.reset();
-                let t0 = std::time::Instant::now();
-                eng.forward(&toks[..t], None);
-                let first = t0.elapsed().as_secs_f64() * 1e3;
-                eng.reset();
-                let t0 = std::time::Instant::now();
-                eng.forward(&toks[..t], None);
-                let second = t0.elapsed().as_secs_f64() * 1e3;
+                let first = run(&mut eng, t);
+                let second = run(&mut eng, t);
                 if t % 16 == 0 || t == 1 || t == 4 || t == 8 {
                     let f = engine::vram_free();
                     println!("T={t:3}: first call {first:6.1} ms, second {second:6.1} ms; graphs so far {:6.1} MiB", (f0 as f64 - f as f64) / 1048576.0);
@@ -684,6 +700,38 @@ fn main() -> Result<()> {
             let hits = out.iter().zip(&ids[1..=n]).filter(|(a, b)| a == b).count();
             eprintln!("next-token accuracy on the text: {:.1}%", 100.0 * hits as f64 / n as f64);
             println!("{}", out.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(" "));
+        }
+        // The two-stage output head against the full one: kuroshio headcheck [tokens]. Steps of 1..32 rows at temperatures
+        // from 0 to 2 over three texts; after each, both heads run again on the same rows. A different argmax or sample
+        // (from the step itself or from the re-run), or a token whose approximation error exceeds its bound, is a failure.
+        Some("headcheck") => {
+            let n: usize = args.get(2).map(|s| s.parse()).transpose()?.unwrap_or(3000);
+            let dir = weights_dir()?;
+            let chat = chat::Chat::load(&dir)?;
+            let mut eng = engine::Engine::load(&dir, 8192)?;
+            let (mut steps, mut rows_n, mut diff, mut worst, mut ratio, mut blocks, mut most, mut over) = (0usize, 0usize, 0.0f64, f64::MIN, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            for file in ["docs/ARCHITECTURE.md", "host/src/server.rs", "LICENSE"] {
+                let ids = chat.encode(&std::fs::read_to_string(file)?)?;
+                let n = n.min(ids.len());
+                eng.reset();
+                let (mut p, mut k) = (0usize, 0usize);
+                while p < n {
+                    let c = [1usize, 2, 3, 5, 8, 13, 16, 24, 32, 7][k % 10].min(n - p);
+                    // every third step one temperature for all rows, otherwise greedy and sampling rows mixed
+                    let temps = [0.0f32, 0.6, 1.0, 0.05, 0.3, 2.0];
+                    let rows: Vec<(usize, usize, u32)> = (0..c).map(|i| (0, p + i, ids[p + i])).collect();
+                    let sampling: Vec<(f32, u32)> = (0..c).map(|i| (temps[if k % 3 == 0 { (k / 3) % 3 } else { (k + i) % 6 }], 1000 + (k * 37 + i) as u32)).collect();
+                    eng.step_rows_with(&rows, None, true, Some(&sampling), None);
+                    let r = eng.headcheck().ok_or_else(|| anyhow::anyhow!("the two-stage head is not available in this configuration"))?;
+                    (steps, rows_n, diff, worst, ratio, blocks, most, over) = (steps + 1, rows_n + c, diff + r[0], worst.max(r[1]), ratio.max(r[2]), blocks + r[3], most.max(r[3]), over + r[4]);
+                    p += c;
+                    k += 1;
+                }
+            }
+            println!("{steps} steps, {rows_n} rows: {diff} rows differ from the full head; worst error - bound {worst:.3} (must be negative), worst error / bound {ratio:.3};");
+            println!("candidate blocks per row {:.1} on average, {most} at most in a step, {over} steps over the limit (those use the full head)", blocks / rows_n as f64);
+            anyhow::ensure!(diff == 0.0 && worst < 0.0, "the two-stage head disagrees with the full head");
+            println!("IDENTICAL");
         }
         // Teacher-forced comparison with golden outputs: inkling check golden.json [trace_out.bin]
         // Diagnostic: inkling topk tokens.json [last_n] - run the tokens, print the model's 5 most likely next tokens

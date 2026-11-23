@@ -3722,6 +3722,218 @@ At 8 rows, 51% of the step is the reading of expert weights, which is bandwidth-
 
 ---
 
+## Step 66 — Prompt steps of 256 rows, and a test that could not fail (2026-11-23)
+
+**What we did**
+
+**The starting point.** Step 65 left a prompt step of 128 rows at about 44 ms, with the experts as its largest part at 14.8 ms. Processing a prompt is throughput work (Step 42): it gets faster when each byte that is read serves more tokens. Since Step 42 a step has had at most 128 rows. A step that only reads prompts may now have 256. Below it is called a prompt-only step: nobody reads the predictions of its rows, so it runs without the output head (Step 42). Every output is bit-identical to before. A step that generates tokens keeps its limit of 128 rows, its caches and its buffers.
+
+**Which part of a step gains from more rows.** A step reads two kinds of weights, and they respond differently to a bigger step.
+
+- *The dense matrices*, such as the attention projection. Their kernels take at most 64 rows per launch (Step 42). A step of 256 rows launches each of them four times and reads each matrix four times, which is one read per 64 rows, as before. And Step 65 found that these kernels are compute-bound at 64 rows: their time goes into the multiplies for each row. A bigger step gives them nothing.
+- *The experts.* The router picks 8 of a layer's 128 experts for every row, and an expert's weights are read once for all rows of the step that picked it (Steps 13 and 42). The bytes read follow the number of distinct experts that the step picks, not its number of rows.
+
+| Rows in the step | Distinct experts read in a layer visit | Experts read per row |
+|---|---|---|
+| 128 | 93 | 0.73 |
+| 256 | 105 | 0.41 |
+
+Step 42 had reasoned more simply, and Step 65 repeated it: 64 rows already make 512 picks, so every one of the 128 experts is in use. Counted at 128 rows, it is 93. The picks are not spread evenly, and the rows of a step share many of their experts.
+
+The second 128 rows add 12 experts. That is 13% more bytes for twice the tokens, so the expert bytes per token nearly halve. The experts are also the memory-bound part of a prompt step: their time follows the bytes they read. They are the one part of the step that more rows make cheaper per token.
+
+**Why the limit cannot simply be raised.** The limit is the constant `TMAX`, and Step 42 raised it from 16 to 128 by enlarging what was sized by it. This time one of those sizes is the problem.
+
+A sliding-window visit keeps a conversation's keys and values in a ring of 1,152 slots (`RING`), and position p lives in slot p mod 1,152 (Steps 8 and 42). A row at position p attends to the 1,024 positions from p − 1,023 to p. One launch (`k_attn_prep`) writes the keys and values of all its rows, and the score kernels read after it (Step 37). The order is needed, because a row attends to the earlier rows of its own step.
+
+With 128 rows this fits, and Step 42 chose the size for that reason. The first row of a step needs 1,024 slots. The rows after it land in the slots outside its window. Those spare slots are the ring's headroom: the number of new positions that may be written before anything is read.
+
+Now take a step of 256 rows of one conversation at positions 1,024 to 1,279, all written before any score is read:
+
+| Rows | Positions | Slots | What the slots held |
+|---|---|---|---|
+| 0–127 | 1,024–1,151 | 1,024–1,151 | Nothing yet |
+| 128 | 1,152 | 0 | Position 0 |
+| 129–255 | 1,153–1,279 | 1–127 | Positions 1–127 |
+
+Row 0 attends to positions 1 to 1,024. Positions 1 to 127 are no longer in the ring, because rows 129 to 255 have overwritten them. The score kernel cannot notice. It derives the position of a key from the number of its slot (`slot_position`), so it scores the key of position 1,153 as if it were the key of position 1. Row 0 would get 127 wrong keys out of 1,024, row 1 would get 126, and so on down to row 126 with one. The wrong keys even belong to tokens that come after the row.
+
+Nothing would crash. It is not a data race either: the launches run one after another, so the result would be wrong in the same way every time. It is the slot collision of Step 46, here between two positions that are 1,152 apart.
+
+**Why not a larger ring.** A ring of 1,280 slots, the window plus 256, would hold such a step. But the sliding-window kernels compute a score for every slot of the ring and then mask the slots outside the window (Step 37), and their grid is fixed by the ring size (Step 15). Every sliding-window launch would become 11% bigger, in every step. A decode step of one row has 40 such visits and would be about 0.6% slower. Each conversation's rings and their snapshot (Step 54) would grow by the same share.
+
+The project's rule is that single-stream decoding never pays for something else. Step 49 set it for concurrency, and it holds for prompt speed as well. 0.6% is small, but many small charges of this kind would add up, each with a good reason. The larger ring was rejected.
+
+**The design: split only what has state.** Most of a layer visit has no state. Its kernels compute each row from the step's own buffers, and for them 256 rows are just more rows. The attention is different: it reads and writes the key/value caches, which are kept from step to step. A stage of this kind is called stateful here. The convolutions keep a history as well, but since Steps 46 and 64 that history is built for runs of any length: positions inside a run are read from the step's own buffers, and a long run stores only its last 37 rows. So the attention is the only stage whose state has a capacity that depends on how many rows arrive at once.
+
+So the attention of a visit now runs in sub-batches of at most 128 rows (`HMAX`), and everything else runs once for the whole step. A step of 256 rows has two sub-batches, called halves in the code. One layer visit of such a step (`forward_body`):
+
+| Stage | Launched for | Note |
+|---|---|---|
+| Input mix, or the blend with its gate in the looped layers | All 256 rows | |
+| Attention projection | 4 × 64 rows | A dense matrix, read once per 64 rows |
+| **Keys and values written; scores, softmax, value sum** | **Rows 0–127, then rows 128–255** | The stateful stage |
+| Attention output projection | 4 × 64 rows | Dense |
+| Convolution after the attention, input mix for the experts | All 256 rows | |
+| Router and task list | All 256 rows | The router's small matrix is dense: 4 × 64 rows |
+| Experts | All 256 rows | Each picked expert is read once |
+| Combine, convolution, residual update | All 256 rows | |
+
+Each half writes its keys and values and reads its scores before the next half writes anything. That is the order in which two steps of 128 rows would use the caches, and so the ring, its headroom and the score scratch buffer (128 rows × 24 heads × 1,152 slots) are exactly as they were. A step of 128 rows or fewer has one sub-batch and launches the attention kernels it launched before.
+
+The change in the kernels is small. `k_attn_scores`, `k_attn_soft` and `k_attn_pv` already took a row offset, because the full-attention visits run 16 rows per launch (Step 46). `k_attn_prep` gained one (`t0`). The full-attention visits go through the same loop. They would not need it: they store a key at its position, nothing is overwritten, and a row never sees a later position.
+
+**Why this is the same as two smaller steps.** For the attention it is not an approximation of two steps. It is the same sequence of launches.
+
+1. *The inputs are the same.* What the attention kernels read from the step is the projection, one line per row. A line is computed from its row's input alone, and Step 43 already requires that it does not depend on the number of rows in the step. The input comes from the visits before, where the same argument applies.
+2. *The caches are in the same state.* When the first half reads, the caches hold what they would hold in a step that has only rows 0–127: rows 128–255 have not written yet. When the second half reads, they hold what a following step of rows 128–255 would find.
+3. *The kernels are the same*, launched with a row offset.
+
+The order between visits differs: in one step of 256 rows, visit 1 handles rows 128–255 before visit 2 handles rows 0–127, and in two steps it is the other way round. That does not matter, because each of the 48 visits has its own caches. The order has to be right within a visit, and it is.
+
+**The convolution across the boundary.** A row's key and value are a convolution over the projection lines of the row and of the 3 positions before it (Step 14). `k_attn_prep` takes an earlier position from the step's own projection buffer if that position is a row of the same run (Step 50), and otherwise from the history ring (Steps 46 and 64). The halves split the launches. They do not split the data: the projection is computed for all 256 rows before the first half starts, and a run is still described for the whole step. Row 128 finds rows 125 to 127 in the buffer, although they belong to the other half. In two separate steps it would have read the same three values from the history ring. For a long run, the kernel that stores its last 37 rows in the history ring (`k_ring_put`, Step 64) runs once, after both halves, because a run that begins in the second half still reads the ring for the positions before it.
+
+**A second buffer sized by the old limit.** The per-thread form of the gate (`k_gate_big` and `k_gate3_big`, Step 65) copied the controller values of all rows into shared memory: 64 floats per row, which is 32 KB at 128 rows. At 256 rows it would be 64 KB, and a block has 48 KB. The kernels now work through the rows 128 at a time and refill the buffer in between. Each (token, channel) pair is computed as before, so the bits are the same.
+
+**The output head stays at 128 rows.** The head writes one logit per vocabulary entry for every row, and its buffer is 102 MB for 128 rows. Nothing needs it for more:
+
+- A prompt needs one prediction, the one after its last token (Step 42).
+- A step that generates has at most 128 rows. The scheduler's step-time table ends there (Step 64).
+- On rows whose prediction nobody reads, the head is pure cost, about 0.12 ms per row (Step 64).
+
+So the rule is: a step of more than 128 rows has no head. The engine enforces it. `ink_step` refuses a step of more than `HMAX` rows that asks for the head or for logits, and the host checks the same before the call (`PMAX` = 256 without the head, `TMAX` = 128 with it).
+
+**How the scheduler keeps to the rule.** A prompt row needs the head only if it is the last token of its prompt. The scheduler therefore asks, before it sizes a step, whether any prompt could reach its end in it (`may_finish` in `server.rs`): its stopping point for now is its end, and at most 256 tokens remain. The step may have 256 rows (`most`) only if no conversation is generating and no prompt can finish. In every other case the limit is 128, as before.
+
+Step 54 did most of the work here, for another reason. With the prefix cache on, a prompt of 512 tokens or more stops one token before its end, where its snapshot is taken (`snapshot_at`), so that a retry has a token left to process. Until that point is reached, the prompt's stopping point is not its end, and it cannot finish. A prompt of 4,000 tokens:
+
+| Steps | Rows each | Positions | Head |
+|---|---|---|---|
+| 15 | 256 | 0–3,839 | No |
+| 1 | 159 | 3,840–3,998 | No |
+| Snapshot at 3,999 | | | |
+| 1 | 1 | 3,999 | Yes |
+
+The last token is always left for a later step, which runs the head, and everything before it runs at the full size. A short prompt, or any prompt with the prefix cache off, has no such point. It runs 256-row steps while more than 256 tokens remain, and steps of at most 128 rows after that.
+
+**The expert grid.** The expert kernels have one row of blocks per task, a task being one expert with up to 8 of its tokens (Steps 13 and 65). The number of tasks is known only on the GPU, after the router has run, and a recorded CUDA graph fixes every grid in advance (Steps 11 and 15). So the grid is sized for the largest number of tasks that can occur, a worst-case bound, and a block whose task does not exist returns at once. Until now the grid had one row per pick: N = 8 × rows.
+
+That bound is far too loose. An expert with c tokens makes c / 8 tasks, rounded up, which is at most (c + 7) / 8. Summed over the experts in use, the c add up to N, and each expert in use adds one 7. At most min(128, N) experts are in use. So (`max_tasks`):
+
+```
+tasks  <=  (N + 7 × min(128, N)) / 8
+```
+
+| Rows | Picks N | Grid rows before | Grid rows now |
+|---|---|---|---|
+| 1 | 8 | 8 | 8 |
+| 16 | 128 | 128 | 128 |
+| 128 | 1,024 | 1,024 | 240 |
+| 256 | 2,048 | | 368 |
+
+Up to 16 rows the bound is N itself, so those steps launch the grids they launched before. From 17 rows on the grid is smaller than it was. At 128 rows the first expert kernel was launched with 72 × 1,024 = 73,728 blocks, of which at most 72 × 240 = 17,280 could have a task. An empty block does no work, but the GPU still has to start it (Step 10).
+
+| Kernel, 128 rows | Before | After |
+|---|---|---|
+| Experts, first matrix (w13) | 205 µs | 183 µs |
+| Experts, second matrix (w2) | 104 µs | 95 µs |
+
+Over 48 visits that is about 1.5 ms, 3.4% of a prompt step.
+
+**The test, first version.** A prompt-only step returns nothing. What it produces is state: the caches that later steps read. So the check feeds the start of a text in big prompt-only steps, continues in steps of 16 rows, and compares the tokens predicted from there on with a run that used 16-row steps throughout. The environment variable `INK_PRE=tokens,rows` of `kuroshio argmaxes` does the first part. It also prints the time of each prompt-only step.
+
+The first version of this check passed. An independent review did not take that as evidence. It replayed the test's steps in a simulation of the ring with the split removed, and no row read a slot that a later row had overwritten. The reason is in the table further up: the hazard needs a slot that already holds a position the row still needs. All big steps of the test ended before position 1,152. Up to there the ring has not wrapped, and every new position goes to a slot that has never been used. The test would have passed with one launch for all 256 rows, which is the bug it was written to catch.
+
+**The test, corrected.** `scripts/verify.sh` now runs 2,600 tokens three times:
+
+| `INK_PRE` | Prompt-only steps | What it reaches |
+|---|---|---|
+| `2304,256` | 9 of 256 rows | Twice around the ring, in halves of 128 and 128 |
+| `2400,200` | 12 of 200 rows | Halves of 128 and 72 |
+| `1408,129` | 10 of 129 rows and one of 118 | A second half of a single row |
+
+In each run the tokens after the prompt-only steps must equal those of the 16-row run. By the slot arithmetic above, the first two runs do reach the hazard. Without the split, the 256-row step at positions 1,024 to 1,279 would compute 127 of its rows from overwritten keys, and so would every later step of that run. In the second run it would be 71 rows of every step from position 1,000 on. The wrong rows would then write wrong keys and values in the visits that follow, also into the full-attention caches, which keep every position, and the tokens after them are compared exactly.
+
+The third run is not a test of the ring. 129 rows in one launch would still fit into the ring: the window includes the row itself, so the first row needs its own slot and 1,023 before it, and 128 further rows find free slots. That run checks the smallest second half, one row past the boundary (Step 65 asks for a test size on each side of every threshold).
+
+All earlier checks of `verify.sh` are unchanged, and the NLL is 0.9007 as before.
+
+**Results.** Prompt-only steps over a 4K prompt, time per 128 tokens:
+
+| Rows per step | Time per 128 tokens | Tokens/s |
+|---|---|---|
+| 128 | 46.6 ms | 2,745 |
+| 192 | 44.7 ms | |
+| 256 | 41.9 ms | 3,057 (+11%) |
+
+The general harness, tokens/s:
+
+| Measurement | Step 65 | This build |
+|---|---|---|
+| Prompt processing, 4K prompt | 2,897–2,954 | 3,105 / 3,150 / 3,289 |
+| 2 streams, aggregate | 369–389 | 394–396 |
+| 4 streams, aggregate | 485–501 | 485–490 |
+
+The test suite of Step 63, prompt processing in tokens/s, measured from the request to the first token:
+
+| Prompt | Before | Now |
+|---|---|---|
+| 4K | 2,712 | 3,124 |
+| 16K | 2,501 | 2,783 |
+| 48K | 1,699 | 1,841 |
+
+Decoding counts as unchanged. A step that generates has one sub-batch, the same ring and the same score scratch buffer, and the only thing that changed for it is the smaller expert grid from 17 rows on. The differences in the harness lines for 2 and 4 streams are of the size this harness shows between runs (Step 58). The gain in prompt processing is largest at 4K and smaller at 48K. That fits what was changed: the attention work of the full-attention visits grows with the context (Step 15), and a bigger step does not make it cheaper per token.
+
+Memory: the per-row scratch buffers doubled, about 0.1 GiB. The rings, the score scratch buffer and the logits buffer kept their size.
+
+**What was not done.** Steps of 384 or 512 rows would go further along the same curve:
+
+| Rows in the step | Distinct experts read in a layer visit | Experts read per row |
+|---|---|---|
+| 128 | 93 | 0.73 |
+| 256 | 105 | 0.41 |
+| 384 | 111 | 0.29 |
+| 512 | about 113 | about 0.22 |
+
+The count is levelling off below 128: beyond 256 rows a bigger step reads almost the same experts for more rows. What is left to save per row shrinks with it. The step from 128 to 256 rows saved 0.32 expert reads per row, and a step from 256 to 512 would save 0.19. The further gain was estimated at 6–9%.
+
+The attention loop would take three or four sub-batches as it is written. Two other things stand in the way. The task-list kernel (`k_tasks`, Step 65) keeps a map in shared memory with one byte per expert and row. That is 32 KB at 256 rows and 48 KB at 384, which no longer fits into a block's 48 KB together with the kernel's bitmasks. And the scratch buffers would grow by about 0.25 GiB. For a gain of that size this was left alone.
+
+**Quirks we hit**
+
+- **The same number under two names.** In the engine, `TMAX` is now 256 and the new `HMAX` is 128. In the host, `TMAX` is still 128 and the new `PMAX` is 256. The host's `TMAX` is the engine's `HMAX`.
+- **Three buffers were sized by the old limit, and each would have failed in its own way.** The ring would have given wrong results silently. The gate's shared memory would not have fitted into a block. The logits buffer would only have cost memory. Step 42 had the same list in a different form.
+- **A feature from Step 54 did a second job.** The snapshot point one token before the end was introduced for retries. It now also separates the one row that needs the head from the rows that do not.
+- **The count corrected two earlier steps.** "All experts are read at 128 rows" had been written twice without being counted. With all 128 in use, a step of 256 rows would halve the expert bytes per token exactly. The count says a little less than half, and it also gives the curve beyond 256 rows.
+- **The micro-benchmark stays at 128 rows.** It runs the head and the attention kernels without the split, and now refuses a larger batch size.
+- **Prompt-only steps no longer feed the scheduler's step-time scale.** The table of Step 64 describes steps with the head and ends at 128 rows. The scheduler now observes only steps with the head.
+- **The server's estimate of its fixed memory** (`vram_base`) went from 19,800 to 19,900 MiB.
+
+**Why you should care**
+
+- Before enlarging a batch, ask which stage reads fewer bytes per token for it, and count. Here it was one stage, and the count was distinct experts per visit. A stage that is compute-bound gains nothing from a bigger batch.
+- A batch limit is often the size of a buffer under another name. Find every buffer behind the limit, and for each one the order of writes and reads it relies on, before changing the number.
+- When a larger batch breaks one stage, split that stage and not the batch. Stages without state take any number of rows at once. A stage with state takes them in portions that its state can hold.
+- The safest new path replays a path that is already trusted. Two halves that write and read in turn are two smaller steps as far as the caches can tell, so exactness follows from the invariance that was already tested (Step 43).
+- A rule such as "decode never pays for something else" is worth more than the 0.6% it saved here. It turns a series of small, reasonable trade-offs into a search for a design that needs none.
+- A grid that must be fixed in advance needs a bound on the work, and a loose bound is paid for in every launch. Derive the bound from how the work items are formed.
+- A test must be able to fail. For each hazard, write down the condition under which it occurs, here more than 129 rows of one conversation in a launch and positions beyond the ring size, and check that the test reaches it.
+- The direct proof is a mutation check: remove the fix and watch the test fail. Where that is awkward, replay the test in a small model of the mechanism, as the review did.
+- Awkward sizes are not enough (Step 43). This hazard depended on the position in the text, not on the size of the step. Ask which variable the bug depends on, and vary that one.
+- A stage that returns nothing can only be tested through the state it leaves. Compare what comes after it.
+- Write down what was not done, with the numbers and with what blocks it. Here: an estimated 6–9%, a 48 KB limit, 0.25 GiB.
+
+**Jargon**
+
+- **Headroom (of a ring buffer)**: the slots a ring buffer has beyond the entries that must stay readable; they decide how many new entries may be written before anything is read (here 128 slots beyond a window of 1,024 positions).
+- **Mutation check (of a test)**: breaking on purpose the thing a test is meant to guard, in the code or in a model of it, and confirming that the test then fails; a test that still passes does not test that thing.
+- **Prompt-only step**: an engine step whose rows all read prompt tokens and whose predictions nobody uses, so that it runs without the output head; it may have up to 256 rows, where a step with the head has at most 128.
+- **Stateful stage**: a stage of a step that reads or writes data kept from one step to the next, such as cached keys and values; it must receive its rows in an order and in portions that keep that data valid, while a stage without state can take any number of rows at once.
+- **Sub-batch**: a portion of a step's rows that one stage processes on its own, portion after portion, while the other stages process all rows together; here the attention of a step with more than 128 rows runs in sub-batches of at most 128.
+- **Worst-case bound (of a grid)**: the largest number of work items that any input can produce, used to size something that must be fixed in advance, such as a kernel's grid in a recorded CUDA graph; the looser the bound, the more blocks are launched that find nothing to do.
+
+---
+
 ## Glossary
 
 Alphabetical. Later entries extend this list.
@@ -3815,6 +4027,7 @@ Alphabetical. Later entries extend this list.
 - **Half-close (TCP)**: closing only the sending direction of a connection while still reading from it; the other side sees the same end-of-stream as for a full close.
 - **Head (attention)**: one of several independent attention computations in a layer, each with its own query; here 24 query heads share 8 sets of keys and values.
 - **Head-of-line blocking**: one large piece of work at the front holding up everything behind it, here a long prompt delaying every other conversation's next token.
+- **Headroom (of a ring buffer)**: the slots a ring buffer has beyond the entries that must stay readable; they decide how many new entries may be written before anything is read (here 128 slots beyond a window of 1,024 positions).
 - **Hidden size**: the length of the vector that represents one token inside the model (2304 here).
 - **High-water mark**: the highest value a growing quantity has ever reached; here the highest position ever written in a slot's ring buffers, rejected drafts included.
 - **Host**: the CPU side of the program.
@@ -3849,6 +4062,7 @@ Alphabetical. Later entries extend this list.
 - **MMA instruction**: "matrix multiply-accumulate", the instruction that drives a tensor core; all 32 threads of a warp execute it together.
 - **mmap**: an operating-system call that makes a file appear as a region of memory, loading pages from disk only when they are touched.
 - **Model card**: the README published with a model.
+- **Mutation check (of a test)**: breaking on purpose the thing a test is meant to guard, in the code or in a model of it, and confirming that the test then fails; a test that still passes does not test that thing.
 - **MXFP8**: an 8-bit floating-point format (E4M3 values) with one power-of-two scale per block of 32 values; the stored format of some weights, and from Step 33 on also used for activations and for matrices converted at load.
 - **NaN**: "not a number", a special floating-point value that marks an undefined result; any arithmetic with a NaN gives NaN, including 0 × NaN.
 - **Nat**: the unit of a log-probability difference; 1 nat is a factor of e ≈ 2.7 in probability.
@@ -3880,6 +4094,7 @@ Alphabetical. Later entries extend this list.
 - **Prior (of an estimate)**: the value an estimate starts from before anything has been observed, with a weight that says how many observations it counts for (here 8).
 - **Profiler**: a tool that measures how much time each part of a program takes.
 - **Prometheus counter / metrics endpoint**: a metrics endpoint is an HTTP address where a server publishes running totals about its own work; a Prometheus counter is one such total, in the text format of the Prometheus monitoring system.
+- **Prompt-only step**: an engine step whose rows all read prompt tokens and whose predictions nobody uses, so that it runs without the output head; it may have up to 256 rows, where a step with the head has at most 128.
 - **Proportional fairness**: a rule for sharing a resource that weighs each gain against what the receiver already gets, so that a gain for one who has little counts more; it gives up some total throughput for a more even split.
 - **PTX / inline assembly**: PTX is the assembly language of NVIDIA GPUs; inline assembly (`asm`) writes such instructions directly inside C++ code.
 - **PyTorch**: the standard Python library for neural-network arithmetic.
@@ -3921,9 +4136,11 @@ Alphabetical. Later entries extend this list.
 - **Special token**: a token that marks structure rather than text, such as the start of a message.
 - **Speculative decoding**: guessing several tokens cheaply and verifying them with the full model in one pass.
 - **Spill**: a value the compiler had to keep in per-thread memory because it ran out of registers.
+- **Stateful stage**: a stage of a step that reads or writes data kept from one step to the next, such as cached keys and values; it must receive its rows in an order and in portions that keep that data valid, while a stage without state can take any number of rows at once.
 - **Stop sequence**: a string given with a request at which generation ends; the string itself is not part of the reply.
 - **Stream (CUDA)**: a queue of GPU work that runs in the order it was submitted.
 - **Stride (strided assignment)**: the fixed distance between the items one worker takes; with stride N, worker w takes items w, w + N, w + 2N, ..., so which worker handles an item does not depend on how many items there are.
+- **Sub-batch**: a portion of a step's rows that one stage processes on its own, portion after portion, while the other stages process all rows together; here the attention of a step with more than 128 rows runs in sub-batches of at most 128.
 - **SwiGLU**: the non-linearity inside each expert MLP: the first matrix produces two vectors and one is used to gate the other.
 - **Swizzle**: to reorder stored data ahead of time into the order the hardware will read it; here, rewriting each weight matrix as tiles.
 - **Tail tokens**: the unlikely candidates for the next token, far below the top choice.
@@ -3959,5 +4176,6 @@ Alphabetical. Later entries extend this list.
 - **W4A4**: 4-bit weights and 4-bit activations; the experts' inputs are quantised at run time as well as their stored weights.
 - **Warp**: 32 GPU threads of a block that execute the same instruction at the same time; the smallest unit the GPU schedules.
 - **Warp shuffle**: an instruction that lets a thread read a register value from another thread of its warp directly, without going through memory.
+- **Worst-case bound (of a grid)**: the largest number of work items that any input can produce, used to size something that must be fixed in advance, such as a kernel's grid in a recorded CUDA graph; the looser the bound, the more blocks are launched that find nothing to do.
 - **Zero-copy**: using data where it already lies instead of first copying it into another buffer.
 - **Zero-initialisation**: filling newly allocated memory with zeros before first use, so that every element holds a known, finite value.
