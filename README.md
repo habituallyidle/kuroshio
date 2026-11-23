@@ -10,7 +10,7 @@
 Kuroshio is an inference engine built for exactly one model and one GPU: hand-written CUDA kernels for Blackwell's
 tensor cores behind an OpenAI-compatible server. One binary, nothing to configure.
 
-- **21% faster** on one stream, **4x faster** at reading prompts
+- **21% faster** on one stream, **5x faster** at reading prompts
 - **240K tokens** of context, lossless, and follow-up turns answer in milliseconds
 - **Tool calls that parse**: 24 of 24 where the reference stack manages 9
 - **Shares the card**: takes memory as conversations grow, and survives another program filling the GPU
@@ -24,16 +24,17 @@ Same RTX 5090, same harness, temperature 0.6, 512-token completions, median of 3
 | | Kuroshio | vLLM | |
 |---|---:|---:|---:|
 | Decode, 1 stream (tok/s) | **242** | 200 | +21% |
-| Decode, 2 streams, total | **381** | 310 | +23% |
-| Decode, 4 streams, total | **474** | 431 | +10% |
-| Prompt processing (tok/s, 4K prompt) | **2,360** | 580 | 4.1x |
+| Decode, 2 streams, total | **378** | 310 | +22% |
+| Decode, 4 streams, total | **495** | 431 | +15% |
+| Prompt processing (tok/s, 4K prompt) | **2,900** | 580 | 5.0x |
 | Well-formed tool calls (24 variants of one agent prompt, temperature 0) | **24 / 24** | 9 / 24 | |
 
 - Context: about 240K tokens for one conversation, lossless. With `--kv 8 --dense 8` (the 8-bit cache vLLM was run
-  with, plus 8-bit attention matrices): about 450K tokens, about 250 tok/s, 2,800 tok/s prompt processing.
+  with, plus 8-bit attention matrices): about 450K tokens, about 260 tok/s, 3,000 tok/s prompt processing.
 - Follow-up turns of a conversation skip the part of the prompt the server has already seen: typically 30-50 ms to
   first token in an agent loop, instead of re-reading everything.
-- Prompt processing slows as the context grows: about 2,300 / 2,100 / 1,500 / 800 tok/s at 4K / 16K / 48K / 100K.
+- Prompt processing slows as the context grows: about 2,700 / 2,500 / 1,700 / 860 tok/s at 4K / 16K / 48K / 100K
+  (measured from request to first token).
 - It starts at about 20 GiB of GPU memory and takes more only as conversations grow, so other programs can use the
   card; when the card is full a conversation stops growing instead of the server crashing.
 - When the model repeats text it has already seen (rewriting a file with a small change, quoting a document,
@@ -95,7 +96,7 @@ r = client.chat.completions.create(model="inkling-2-mini", messages=[{"role": "u
 | `--reserve` | size (`512m`, `6g`) | `512m` | GPU memory to leave free for other programs. Conversations stop growing at that point. |
 | `--idle-release` | seconds, 0 = never | `0` | Give a slot's context memory back after it has been idle this long. Its prefix cache goes with it. |
 | `--kv` | `16`, `8` | `16` | Precision of the attention cache. `8` nearly doubles the context that fits; about 3% slower; lossy. |
-| `--dense` | `16`, `8` | `16` | Precision of the attention matrices and output head. `8` decodes about 7% faster, reads prompts about 20% faster and saves 0.8 GiB; lossy. |
+| `--dense` | `16`, `8` | `16` | Precision of the attention matrices and output head. `8` decodes about 7% faster, reads prompts about 10% faster and saves 0.8 GiB; lossy. |
 | `--spec` | 0-7 | `7` | Speculative decoding: verify up to this many drafted tokens per step. `0` turns it off. Output is unchanged either way. |
 | `--tau` | `auto`, or 0-1 | `auto` | Which drafts to verify. `auto` weighs each draft's chance of being accepted against the time a row costs, and adapts to load. A number verifies those the drafter gives at least that probability. |
 | `--copy` | 0-32 | `31` | When the conversation starts repeating an earlier passage, verify up to this many copied tokens per step. `0` turns it off. Output is unchanged either way. |

@@ -282,18 +282,37 @@ template <int NV> __device__ __forceinline__ void breduce(float* v, float* sh, f
 // so the expert's weights are read once for all tokens that routed to it. tasks[i] = {expert, ncols, col[8]}.
 const int TASKW = 10;
 __global__ void k_tasks(const int* ids, int N, int* tasks, int* ntasks) {
-    __shared__ int sid[TMAX * TOPK]; __shared__ int nt[NE];
-    int e = threadIdx.x; for (int i = e; i < N; i += NE) sid[i] = ids[i];      // N can exceed the 128 threads of this block
+    // Per expert: which tokens picked it (a bit each: an expert is picked at most once per token) and as which of
+    // their 8 picks. Filled by the threads in parallel, 8 picks each at most, so the cost does not grow with the
+    // batch the way a scan of all picks by every expert's thread did (154 us at 128 tokens, 48 times per step).
+    __shared__ unsigned int mask[NE][TMAX / 32]; __shared__ unsigned char slot[NE][TMAX]; __shared__ int wsum_[NE / 32];
+    int e = threadIdx.x;
+    for (int w = 0; w < TMAX / 32; w++) mask[e][w] = 0;
     __syncthreads();
-    int cols[TMAX], cnt = 0;                              // an expert is chosen at most once per token
-    for (int n = 0; n < N; n++) if (sid[n] == e) cols[cnt++] = n;
-    nt[e] = (cnt + 7) / 8; __syncthreads();
-    int rank = 0; for (int j = 0; j < e; j++) rank += nt[j];
-    for (int k = 0; k * 8 < cnt; k++) {
-        int* t = tasks + (rank + k) * TASKW; int c = min(8, cnt - k * 8);
-        t[0] = e; t[1] = c; for (int q = 0; q < c; q++) t[2 + q] = cols[k * 8 + q];
+    for (int n = e; n < N; n += NE) {
+        int id = ids[n], t = n / TOPK; if ((unsigned)id >= (unsigned)NE) continue;        // (NaN router scores can leave a pick unset)
+        slot[id][t] = (unsigned char)(n % TOPK); atomicOr(&mask[id][t >> 5], 1u << (t & 31));
     }
-    if (e == NE - 1) *ntasks = rank + nt[e];
+    __syncthreads();
+    int cnt = 0; for (int w = 0; w < TMAX / 32; w++) cnt += __popc(mask[e][w]);
+    int mine = (cnt + 7) / 8;                              // tasks of this expert: 8 tokens each
+    // Tasks are numbered by expert: a running sum over the 128 threads, inside each warp by shuffles.
+    int incl = mine;
+    for (int o = 1; o < 32; o <<= 1) { int v = __shfl_up_sync(0xffffffffu, incl, o); if ((e & 31) >= o) incl += v; }
+    if ((e & 31) == 31) wsum_[e >> 5] = incl;
+    __syncthreads();
+    int rank = incl - mine; for (int w = 0; w < (e >> 5); w++) rank += wsum_[w];
+    int k = 0;                                           // tokens in ascending order, as before
+    for (int w = 0; w < TMAX / 32; w++) {
+        unsigned int m = mask[e][w];
+        while (m) {
+            int t = w * 32 + __ffs(m) - 1; m &= m - 1;
+            int* tk = tasks + (rank + k / 8) * TASKW;
+            if ((k & 7) == 0) { tk[0] = e; tk[1] = min(8, cnt - k); }
+            tk[2 + (k & 7)] = t * TOPK + slot[e][t]; k++;
+        }
+    }
+    if (e == NE - 1) *ntasks = rank + mine;
 }
 
 // Expert GEMM on the tensor cores. One warp = 16 weight rows (operand A); columns (operand B) = the tokens
@@ -344,12 +363,35 @@ __global__ void k_pair(const float* dest, int dstride, const float* msg, int mst
     for (int k = 0; k < DPT; k++) { int c = tid + NT * k; pair[(size_t)t * 2 * D + c] = bf16r(dv[k] * id); pair[(size_t)t * 2 * D + D + c] = bf16r(mv[k] * im); }
 }
 // (c) x = (1 - tanh(forget.h)) * dest + tanh(gain.h) * msg; one warp per output element, 8 elements per block.
+// The loop controller's gate: x = (1 - tanh(h . forget_c)) * dest + tanh(h . gain_c) * msg for every token and channel,
+// h being the token's 64 controller values. One warp per (token, channel): the fastest form for a few tokens.
 __global__ void k_gate(const float* h, const float* gain, const float* forget, const float* dest, int dstride, const float* msg, int mstride, float* x) {
     int t = blockIdx.y, c = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     const float* hh = h + (size_t)t * 64; const float* g = gain + (size_t)c * 64; const float* f = forget + (size_t)c * 64;
     float ga = fmaf(hh[lane], g[lane], hh[lane + 32] * g[lane + 32]), fa = fmaf(hh[lane], f[lane], hh[lane + 32] * f[lane + 32]);
     ga = wsum(ga); fa = wsum(fa);
     if (lane == 0) { float a = (1.0f - tanhf(fa)) * dest[(size_t)t * dstride + c]; float b = tanhf(ga) * msg[(size_t)t * mstride + c]; x[(size_t)t * D + c] = a + b; }
+}
+// The same for big batches (GATE_BIG tokens or more), where a warp per (token, channel) reads the 4.7 MB of tables
+// again for every token (93 us at 128 tokens, 24 times per step). One block per 8 channels stages h for all tokens
+// and its 8 rows of gain and forget in shared memory; each thread then works through (token, channel) pairs alone,
+// summing in the order the warp reduction above takes (pairs 32 apart, then a halving tree), so results are the same
+// bit for bit. Slower than the warp form below about 40 tokens: few threads have work.
+const int GATE_BIG = 48;
+__global__ void k_gate_big(const float* h, const float* gain, const float* forget, const float* dest, int dstride, const float* msg, int mstride, float* x, int T) {
+    __shared__ float sh[TMAX * 64]; __shared__ float sg[8 * 64]; __shared__ float sf[8 * 64];
+    int c0 = blockIdx.x * 8, tid = threadIdx.x;
+    for (int i = tid; i < T * 64; i += 256) sh[i] = h[i];
+    for (int i = tid; i < 8 * 64; i += 256) { sg[i] = gain[(size_t)c0 * 64 + i]; sf[i] = forget[(size_t)c0 * 64 + i]; }
+    __syncthreads();
+    for (int p = tid; p < T * 8; p += 256) {
+        int t = p >> 3, w = p & 7, c = c0 + w; const float* hh = sh + t * 64; const float* g = sg + w * 64; const float* f = sf + w * 64;
+        float va[32], vf[32];
+        for (int l = 0; l < 32; l++) { va[l] = fmaf(hh[l], g[l], hh[l + 32] * g[l + 32]); vf[l] = fmaf(hh[l], f[l], hh[l + 32] * f[l + 32]); }
+        for (int o = 16; o > 0; o >>= 1) for (int l = 0; l < o; l++) { va[l] += va[l + o]; vf[l] += vf[l + o]; }
+        float a = (1.0f - tanhf(vf[0])) * dest[(size_t)t * dstride + c]; float b = tanhf(va[0]) * msg[(size_t)t * mstride + c];
+        x[(size_t)t * D + c] = a + b;
+    }
 }
 // out[t*ostride ..] = bf16(rmsnorm(x[t]) * w)
 __global__ void k_rms_s(const float* x, const float* w, float* out, int ostride) {
@@ -584,12 +626,28 @@ __global__ void k_pair3(const float* dest, int dstride, int doff, const float* m
     float id = rsqrtf(r[0] / D + EPS), im = rsqrtf(r[1] / D + EPS); float* o = pair + ((size_t)t * 3 + s) * 2 * D;
     for (int k = 0; k < DPT; k++) { int c = tid + NT * k; o[c] = bf16r(dv[k] * id); o[D + c] = bf16r(mv[k] * im); }
 }
+// As k_gate / k_gate_big, for the three streams q, k, v. Grids (D/8, 3 T) and (D/8, 3).
 __global__ void k_gate3(const float* h, const float* gain, const float* forget, const float* dest, int dstride, int doff, const float* msg, float* x) {
     int ts = blockIdx.y, t = ts / 3, s = ts % 3, c = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     const float* hh = h + (size_t)t * 192 + s * 64; const float* g = gain + ((size_t)s * D + c) * 64; const float* f = forget + ((size_t)s * D + c) * 64;
     float ga = fmaf(hh[lane], g[lane], hh[lane + 32] * g[lane + 32]), fa = fmaf(hh[lane], f[lane], hh[lane + 32] * f[lane + 32]);
     ga = wsum(ga); fa = wsum(fa);
     if (lane == 0) { float a = (1.0f - tanhf(fa)) * dest[(size_t)t * dstride + s * doff + c]; float b = tanhf(ga) * msg[((size_t)t * 4 + s) * D + c]; x[((size_t)t * 3 + s) * D + c] = a + b; }
+}
+__global__ void k_gate3_big(const float* h, const float* gain, const float* forget, const float* dest, int dstride, int doff, const float* msg, float* x, int T) {
+    __shared__ float sh[TMAX * 64]; __shared__ float sg[8 * 64]; __shared__ float sf[8 * 64];
+    int s = blockIdx.y, c0 = blockIdx.x * 8, tid = threadIdx.x;
+    for (int i = tid; i < T * 64; i += 256) sh[i] = h[(size_t)(i >> 6) * 192 + s * 64 + (i & 63)];
+    for (int i = tid; i < 8 * 64; i += 256) { sg[i] = gain[((size_t)s * D + c0) * 64 + i]; sf[i] = forget[((size_t)s * D + c0) * 64 + i]; }
+    __syncthreads();
+    for (int p = tid; p < T * 8; p += 256) {
+        int t = p >> 3, w = p & 7, c = c0 + w; const float* hh = sh + t * 64; const float* g = sg + w * 64; const float* f = sf + w * 64;
+        float va[32], vf[32];
+        for (int l = 0; l < 32; l++) { va[l] = fmaf(hh[l], g[l], hh[l + 32] * g[l + 32]); vf[l] = fmaf(hh[l], f[l], hh[l + 32] * f[l + 32]); }
+        for (int o = 16; o > 0; o >>= 1) for (int l = 0; l < o; l++) { va[l] += va[l + o]; vf[l] += vf[l + o]; }   // the order a warp sum takes
+        float a = (1.0f - tanhf(vf[0])) * dest[(size_t)t * dstride + s * doff + c]; float b = tanhf(va[0]) * msg[((size_t)t * 4 + s) * D + c];
+        x[((size_t)t * 3 + s) * D + c] = a + b;
+    }
 }
 __global__ void k_rms3(const float* x, const float* w, int wstride, float* out) {
     __shared__ float sh[NT / 32]; __shared__ float sh2[32];
@@ -739,6 +797,56 @@ template <int NCG> __global__ void k_gemm_bf16(const uint16_t* W, int C, int T, 
         for (int u = 0; u < 3; u++) for (int cg = 0; cg < NCG; cg++) mma_bf16(d[cg], w[u].x, w[u].y, w[u].z, w[u].w, b0[cg][u], b1[cg][u]);
     }
     for (int cg = 0; cg < NCG; cg++) {                       // one column group (8 tokens) at a time: keeps the shared buffer small
+        for (int i = 0; i < 4; i++) sh[warp][lane][i] = d[cg][i];
+        __syncthreads();
+        if (warp == 0) for (int i = 0; i < 4; i++) {
+            int t = cg * 8 + 2 * q + (i & 1), row = r0 + g + (i >> 1) * 8;
+            if (t >= T || row >= rend) continue;
+            float v = 0; for (int w2 = 0; w2 < 16; w2++) v += sh[w2][lane][i];
+            out[(size_t)t * R + row] = round ? bf16r(v) : v;
+        }
+        __syncthreads();
+    }
+}
+
+// Activations for k_gemm_bf16p, packed once per GEMM instead of by every thread at every use: the bf16 bits of a
+// row in the order the tensor-core operand takes them. For each 16-value slice and q = 0..3: values 2q, 2q+1, 8+2q,
+// 9+2q, 8 bytes, which is what one thread loads for one slice.
+__global__ void k_pack_bf16(const float* x, int xstride, int C, uint2* out) {
+    int t = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= C / 4) return;
+    const float* r = x + (size_t)t * xstride + (i >> 2) * 16 + 2 * (i & 3);
+    float2 lo = *(const float2*)r, hi = *(const float2*)(r + 8);
+    out[(size_t)t * (C / 4) + i] = make_uint2(pack_bf16(lo.x, lo.y), pack_bf16(hi.x, hi.y));
+}
+// k_gemm_bf16 for bigger batches. Same operations in the same order, so the same results bit for bit; the
+// activations come packed (k_pack_bf16), one 8-byte load per slice where the plain kernel does two loads and a
+// conversion. With several column groups the plain kernel spends most of its time on exactly that.
+// U: slices per loop iteration (fewer for many column groups: a block of 512 threads has 65,536 registers in all).
+template <int NCG, int U> __global__ void k_gemm_bf16p(const uint16_t* W, int C, int T, const uint2* x0, const uint2* x1, const uint2* x2, int r1, int r2,
+                            float* out, int R, int round) {
+    __shared__ float sh[16][32][4];
+    int n0 = (r1 + 15) / 16, n1 = (r2 - r1 + 15) / 16, blk = blockIdx.x, r0, rend; const uint2* xb;
+    if (blk < n0) { r0 = blk * 16; rend = r1; xb = x0; }
+    else if (blk < n0 + n1) { r0 = r1 + (blk - n0) * 16; rend = r2; xb = x1; }
+    else { r0 = r2 + (blk - n0 - n1) * 16; rend = R; xb = x2; }
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, q = lane & 3, g = lane >> 2;
+    int KB = C / 16, kseg = KB / 16, kbase = warp * kseg, XS = C / 4;
+    const uint4* wt = (const uint4*)((const uint8_t*)W + ((size_t)blk * KB) * 512 + lane * 16);
+    float d[NCG][4]; for (int cg = 0; cg < NCG; cg++) for (int i = 0; i < 4; i++) d[cg][i] = 0;
+    for (int it = 0; it < kseg; it += U) {
+        uint4 w[U]; uint2 b[NCG][U];
+        for (int u = 0; u < U; u++) {
+            int kb = kbase + it + u; bool live = it + u < kseg;
+            w[u] = live ? wt[(size_t)kb * 32] : make_uint4(0, 0, 0, 0);
+            for (int cg = 0; cg < NCG; cg++) {
+                int t = cg * 8 + g;
+                b[cg][u] = (t < T && live) ? xb[(size_t)t * XS + kb * 4 + q] : make_uint2(0, 0);
+            }
+        }
+        for (int u = 0; u < U && it + u < kseg; u++)     // (a slice past the end is skipped, not multiplied by zero: exactly the plain kernel's operations)
+            for (int cg = 0; cg < NCG; cg++) mma_bf16(d[cg], w[u].x, w[u].y, w[u].z, w[u].w, b[cg][u].x, b[cg][u].y);
+    }
+    for (int cg = 0; cg < NCG; cg++) {
         for (int i = 0; i < 4; i++) sh[warp][lane][i] = d[cg][i];
         __syncthreads();
         if (warp == 0) for (int i = 0; i < 4; i++) {
@@ -1230,24 +1338,54 @@ void gemm_fp8(const Fp8Mat& f, int C, int T, const uint8_t* xcode, const uint8_t
         return;
     }
     int nb = (f.R + 15) / 16;
-    if (T <= 8) k_gemm_fp8<1><<<nb, 256, 0, g_stream>>>(f.w, f.s, C, T, xcode, xscale, out, f.R, round, ostride);
-    else if (T <= 16) k_gemm_fp8<2><<<nb, 256, 0, g_stream>>>(f.w, f.s, C, T, xcode, xscale, out, f.R, round, ostride);
-    else if (T <= 32) k_gemm_fp8<4><<<nb, 256, 0, g_stream>>>(f.w, f.s, C, T, xcode, xscale, out, f.R, round, ostride);
-    else k_gemm_fp8<8><<<nb, 256, 0, g_stream>>>(f.w, f.s, C, T, xcode, xscale, out, f.R, round, ostride);
+    // One kernel per number of 8-token column groups: a step of 17 tokens should not pay for 32.
+    switch ((T + 7) / 8) {
+        #define GEMM8(n) case n: k_gemm_fp8<n><<<nb, 256, 0, g_stream>>>(f.w, f.s, C, T, xcode, xscale, out, f.R, round, ostride); break;
+        GEMM8(1) GEMM8(2) GEMM8(3) GEMM8(4) GEMM8(5) GEMM8(6) GEMM8(7) default: GEMM8(8)
+        #undef GEMM8
+    }
 }
 
+// Scratch for packed activations (three inputs of up to 64 tokens x XPK_C values), and the batch size from which
+// packing pays (INK_PACK_MIN to experiment; a large value turns it off).
+const int XPK_C = 4608;
+static uint2* g_xpk[3];
+static int g_pack_min = getenv("INK_PACK_MIN") ? atoi(getenv("INK_PACK_MIN")) : 9;
+void gemv_scratch() {
+    if (g_xpk[0]) return;
+    for (int i = 0; i < 3; i++) { CK(cudaMalloc(&g_xpk[i], (size_t)64 * (XPK_C / 4) * sizeof(uint2))); CK(cudaMemset(g_xpk[i], 0, (size_t)64 * (XPK_C / 4) * sizeof(uint2))); }
+}
 // Dense bf16 matrix (stored as tiles) x T activation rows, on the tensor cores for every batch size.
 void gemv(int R, int T, const uint16_t* W, int C, int T2, const float* x0, const float* x1, const float* x2, int xstride, int r1, int r2, float* out, int R2, int round) {
+    gemv_scratch();
     if (T > 64) {                                        // two launches of at most 64 tokens each
         gemv(R, 64, W, C, 64, x0, x1, x2, xstride, r1, r2, out, R2, round);
         gemv(R, T - 64, W, C, T - 64, x0 + (size_t)64 * xstride, x1 + (size_t)64 * xstride, x2 + (size_t)64 * xstride, xstride, r1, r2, out + (size_t)64 * R, R2, round);
         return;
     }
     int nb = (r1 + 15) / 16 + (r2 - r1 + 15) / 16 + (R - r2 + 15) / 16;
-    if (T <= 8) k_gemm_bf16<1><<<nb, 512, 0, g_stream>>>(W, C, T, x0, x1, x2, xstride, r1, r2, out, R, round);
-    else if (T <= 16) k_gemm_bf16<2><<<nb, 512, 0, g_stream>>>(W, C, T, x0, x1, x2, xstride, r1, r2, out, R, round);
-    else if (T <= 32) k_gemm_bf16<4><<<nb, 512, 0, g_stream>>>(W, C, T, x0, x1, x2, xstride, r1, r2, out, R, round);
-    else k_gemm_bf16<8><<<nb, 512, 0, g_stream>>>(W, C, T, x0, x1, x2, xstride, r1, r2, out, R, round);
+    // One kernel per number of 8-token column groups: a step of 17 tokens should not pay for 32.
+    if (T >= g_pack_min && C <= XPK_C) {                  // bigger batches: pack each distinct input once
+        const float* xs[3] = {x0, x1, x2}; const uint2* xp[3]; bool packed[3] = {false, false, false};
+        for (int i = 0; i < 3; i++) {
+            bool used = i == 0 ? r1 > 0 : i == 1 ? r2 > r1 : R > r2;
+            int same = -1; for (int j = 0; j < i; j++) if (packed[j] && xs[j] == xs[i]) same = j;
+            if (!used) xp[i] = g_xpk[i];                  // never read
+            else if (same >= 0) xp[i] = xp[same];
+            else { k_pack_bf16<<<dim3((C / 4 + 255) / 256, T), 256, 0, g_stream>>>(xs[i], xstride, C, g_xpk[i]); xp[i] = g_xpk[i]; packed[i] = true; }
+        }
+        switch ((T + 7) / 8) {
+            #define GEMM16P(n, u) case n: k_gemm_bf16p<n, u><<<nb, 512, 0, g_stream>>>(W, C, T, xp[0], xp[1], xp[2], r1, r2, out, R, round); break;
+            GEMM16P(1, 3) GEMM16P(2, 3) GEMM16P(3, 3) GEMM16P(4, 3) GEMM16P(5, 3) GEMM16P(6, 3) GEMM16P(7, 2) default: GEMM16P(8, 2)
+            #undef GEMM16P
+        }
+        return;
+    }
+    switch ((T + 7) / 8) {
+        #define GEMM16(n) case n: k_gemm_bf16<n><<<nb, 512, 0, g_stream>>>(W, C, T, x0, x1, x2, xstride, r1, r2, out, R, round); break;
+        GEMM16(1) GEMM16(2) GEMM16(3) GEMM16(4) GEMM16(5) GEMM16(6) GEMM16(7) default: GEMM16(8)
+        #undef GEMM16
+    }
 }
 
 
@@ -1466,7 +1604,8 @@ void mix(Engine* e, int T, std::vector<const float*> src, const float* add, cons
 void blend(Engine* e, int T, Layer& L, int s, const float* dest, int dstride, const float* msg, const float* w, float* out, int ostride) {
     k_pair<<<T, NT, 0, g_stream>>>(dest, dstride, msg, 4 * D, e->pair);
     gemv(64, T, L.ctl_down[s], 2 * D, T, e->pair, e->pair, e->pair, 2 * D, 64, 64, e->hbuf, 64, 1);
-    k_gate<<<dim3(D / 8, T), 256, 0, g_stream>>>(e->hbuf, L.ctl[s][1], L.ctl[s][2], dest, dstride, msg, 4 * D, e->gx);
+    if (T >= GATE_BIG) k_gate_big<<<D / 8, 256, 0, g_stream>>>(e->hbuf, L.ctl[s][1], L.ctl[s][2], dest, dstride, msg, 4 * D, e->gx, T);
+    else k_gate<<<dim3(D / 8, T), 256, 0, g_stream>>>(e->hbuf, L.ctl[s][1], L.ctl[s][2], dest, dstride, msg, 4 * D, e->gx);
     k_rms_s<<<T, NT, 0, g_stream>>>(e->gx, w, out, ostride);
 }
 void trace_copy(Engine* e, int visit, int slot, const float* dev, int T) {
@@ -1596,6 +1735,7 @@ size_t ink_vram_free() { size_t fr = 0, tot = 0; CK(cudaMemGetInfo(&fr, &tot)); 
 // reserve_mib: GPU memory that must stay free for other programs when attaching more.
 void* ink_new(int max_ctx, int nseq, int reserve_mib) {
     auto* e = new Engine(); CK(cudaStreamCreate(&g_stream));
+    gemv_scratch();
     e->max_ctx = std::max(CTX_STEP, (max_ctx + CTX_STEP - 1) / CTX_STEP * CTX_STEP); e->nseq = std::min(MAXSEQ, std::max(1, nseq));
     e->reserve_bytes = (size_t)std::max(0, reserve_mib) << 20;
     return e;
@@ -1884,7 +2024,8 @@ static void forward_body(Engine* e, int T, int gchunks, bool head) {
                 int ds = Q * D, doff = Q == 3 ? D : 0;
                 k_pair3<<<dim3(T, 3), NT, 0, g_stream>>>(e->inputs, ds, doff, e->msg, e->pair);
                 gemv(192, T, L.ctl3_down, 2 * D, T, e->pair, e->pair + 2 * D, e->pair + 4 * D, 6 * D, 64, 128, e->hbuf, 192, 1);
-                k_gate3<<<dim3(D / 8, T * 3), 256, 0, g_stream>>>(e->hbuf, L.ctl3_gain, L.ctl3_forget, e->inputs, ds, doff, e->msg, e->gx);
+                if (T >= GATE_BIG) k_gate3_big<<<dim3(D / 8, 3), 256, 0, g_stream>>>(e->hbuf, L.ctl3_gain, L.ctl3_forget, e->inputs, ds, doff, e->msg, e->gx, T);
+                else k_gate3<<<dim3(D / 8, T * 3), 256, 0, g_stream>>>(e->hbuf, L.ctl3_gain, L.ctl3_forget, e->inputs, ds, doff, e->msg, e->gx);
                 k_rms3<<<dim3(T, 3), NT, 0, g_stream>>>(e->gx, L.in_norm, L.global ? D : 0, e->xin);
                 xq_ = e->xin; xk_ = e->xin + D; xv_ = e->xin + 2 * D; xs = 3 * D;
             } else {
@@ -2225,11 +2366,11 @@ void ink_microbench(void* ep, int T) {
     if (!e->fp8_attn) mbench("qkvr gemm (8600x2304 bf16)", 39.6, [&](int r) { Layer& L = e->L[r % 24]; gemv(QKVR, T, L.qkvr, D, T, e->inputs, e->inputs, e->inputs, D, R_K, R_V, e->proj, QKVR, 1); });
     if (e->fp8_attn) {
         mbench("  fp8: quantise input (2304)", 0, [&](int) { k_quant8f<<<dim3((D) / 128, T), 32, 0, g_stream>>>(e->inputs, D, e->tq, e->ts, D); });
-        mbench("  fp8: q|r|gate|sink gemm (6552 rows)", 15.1, [&](int r) { Layer& L = e->L[r % 24]; k_gemm_fp8<1><<<(L.f_q.R + 15) / 16, 256, 0, g_stream>>>(L.f_q.w, L.f_q.s, D, T, e->tq, e->ts, e->proj, L.f_q.R, 1, QKVR); });
-        mbench("  fp8: k gemm (1024 rows)", 2.4, [&](int r) { Layer& L = e->L[r % 24]; k_gemm_fp8<1><<<64, 256, 0, g_stream>>>(L.f_k.w, L.f_k.s, D, T, e->tq, e->ts, e->proj + R_K, 1024, 1, QKVR); });
-        mbench("  fp8: wo gemm (2304x3072)", 7.1, [&](int r) { Layer& L = e->L[r % 24]; k_gemm_fp8<1><<<D / 16, 256, 0, g_stream>>>(L.f_wo.w, L.f_wo.s, H * DH, T, e->tq, e->ts, e->attn_raw, D, 1, D); });
+        mbench("  fp8: q|r|gate|sink gemm (6552 rows)", 15.1, [&](int r) { Layer& L = e->L[r % 24]; gemm_fp8(L.f_q, D, T, e->tq, e->ts, e->proj, 1, QKVR); });
+        mbench("  fp8: k gemm (1024 rows)", 2.4, [&](int r) { Layer& L = e->L[r % 24]; gemm_fp8(L.f_k, D, T, e->tq, e->ts, e->proj + R_K, 1, QKVR); });
+        mbench("  fp8: wo gemm (2304x3072)", 7.1, [&](int r) { Layer& L = e->L[r % 24]; gemm_fp8(L.f_wo, H * DH, T, e->tq, e->ts, e->attn_raw, 1, D); });
     }
-    if (e->fp8_head) mbench("  fp8: output head gemm", 461.0, [&](int) { k_gemm_fp8<1><<<(V0 + 15) / 16, 256, 0, g_stream>>>(e->f_head.w, e->f_head.s, D, T, e->tq, e->ts, e->logits, V0, 0, V0); });
+    if (e->fp8_head) mbench("  fp8: output head gemm", 461.0, [&](int) { gemm_fp8(e->f_head, D, T, e->tq, e->ts, e->logits, 0, V0); });
     mbench("attn prep (q/r/bias + kv conv)", 0, [&](int r) { int i = r % 5; Layer& L = e->L[i];
         k_attn_prep<<<dim3(T, H + HKV), 1024, 0, g_stream>>>(e->proj, L.qscale, L.rscale, L.rel, 0, e->rows, e->qc, e->bias, e->ring[i][0], e->ring[i][1], L.kconv, L.vconv, e->dk, e->dv, e->Kc[i], e->Vc[i], e->kv8, e->kv_local); });
     mbench("attn scores (local, tensor cores)", 0, [&](int r) { int i = r % 5; k_attn_scores<<<dim3(9, T * HKV), 256, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[i], e->rows, 0, RING / 16, e->att_sc, RING, 0, e->kv8, e->kv_local); });
@@ -2239,7 +2380,12 @@ void ink_microbench(void* ep, int T) {
     mbench("post-attn (conv + mix)", 0, [&](int r) { int i = r % 24; Layer& L = e->L[i]; PostAttn pa{}; pa.attn_raw = e->attn_raw; pa.ring = e->ring[vis(i)][2]; pa.w = L.attn_sconv; pa.rows = e->rows;
         pa.attn_out = e->attn_out; pa.ns = 2; pa.src[0] = e->stack[0]; pa.src[1] = e->stack[1]; pa.partial = e->stack[2]; pa.q = e->mlp_q[i]; pa.norm = L.mlp_norm; pa.out = e->mlp_in; pa.pf = PF{nullptr, 0, T}; launch_post_attn(T, pa); });
     mbench("router gemm (128x2304 bf16)", 0.59, [&](int r) { Layer& L = e->L[r % 24]; gemv(NE, T, L.router, D, T, e->mlp_in, e->mlp_in, e->mlp_in, D, NE, NE, e->rlogit, NE, 0); });
-    mbench("route top-8 + task list", 0, [&](int r) { Layer& L = e->L[r % 24]; k_route_tasks<<<1, NE, 0, g_stream>>>(e->rlogit, L.rbias, T, e->ids, e->gamma, e->tasks, e->ntasks); });
+    // as the step does it: one fused kernel for a single token, otherwise one block per token and one that groups by expert
+    if (T == 1) mbench("route top-8 + task list", 0, [&](int r) { Layer& L = e->L[r % 24]; k_route_tasks<<<1, NE, 0, g_stream>>>(e->rlogit, L.rbias, T, e->ids, e->gamma, e->tasks, e->ntasks); });
+    else {
+        mbench("route top-8", 0, [&](int r) { Layer& L = e->L[r % 24]; k_route<<<T, NE, 0, g_stream>>>(e->rlogit, L.rbias, e->ids, e->gamma); });
+        mbench("task list", 0, [&](int) { k_tasks<<<1, NE, 0, g_stream>>>(e->ids, T * TOPK, e->tasks, e->ntasks); });
+    }
     mbench("quantise x to NVFP4", 0, [&](int) { k_quant4c<<<T, 256, 0, g_stream>>>(e->mlp_in, D, e->xamax, e->xcode, e->xscale, PF{nullptr, 0, T}); });
     mbench("quantise x to NVFP4 (native cvt)", 0, [&](int) { k_quant4f<<<T, D / 4, 0, g_stream>>>(e->mlp_in, D, e->xamax, e->xcode, e->xscale, PF{nullptr, 0, T}); });
     mbench("swiglu + quantise (native cvt)", 0, [&](int) { k_swiglu_quant4f<<<N, I2 / 4, 0, g_stream>>>(e->gu, e->gamma, e->aamax, e->acode, e->ascale, PF{nullptr, 0, N}); });
@@ -2252,7 +2398,7 @@ void ink_microbench(void* ep, int T) {
     mbench("loop: message mix (4 queries)", 0, [&](int r) { mix(e, T, {e->bank[0], e->bank[1]}, nullptr, e->msg_q[r % 12], 4, nullptr, e->msg); });
     mbench("loop: pair x3", 0, [&](int) { k_pair3<<<dim3(T, 3), NT, 0, g_stream>>>(e->xin, 3 * D, D, e->msg, e->pair); });
     mbench("loop: controller gemm (192x4608)", 1.77, [&](int r) { Layer& L = e->L[6 + r % 12]; gemv(192, T, L.ctl3_down, 2 * D, T, e->pair, e->pair + 2 * D, e->pair + 4 * D, 6 * D, 64, 128, e->hbuf, 192, 1); });
-    mbench("loop: gate x3", 3.5, [&](int r) { Layer& L = e->L[6 + r % 12]; k_gate3<<<dim3(D / 8, T * 3), 256, 0, g_stream>>>(e->hbuf, L.ctl3_gain, L.ctl3_forget, e->xin, 3 * D, D, e->msg, e->gx); });
+    mbench("loop: gate x3", 3.5, [&](int r) { Layer& L = e->L[6 + r % 12]; if (T >= GATE_BIG) k_gate3_big<<<dim3(D / 8, 3), 256, 0, g_stream>>>(e->hbuf, L.ctl3_gain, L.ctl3_forget, e->xin, 3 * D, D, e->msg, e->gx, T); else k_gate3<<<dim3(D / 8, T * 3), 256, 0, g_stream>>>(e->hbuf, L.ctl3_gain, L.ctl3_forget, e->xin, 3 * D, D, e->msg, e->gx); });
     mbench("loop: norm x3", 0, [&](int r) { Layer& L = e->L[6 + r % 12]; k_rms3<<<dim3(T, 3), NT, 0, g_stream>>>(e->gx, L.in_norm, 0, e->xin); });
     if (e->unembed) mbench("unembed gemm (200058x2304 bf16)", 921.9, [&](int) { gemv(V0, T, e->unembed, D, T, e->out, e->out, e->out, D, V0, V0, e->logits, V0, 0); });
     mbench("softcap + argmax", 0, [&](int) { k_head_part<<<dim3(HEAD_PARTS, T), 1024, 0, g_stream>>>(e->logits, e->head_v, e->head_i); k_head_final<<<T, 32, 0, g_stream>>>(e->head_v, e->head_i, e->arg, e->rowmax); });

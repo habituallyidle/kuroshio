@@ -491,7 +491,9 @@ fn main() -> Result<()> {
             let ids = chat.encode(&std::fs::read_to_string("docs/ARCHITECTURE.md")?)?;
             let mut eng = engine::Engine::load(&dir, 8192)?;
             eng.forward(&ids[..ctx], None);
-            for t in [1usize, 8] {
+            // INK_MB_T=1,8,16: the batch sizes to time
+            let ts: Vec<usize> = std::env::var("INK_MB_T").ok().map_or(vec![1, 8], |v| v.split(',').filter_map(|x| x.parse().ok()).collect());
+            for t in ts {
                 eng.forward(&ids[ctx..ctx + t], None);
                 eng.reset();
                 eng.forward(&ids[..ctx], None);
@@ -631,7 +633,7 @@ fn main() -> Result<()> {
                 let (mut rows, mut owner) = (Vec::new(), Vec::new());
                 for s in 0..nseq {
                     seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                    let want = 1 + (seed >> 33) as usize % 19; // 1..19 rows: crosses the in-kernel history limit of 13
+                    let want = 1 + (seed >> 33) as usize % 45; // 1..45 rows: crosses the in-kernel conv history limit (37) and the kernels' 8-row groups
                     let c = want.min(n - pos[s]).min(engine::TMAX - rows.len());
                     for i in 0..c {
                         rows.push((nseq + s, pos[s] + i, texts[s][pos[s] + i]));

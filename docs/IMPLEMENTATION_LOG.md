@@ -3244,6 +3244,221 @@ No change. `scripts/verify.sh`, `scripts/fullcard.sh` and the quick suite ran wi
 
 ---
 
+## Step 64 — Drafts copied from the conversation, and a step-time table that was wrong (2026-11-23)
+
+**What we did**
+
+**The idea.** An agent repeats text it has already seen. It rewrites a file with one line changed, quotes a document, or echoes the output of a tool. While it does that, the tokens it is about to write are already in the conversation: they are what followed the same passage the first time. That continuation can serve as a draft. It is verified like the drafter's guesses (Steps 25 and 27), and it has two advantages over them. It needs no pass of the drafter, and it can have any length, where the drafter proposes at most 7 tokens.
+
+The server now does this (`struct Copy` in `server.rs`). Elsewhere the technique is known as prompt-lookup decoding. The option is `--copy N`, the largest number of copied tokens verified per step. The default is 31, and 0 turns copying off.
+
+**Finding the passage.** Each request keeps the tokens of its conversation, first the prompt and then everything generated, and an index over them. The index maps every trigram, a run of three consecutive tokens, to the place where that run last ended. For every new token (`Copy::push`):
+
+1. If an earlier passage is being followed and the new token is the one that came next there, the match grows by one token.
+2. Otherwise the match is dropped.
+3. The trigram that ends at the new token is entered in the index. If no passage is being followed and the index already held this trigram, the earlier place becomes the passage to follow.
+
+The index proves only three equal tokens. The two places may agree further back, for example when the same text occurs twice in the conversation and the match has just moved from one occurrence to the other. So the length of a new match is measured backwards: the tokens before the two places are compared one by one until they differ, up to 64. The length matters because the chance of acceptance is estimated from it (below). A match of fewer than 4 tokens is not used: three tokens in a row recur by chance.
+
+**The drafts.** They are the tokens that followed the passage (`Copy::drafts`). One case needs care: the passage may be the text that was just written. Take a conversation that ends in
+
+```
+7 8 9 7 8 9
+```
+
+The last three tokens match the first three. What followed those is `7 8 9`, and there the conversation ends. The passage and its repeat lie 3 tokens apart, so the text has period 3, and a draft beyond the end of the conversation is the draft 3 places before it. Eight drafts are `7 8 9 7 8 9 7 8`: a repeating pattern continues into its own drafts. This covers the rule lines of a table, a run of zeros (period 1) and an alternation (period 2).
+
+**Verification is unchanged.** Copied drafts are rows after the conversation's next token, and each is accepted or rejected by the rule of Step 27. A conversation that copies takes no part in that step's drafter pass (Step 56). If no conversation needs the drafter, no pass is run.
+
+**Why exactness had to be proved again.** The accept rule does not care where a draft comes from. A wrong draft is rejected, and the token that comes out is the model's own. That argument covers the rule. It does not cover the state that a rejected draft leaves behind in the engine. After a rejection the conversation is rewound: its position is set back to the first rejected draft, and the next step overwrites the rows from there on. Whether everything before that point is still intact depends on the shape of the step. Until now a run (Step 50) with drafts had at most 8 rows, the next token and 7 drafts, and every identity check had been passed with such runs. The first version of copying built runs of 25 rows, the next token and 24 drafts. A new source of drafts brings new step shapes, so "the output is unchanged" was an open question again.
+
+The A/B that measured the speed also compared the outputs with copying on and off, token for token. 2 of 8 greedy outputs had changed.
+
+**The bug.** The convolutions read the values of the 3 previous positions from a history ring (Step 46). The ring had 16 slots (`CR`), and position p lives in slot p mod 16. Since Step 50 a run of up to 13 rows stores every row in the kernel that computes it. A longer run stores only its last 13 rows, with a separate kernel afterwards. The 13 comes from the 16 slots: 13 positions written and the 3 positions read before them use every slot once (Step 46).
+
+Take a run of 25 rows that starts at position 1,000. The first 4 drafts are accepted and the 5th is rejected:
+
+| Positions | Rows | Slots | Stored in the ring |
+|---|---|---|---|
+| 1,000 | The next token | 8 | No |
+| 1,001–1,004 | Drafts 1–4, accepted | 9–12 | No |
+| 1,005–1,011 | Drafts 5–11, discarded | 13–15, 0–3 | No |
+| 1,012–1,024 | Drafts 12–24, discarded | 4–15, 0 | Yes: the last 13 rows |
+
+The next step starts at position 1,005 with the model's own token. Its convolutions read positions 1,002 to 1,004 from slots 10 to 12. Those slots now hold positions 1,018 to 1,020, which lie 16 positions further on: values computed for drafts that were thrown away. The values of 1,002 to 1,004 had been computed correctly and were never stored.
+
+Only a rejection among the first 14 drafts did this. From the 15th draft on, the restart point is position 1,015 or later, and the three positions before it are among the 13 stored ones. With every draft accepted, nothing is rewound at all. And the drafter's runs of at most 8 rows store every row.
+
+**One inequality.** A run can store all its rows and leave the 3 positions before it untouched if both fit in the ring at once:
+
+```
+rows of the run + 3  <=  CR
+```
+
+Within this bound every restart point inside the run finds the three positions before it. They are either rows of the run, all stored, or positions before the run, not overwritten. Three numbers follow from it:
+
+| | Rule | Ring of 16 | Ring of 40 |
+|---|---|---|---|
+| Longest run in which drafts may be rejected (`ink_max_rewind_run`) | CR − 3 | 13 | 37 |
+| Longest such run the server builds | | 8 with the drafter; 25 with the first version of copying | 32 by default, 33 at most |
+| Live resume (Step 54) is allowed while the high-water mark is at most the resume position plus | CR − 6 | 10 | 34 |
+
+- **The ring size.** The default `--copy 31` builds runs of 32 rows (why 32 is explained below), which needs CR ≥ 35. `CR` is now 40. That costs 31 MiB per slot, and the same again for the slot's snapshot (Step 54).
+- **The cap.** The engine reports CR − 3 through `ink_max_rewind_run`. The scheduler never plans a run with drafts that is longer. Prompt runs may be longer, because nothing in them is ever rejected.
+- **The live-resume margin.** Step 54 lets a follow-up turn continue without restoring a snapshot when `hi <= resume position + 10`, where all positions below `hi` have been written at some time, rejected drafts included. The 10 was 16 − 6. A long run keeps only its last CR − 3 positions, the ones from hi − (CR − 3) on, and the 3 positions before the resume point must be among them. That gives hi ≤ resume position + CR − 6, now 34 (`resume_point`). The server refuses a `--copy` above 32, a run of 33 rows, so that a conversation that ended on such a run can still be resumed live.
+
+The margin used to be the number 10 written into the server. It is now computed from what the engine reports, so the two cannot drift apart.
+
+With the larger ring, greedy and seeded outputs are identical with copying on and off, for 1 and 4 streams.
+
+**How likely is a copied token to be accepted?** The scheduler needs this probability, as it does for the drafter's guesses (Step 61). The drafter reports a confidence with every guess. A copied token has only the length of its match. The estimate is therefore kept per length, in four groups (`Copy::accept`), and learned from the outcomes while serving. Fitting an estimated probability to what is observed is called calibration.
+
+| Match length in tokens | 4–5 | 6–9 | 10–19 | 20 or more |
+|---|---|---|---|---|
+| Starting value (the prior) | 0.55 | 0.7 | 0.85 | 0.92 |
+
+The starting value counts as 8 observations. Each copied token whose outcome is known, the accepted ones and the first rejected one, adds an observation, and the older ones lose 2% of their weight each time. The estimate is capped at 0.995.
+
+**One estimate for all conversations was wrong.** The first version shared the estimate between conversations, as Step 61 does for the drafter's. In a test with 4 streams, two copied a text verbatim and two only quoted a phrase. The two copiers drove the shared estimate up. The scheduler then verified long copies for the other two as well, whose matches end after a few tokens: 5.8 rows verified per step for 3.6 accepted, against 4.6 with the drafter. More than 2 rows per step were computed for nothing.
+
+How far a match continues is a property of the conversation: one repeats a file, another quotes and moves on. The length of the match does not tell the two apart. The estimate is now kept per request and starts from the values above.
+
+**Copying competes with the drafter.** For a conversation with a match, two figures are compared (`Copy::worth`):
+
+```
+copying:   p + p² + ... + p^N    expected accepted tokens; N copied drafts, p the estimate
+drafter:   accepted drafts per step that the drafter has recently had in this request
+```
+
+Copying is used when its figure is the larger one. With the starting value 0.55 the sum is about 1.2 at most, however large N is. With 0.92 and N = 31 it is about 10.6. A short match wins only where the drafter is doing badly, and a long one nearly always.
+
+**An estimate that is not used must fade.** The estimate changes only when copied drafts are verified. Suppose a group's estimate has fallen so low that copying loses the comparison. Then no copied draft of that group is verified, the estimate receives no new observation, and it would keep its value for the rest of the request, also after the text has changed from quoted phrases to a rewritten file. So each time a match is there and is not used, the counts of its group shrink by a factor 0.9 (`Copy::forget`). The estimate drifts back to its starting value, copying is tried again, and that try is a fresh observation. A unit test covers both directions: 12 rejections in a row switch copying off, and 60 unused steps bring it back.
+
+**The step-time table was wrong.** The cost model of Step 61 was a table of 7 measured points with straight lines between them. Up to 16 rows it was close. Copying builds steps of 32 rows and more, and there it was wrong in two ways.
+
+| Rows | Old table, ms | Measured, ms |
+|---|---|---|
+| 16 | 14.9 | 14.97 |
+| 32 | 20.8 | 23.03 |
+| 64 | 31.8 | 39.98 |
+| 128 | 57.0 | 72.32 |
+
+*The large points were too low.* A step that verifies drafts runs the output head on every row, because every row's prediction is read. The old 57 ms for 128 rows matches a prompt step, which skips the head (Step 42).
+
+*The straight lines hid jumps.* Measured for single numbers of rows (`INK_STEP_T=... kuroshio steptime`):
+
+| Rows | Step time, ms | Added by the last row, ms |
+|---|---|---|
+| 15 → 16 | 14.37 → 14.97 | 0.60 |
+| 16 → 17 | 14.97 → 16.27 | 1.30 |
+| 31 → 32 | 22.73 → 23.03 | 0.30 |
+| 32 → 33 | 23.03 → 26.07 | 3.04 |
+
+The step time jumps at the 9th, 17th, 33rd and 65th row. The matrix kernels handle the rows of a step in groups, called tiles of rows in the code. They are compiled for 1, 2, 4 or 8 column groups of 8 rows (Step 42), which is 8, 16, 32 or 64 rows, and more than 64 rows take two launches. A row that fits into the tile in use adds little. The first row beyond it moves the whole step to the next size.
+
+The table in `Speculation::rows_ms` now has 46 measured points: every number of rows from 1 to 34 and 12 sizes above that, with straight lines in between. It is still scaled by the step times the scheduler observes (Step 61).
+
+**"Add rows while each one pays" fails on a curve with jumps.** The scheduler of Step 61 sorted the candidate rows by value and added them one by one. It stopped at the first row that lowered the step's tokens per millisecond. That is right only if no later row is cheaper than the one that failed. Here the row after a boundary is expensive, and the rows behind it are cheap again. Take one conversation whose copied drafts are all certain, so that every row yields a token:
+
+| Rows | Step time, ms | Tokens per ms |
+|---|---|---|
+| 16 | 14.97 | 1.07 |
+| 17 | 16.27 | 1.04 |
+| 32 | 23.03 | 1.39 |
+| 33 | 26.07 | 1.27 |
+
+The 17th row lowers the rate, so the old rule stopped at 16 rows, with 32 clearly better. `Speculation::choose` now computes the rate for every prefix of the sorted list, that is for the best n rows with n = 0, 1, 2 and so on, and takes the n with the highest rate. A step has at most 128 rows, so this is a short loop. In the example it ends at 32 rows, because the 33rd costs 3.04 ms. This is the reason for the default: 31 copied drafts and the next token fill 32 rows.
+
+The list holds the drafter's guesses and the copied drafts together. Draft j of a copying conversation enters with the value p^j. The time of a drafter pass is counted only when a pass is run.
+
+**Big steps come in a few sizes.** Each number of rows is a step shape of its own, with its own recorded CUDA graph (Steps 11 and 59), and the engine keeps 48 graphs. With copying, a step can have almost any number of rows. So the result of `choose` is rounded down (`step_size`): any size up to 16 rows, multiples of 4 up to 64, multiples of 8 above. That makes 36 sizes instead of 128. The rows given up are the least promising ones, and rows that the step has anyway are never dropped. Rounding down also puts a step that is just past a boundary back onto it: 17 to 19 rows become 16, 33 to 35 become 32, 65 to 71 become 64. With 4 streams, graph recordings went from about 105 to about 150 per minute, which is less than 0.5% of the time.
+
+**Tried and rejected: a proportionally fair rule.** The scheduler maximises the total tokens per millisecond of the step. A conversation that copies can take 31 rows of it, and the others wait for the longer step. By the table, a step of 4 rows takes 8.40 ms and one of 32 rows 23.03 ms. The experiment was a rule that weighs a row's gain against the tokens its own conversation already expects from the step, so that a row for a conversation with little counts more. With 4 streams it cost 5% to 11% of wall-clock throughput, also with copying off. The rule for the total was kept. What remains is the trade-off: a conversation that copies a long passage lengthens the step for the others while the passage lasts.
+
+**Fixes from the review.**
+
+| Problem | Fix |
+|---|---|
+| Rows are handed out slot by slot. Copied rows of earlier slots could take the rows that the forced opening of a tool call (Step 55) needed, a stretch of 45 tokens or more. | Forced text has first claim on a step's rows. |
+| With a fixed threshold (`--tau` with a number), copied drafts had no rule. | They are verified while p^j is at least the threshold. |
+| The index was built also when speculation was off. | It is built only when it can be used. |
+
+**Results.** A/B with fixed prompts and seeds, 900 tokens per request, `--copy 0` → `--copy 31`.
+
+One stream, tokens/s:
+
+| Text | Temperature 0 | Temperature 0.6 |
+|---|---|---|
+| Rewrite code with a change | 420 → 483 | 496 → 612 |
+| Quote or repeat a document | 484 → 591 | 495 → 625 |
+| Repeating patterns | 379 → 376 | 418 → 417 |
+| Prose | 223 → 222 | 225 → 226 |
+
+4 streams, tokens/s of the whole batch by the wall clock, two runs each, noise about ±2%:
+
+| Text | Temperature 0 | Temperature 0.6 |
+|---|---|---|
+| Rewrite code with a change | 558 → 604 | 1,000 → 1,130 |
+| Quote or repeat a document | 764 → 782 | 975 → 1,035 |
+| Repeating patterns | 688 → 679 | 788 → 769 |
+| Prose | 435 → 431 | 482 → 484 |
+
+On the pattern prompts 6–7% of the tokens were copied.
+
+The general harness, tokens/s:
+
+| Measurement | Step 63 | This build |
+|---|---|---|
+| 1 stream | 238–247 | 228 / 246 / 263 |
+| 2 streams, aggregate | 372–387 | 376–384 |
+| 4 streams, aggregate | 471–482 | 475–494 |
+| Prompt processing | 2,320–2,360 | 2,394–2,430 |
+
+No change beyond the noise of this harness (Step 58), and none was to be expected: the harness generates random prose, and 1.2% of its tokens were copied.
+
+**What was verified.**
+
+- Greedy and seeded outputs are identical with `--copy 0` and with copying, for 1 and 4 streams.
+- The determinism stage of the test suite (Step 63) gained two prompts whose answers repeat the prompt: a Python file to rewrite with one variable renamed, and a text to repeat word for word. They run in its identity checks: default against `--spec 0`, and 4 slots alone against busy.
+- Unit tests in `server.rs` cover the matching (compared with brute force on random tokens), drafts of a repeating pattern, the estimate switching off and coming back, the live-resume margin on both sides of its limit, the choice of rows, and that the step-time table rises with every row.
+- `scripts/verify.sh`, `scripts/fullcard.sh` and the suite's determinism stage pass.
+
+**Seen on the way, not yet used.** While one conversation generates and another reads its prompt, the prompt rows share the decode step (Step 52). The step runs the output head because of the decode rows, and it then runs it for the prompt rows too, whose predictions nobody reads. The head is a 0.9 GB matrix, and this costs about 0.12 ms per prompt row. At 128 rows, the old table and the new one differ by that same amount per row.
+
+**Quirks we hit**
+
+- **The bug needed a draft that was rejected early in a long run.** A text copied without a slip passes, and so does a slip after the 14th draft. The test needed prompts where copying is mostly right and sometimes wrong, and it needed to compare outputs, not only speeds.
+- **The wrong outputs were plausible text.** Three history values from other positions shift the arithmetic a little, and the model writes on. As in Step 46, only a check for exact equality marked it as a bug.
+- **The old ring size held an assumption about the caller.** The comment on `CR` said: 3 positions are needed, up to 7 more after a rejected draft. The 7 was the drafter's limit. Nothing in the code tied the two together, and a second source of drafts did not know about it.
+- **Step 46 shrank the ring and this step enlarged it, for the same reason.** Both times the question was which positions a launch reads and which it writes. The answer is now a function that the host calls, not a number that it repeats.
+- **The old table was right where it had been used.** With the drafter alone, one conversation's step has at most 8 rows. The errors began at 32 rows, where no decision had depended on the table before.
+- **Two small diagnostics came with it.** The summary line that the server logs for a request now includes the number of tokens copied. With the environment variable `INK_GRAPH_LOG` set, the engine prints a line for every graph it records.
+- **No gain on repeating patterns.** Only 6–7% of the tokens were copied there, and the speed stayed inside the noise. Where the drafter already does well, copying has little to add.
+
+**Why you should care**
+
+- Look at the workload for text that is already known. An agent's output overlaps with its own context, and that overlap is a draft that costs almost nothing to produce.
+- "Exact" is a property of the engine together with the step shapes it is given. A new source of drafts means new shapes, so run the identity checks again with the new feature on, and make them part of the benchmark: compare outputs first, speeds second.
+- A buffer size that depends on what callers do is an interface. Export the limit and let callers ask for it (Step 46 found the same rule from the other side).
+- Keep a learned estimate per thing that actually differs. Here that was the conversation. With a shared estimate, the conversations that copy well raised the figure for those that do not.
+- An estimate that is updated only when it is used can lock itself out. Give it a way back: let unused knowledge fade towards the starting value.
+- Measure a cost model in the configuration it is used in, here with the output head on every row, and at every size where the mechanism changes. Straight lines between a few points hide jumps.
+- A rule that stops at the first step that does not pay is correct only when later steps cannot be cheaper. When the cost has jumps, evaluate every candidate size. Here that is at most 128 divisions.
+- Fairness has a price in throughput. Measure the price before choosing, and write down the trade-off that the chosen rule leaves.
+- A benchmark of random prose cannot see a feature that works on repeated text. It can only show that nothing else got slower. The gain needs prompts of the kind the feature is for.
+
+**Jargon**
+
+- **Calibration (of a probability estimate)**: adjusting an estimated probability so that it matches how often the event really happens; here, learning from verified drafts how often a draft of a given kind is accepted.
+- **Copied draft (prompt-lookup decoding)**: a draft taken from the conversation itself: when the last tokens repeat an earlier passage, the tokens that followed that passage are proposed as the next ones; often called prompt-lookup decoding.
+- **Prior (of an estimate)**: the value an estimate starts from before anything has been observed, with a weight that says how many observations it counts for (here 8).
+- **Proportional fairness**: a rule for sharing a resource that weighs each gain against what the receiver already gets, so that a gain for one who has little counts more; it gives up some total throughput for a more even split.
+- **Rewind (of a run)**: setting a conversation's position back to its first rejected draft, so that the next step overwrites the rejected rows; the state stored for the positions before that point must still be intact.
+- **Tile of rows**: the group of rows of a step that the matrix kernels handle together (8, 16, 32 or 64 here); the first row beyond a full group moves the step to the next size and adds far more time than a row inside a group.
+- **Trigram index**: a table from every run of three consecutive tokens (a trigram) to the place where that run last occurred, used to find an earlier passage that ends in the same tokens.
+
+---
+
 ## Glossary
 
 Alphabetical. Later entries extend this list.
@@ -3271,6 +3486,7 @@ Alphabetical. Later entries extend this list.
 - **Block scale**: one shared scale factor that multiplies a small block of low-bit values (in NVFP4, 8 bits per 16 values).
 - **Block sum**: in this model, the running sum of the outputs of one group of 6 layers; sublayers read a learned mix of these instead of one residual stream.
 - **Cache sector**: the unit in which the cache fetches data from memory, here 32 bytes; touching one byte brings in its whole sector.
+- **Calibration (of a probability estimate)**: adjusting an estimated probability so that it matches how often the event really happens; here, learning from verified drafts how often a draft of a given kind is accepted.
 - **Cancel flag**: a value shared between two threads that one sets to ask the other to stop a piece of work; the other checks it at points where stopping is safe.
 - **Causality (attention mask)**: the rule that a token may attend only to itself and earlier positions, never to later ones; the mask is whatever enforces it, here probability 0 for slots that are not visible.
 - **Ceiling**: the best speed the hardware could reach in theory for a workload.
@@ -3292,6 +3508,7 @@ Alphabetical. Later entries extend this list.
 - **Control token**: a special token the model emits to mark structure (start of thinking, start of answer, end of message, end of sampling) rather than text.
 - **Control-token injection**: text supplied as data (a message, a tool result) that contains the spelling of a control token and is turned into that token when the prompt is tokenised, so that the data changes the structure of the prompt.
 - **Convolution (over the token axis)**: a weighted sum of a value at the current token and at a few preceding tokens; "4-tap" means four tokens take part.
+- **Copied draft (prompt-lookup decoding)**: a draft taken from the conversation itself: when the last tokens repeat an earlier passage, the tokens that followed that passage are proposed as the next ones; often called prompt-lookup decoding.
 - **CORS (cross-origin resource sharing)**: the browser rule that a web page may read a reply from a server of another origin (scheme, host and port) only if that server names the page's origin in a response header.
 - **Crate**: a Rust library package.
 - **CUDA**: NVIDIA's platform and C++ dialect for programming its GPUs.
@@ -3389,8 +3606,10 @@ Alphabetical. Later entries extend this list.
 - **Prefetch**: reading data shortly before it is needed, only to get it into the cache.
 - **Prefill**: processing the prompt before the first output token.
 - **Prefix cache**: state a server keeps from a prompt it has already processed (here the KV caches and a snapshot of the ring buffers), which lets a later request that begins with the same tokens skip prefill for that part.
+- **Prior (of an estimate)**: the value an estimate starts from before anything has been observed, with a weight that says how many observations it counts for (here 8).
 - **Profiler**: a tool that measures how much time each part of a program takes.
 - **Prometheus counter / metrics endpoint**: a metrics endpoint is an HTTP address where a server publishes running totals about its own work; a Prometheus counter is one such total, in the text format of the Prometheus monitoring system.
+- **Proportional fairness**: a rule for sharing a resource that weighs each gain against what the receiver already gets, so that a gain for one who has little counts more; it gives up some total throughput for a more even split.
 - **PTX / inline assembly**: PTX is the assembly language of NVIDIA GPUs; inline assembly (`asm`) writes such instructions directly inside C++ code.
 - **PyTorch**: the standard Python library for neural-network arithmetic.
 - **Quadratic-time bug**: code that repeats work on everything produced so far at every step, so the total work grows with the square of the output length.
@@ -3402,6 +3621,7 @@ Alphabetical. Later entries extend this list.
 - **Rejection sampling (speculative)**: the rule that keeps a draft token with a probability set by the full model and otherwise draws a replacement from what is left of the full model's distribution, so the output is distributed exactly as without speculation.
 - **Relative position bias**: a learned amount added to an attention score that depends only on how many tokens apart the two tokens are.
 - **Residual stream**: in an ordinary transformer, the single running vector per token that every layer reads and adds its output to.
+- **Rewind (of a run)**: setting a conversation's position back to its first rejected draft, so that the next step overwrites the rejected rows; the state stored for the positions before that point must still be intact.
 - **Ring buffer**: a fixed-size array written in a circle, so the newest entry overwrites the oldest.
 - **Ring buffer slot collision**: two different positions landing on the same slot of a ring buffer because they differ by a multiple of its size; a data race if one kernel launch reads the slot for one position and writes it for the other.
 - **RoPE (rotary position embedding)**: the common way of telling attention where tokens are, by rotating query and key vectors by a position-dependent angle; not used by the main model, but used by the DSpark drafter (Step 19).
@@ -3443,6 +3663,7 @@ Alphabetical. Later entries extend this list.
 - **Tensor core**: a hardware unit in NVIDIA GPUs that multiplies small matrices in one instruction.
 - **Throughput work vs latency work**: throughput work is judged by how much completes per second and gains from large batches (prefill); latency work is judged by how soon one result arrives and gains from short steps (single-token decoding).
 - **Tile**: the piece of a weight matrix one tensor-core instruction consumes, here 16 rows × 32 bytes = 512 bytes.
+- **Tile of rows**: the group of rows of a step that the matrix kernels handle together (8, 16, 32 or 64 here); the first row beyond a full group moves the step to the next size and adds far more time than a row inside a group.
 - **Time-slicing (GPU)**: the GPU serving several programs by switching between them in short turns, so each one waits while another has its turn.
 - **Time to first token (TTFT)**: the delay between sending a request and receiving the first piece of the answer.
 - **Token**: the unit of text a model reads and writes.
@@ -3451,6 +3672,7 @@ Alphabetical. Later entries extend this list.
 - **Total variation distance**: a measure of how different two probability distributions are: half the sum of the absolute differences of their probabilities, from 0 (identical) to 1 (no overlap).
 - **Transformer**: the standard layered neural network design for language models.
 - **Transposed layout**: storing a matrix with rows and columns swapped; here the value cache has dimensions as rows and keys as columns, the orientation the value product needs.
+- **Trigram index**: a table from every run of three consecutive tokens (a trigram) to the place where that run last occurred, used to find an earlier passage that ends in the same tokens.
 - **Triton**: a Python-based language for writing GPU kernels.
 - **Underflow (floating point)**: a result too close to zero for the number format to represent, which is silently replaced by 0.
 - **Unit scale (quantisation)**: storing values in a low-bit format directly, with no scale factor, which works when the values are already bounded to a range the format covers.

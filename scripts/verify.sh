@@ -9,9 +9,11 @@ echo "== golden outputs (vLLM greedy tokens; a few mismatches per prompt are num
 $BIN check tests/oracle/golden.json 2>/dev/null | tee "$TMP/golden.txt"
 bad=$(awk '{s+=$6} END{print s+0}' "$TMP/golden.txt"); [ "$bad" -le 20 ] || { echo "FAIL: $bad golden mismatches (expected about 10 of 236)"; exit 1; }
 echo "== batch size must not change results"
-$BIN argmaxes 1500 > "$TMP/b16.txt" 2>/dev/null; INK_CHUNK=1 $BIN argmaxes 1500 > "$TMP/b1.txt" 2>/dev/null; for c in 128 100 48 14 13; do INK_CHUNK=$c $BIN argmaxes 1500 > "$TMP/bx.txt" 2>/dev/null
-  cmp -s "$TMP/b16.txt" "$TMP/bx.txt" || { echo "FAIL: batch-$c and batch-16 greedy tokens differ"; exit 1; }; done   # 100 and 48 straddle the 1,024-token bucket boundary
-cmp -s "$TMP/b16.txt" "$TMP/b1.txt" || { echo "FAIL: batch-16 and batch-1 greedy tokens differ"; exit 1; }; echo "ok"
+$BIN argmaxes 1500 > "$TMP/b16.txt" 2>/dev/null; INK_CHUNK=1 $BIN argmaxes 1500 > "$TMP/b1.txt" 2>/dev/null; for c in 128 100 56 48 38 37 30 24 9 8; do INK_CHUNK=$c $BIN argmaxes 1500 > "$TMP/bx.txt" 2>/dev/null
+  cmp -s "$TMP/b16.txt" "$TMP/bx.txt" || { echo "FAIL: batch-$c and batch-16 greedy tokens differ"; exit 1; }; done   # 100 and 48 straddle the 1,024-token bucket boundary; 37/38 the conv-history limit; 8/9, 24, 30, 56 the kernels' row groups
+cmp -s "$TMP/b16.txt" "$TMP/b1.txt" || { echo "FAIL: batch-16 and batch-1 greedy tokens differ"; exit 1; }
+# the matrix kernel that packs its inputs first (batches of 9+) must agree with the plain one
+INK_PACK_MIN=999 INK_CHUNK=100 $BIN argmaxes 1500 > "$TMP/bx.txt" 2>/dev/null; cmp -s "$TMP/b16.txt" "$TMP/bx.txt" || { echo "FAIL: plain and packed-input matrix kernels differ"; exit 1; }; echo "ok"
 echo "== conversations advanced together must match separate runs"
 $BIN interleave 3 1300 2>/dev/null | tail -1 | grep -q IDENTICAL || { echo "FAIL: interleaved conversations differ from separate runs"; exit 1; }; echo "ok"
 echo "== drafts computed for several conversations at once must match one at a time"
