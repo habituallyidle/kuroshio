@@ -24,13 +24,13 @@ WARN_FRAC, FAIL_FRAC = 0.15, 0.35
 
 # Figures claimed in README.md ("Headline" table and the bullets under it).
 CLAIM_DECODE_1 = 242.0        # "Decode, 1 stream (tok/s)", temperature 0.6, 512-token completions
-CLAIM_DECODE_2_TOTAL = 381.0  # "Decode, 2 streams, total"
-CLAIM_DECODE_4_TOTAL = 474.0  # "Decode, 4 streams, total"
-CLAIM_PREFILL_4K = 2360.0     # "Prompt processing (tok/s, 4K prompt)"
+CLAIM_DECODE_2_TOTAL = 378.0  # "Decode, 2 streams, total"
+CLAIM_DECODE_4_TOTAL = 495.0  # "Decode, 4 streams, total"
+CLAIM_PREFILL_4K = 3150.0     # "Prompt processing (tok/s, 4K prompt)"
 CLAIM_SPEC0 = 158.0           # "Without speculative decoding ... 158 tok/s (--spec 0)"
-CLAIM_8BIT_DECODE = 250.0     # "With --kv 8 --dense 8: ... about 250 tok/s"
-CLAIM_8BIT_PREFILL = 2800.0   # "... 2,800 tok/s prompt processing"
-CLAIM_FOLLOWUP_TTFT_MS = 56.0  # "11-56 ms to first token in an agent loop": the upper end is the claim checked
+CLAIM_8BIT_DECODE = 260.0     # "With --kv 8 --dense 8: ... about 260 tok/s"
+CLAIM_8BIT_PREFILL = 3500.0   # "... 3,500 tok/s prompt processing"
+CLAIM_FOLLOWUP_TTFT_MS = 50.0  # "typically 30-50 ms to first token in an agent loop": the upper end is the claim checked
 
 GEN_TOKENS = 512              # as in the README's benchmark; every run must reach at least MIN_TOKENS
 MIN_TOKENS = 300
@@ -168,7 +168,7 @@ def single(st, ctx):
     if len(ttfts) >= 3:
         st.num("agent loop: follow-up time to first token, median (min-max)", f"{median(ttfts):.0f} ({min(ttfts):.0f}-{max(ttfts):.0f})", "ms")
         st.num("agent loop: share of prompt tokens served from the cache", f"{100 * median(cached_share):.0f}", "%")
-        claim(st, ctx, "follow-up turn, time to first token in an agent loop (upper end of 11-56 ms)", median(ttfts), CLAIM_FOLLOWUP_TTFT_MS, "ms", higher_is_better=False,
+        claim(st, ctx, "follow-up turn, time to first token in an agent loop (upper end of 30-50 ms)", median(ttfts), CLAIM_FOLLOWUP_TTFT_MS, "ms", higher_is_better=False,
               how=f"median over {len(ttfts)} follow-up requests of a synthetic tool loop (about 1.3K-token system prompt, one bash call and a short tool result per step)")
     else:
         st.warn("agent loop: the model stopped calling tools before 3 follow-ups could be timed", f"{len(ttfts)} follow-ups")

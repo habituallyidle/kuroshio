@@ -26,7 +26,9 @@
 namespace {
 cudaStream_t g_stream = nullptr;
 const int D = 2304, H = 24, HKV = 8, DH = 128, DR = 16, EXT = 1024, NE = 128, TOPK = 8, I2 = 1152;
-const int V0 = 200058, NVIS = 48, TMAX = 128;              // TMAX: most tokens of one sequence per forward call (prefill batch)
+const int V0 = 200058, NVIS = 48, TMAX = 256;              // TMAX: most rows of one step (a prompt batch)
+const int HMAX = 128;                                     // most rows of a step that uses the output head (decoding); also the size of an attention
+                                                          // sub-batch: a bigger step runs its attention in halves (see forward_body)
 const int QKVR = 8600;                                   // rows of the fused q|r|gate|sink|k|v projection
 const int R_Q = 0, R_R = 3072, R_GATE = 3456, R_SINK = 6528, R_K = 6552, R_V = 7576;
 const int RING = 1152;                                   // local KV ring: window 1024 + batch headroom
@@ -284,7 +286,7 @@ const int TASKW = 10;
 __global__ void k_tasks(const int* ids, int N, int* tasks, int* ntasks) {
     // Per expert: which tokens picked it (a bit each: an expert is picked at most once per token) and as which of
     // their 8 picks. Filled by the threads in parallel, 8 picks each at most, so the cost does not grow with the
-    // batch the way a scan of all picks by every expert's thread did (154 us at 128 tokens, 48 times per step).
+    // batch the way a scan of all picks by every expert's thread did (20 us at 128 tokens against 5 now, 48 times per step).
     __shared__ unsigned int mask[NE][TMAX / 32]; __shared__ unsigned char slot[NE][TMAX]; __shared__ int wsum_[NE / 32];
     int e = threadIdx.x;
     for (int w = 0; w < TMAX / 32; w++) mask[e][w] = 0;
@@ -314,6 +316,11 @@ __global__ void k_tasks(const int* ids, int N, int* tasks, int* ntasks) {
     }
     if (e == NE - 1) *ntasks = rank + mine;
 }
+
+// Most tasks N picks can make: each of at most NE experts rounds its tokens up to a multiple of 8. The expert
+// kernels' grids are this tall, not N: at 128 tokens that is 240 task rows instead of 1,024, mostly empty, each
+// costing a block start.
+static inline int max_tasks(int N) { return (N + 7 * std::min(NE, N)) / 8; }
 
 // Expert GEMM on the tensor cores. One warp = 16 weight rows (operand A); columns (operand B) = the tokens
 // of this task. Grid: (R/128, max tasks). x_per_slot: the activation row is per (token, slot), else per token.
@@ -379,18 +386,22 @@ __global__ void k_gate(const float* h, const float* gain, const float* forget, c
 // bit for bit. Slower than the warp form below about 40 tokens: few threads have work.
 const int GATE_BIG = 48;
 __global__ void k_gate_big(const float* h, const float* gain, const float* forget, const float* dest, int dstride, const float* msg, int mstride, float* x, int T) {
-    __shared__ float sh[TMAX * 64]; __shared__ float sg[8 * 64]; __shared__ float sf[8 * 64];
+    __shared__ float sh[HMAX * 64]; __shared__ float sg[8 * 64]; __shared__ float sf[8 * 64];
     int c0 = blockIdx.x * 8, tid = threadIdx.x;
-    for (int i = tid; i < T * 64; i += 256) sh[i] = h[i];
     for (int i = tid; i < 8 * 64; i += 256) { sg[i] = gain[(size_t)c0 * 64 + i]; sf[i] = forget[(size_t)c0 * 64 + i]; }
-    __syncthreads();
-    for (int p = tid; p < T * 8; p += 256) {
-        int t = p >> 3, w = p & 7, c = c0 + w; const float* hh = sh + t * 64; const float* g = sg + w * 64; const float* f = sf + w * 64;
-        float va[32], vf[32];
-        for (int l = 0; l < 32; l++) { va[l] = fmaf(hh[l], g[l], hh[l + 32] * g[l + 32]); vf[l] = fmaf(hh[l], f[l], hh[l + 32] * f[l + 32]); }
-        for (int o = 16; o > 0; o >>= 1) for (int l = 0; l < o; l++) { va[l] += va[l + o]; vf[l] += vf[l + o]; }
-        float a = (1.0f - tanhf(vf[0])) * dest[(size_t)t * dstride + c]; float b = tanhf(va[0]) * msg[(size_t)t * mstride + c];
-        x[(size_t)t * D + c] = a + b;
+    for (int t0 = 0; t0 < T; t0 += HMAX) {                 // HMAX tokens at a time: what fits in shared memory
+        int n = min(HMAX, T - t0);
+        __syncthreads();
+        for (int i = tid; i < n * 64; i += 256) sh[i] = h[(size_t)t0 * 64 + i];
+        __syncthreads();
+        for (int p = tid; p < n * 8; p += 256) {
+            int t = t0 + (p >> 3), w = p & 7, c = c0 + w; const float* hh = sh + (p >> 3) * 64; const float* g = sg + w * 64; const float* f = sf + w * 64;
+            float va[32], vf[32];
+            for (int l = 0; l < 32; l++) { va[l] = fmaf(hh[l], g[l], hh[l + 32] * g[l + 32]); vf[l] = fmaf(hh[l], f[l], hh[l + 32] * f[l + 32]); }
+            for (int o = 16; o > 0; o >>= 1) for (int l = 0; l < o; l++) { va[l] += va[l + o]; vf[l] += vf[l + o]; }
+            float a = (1.0f - tanhf(vf[0])) * dest[(size_t)t * dstride + c]; float b = tanhf(va[0]) * msg[(size_t)t * mstride + c];
+            x[(size_t)t * D + c] = a + b;
+        }
     }
 }
 // out[t*ostride ..] = bf16(rmsnorm(x[t]) * w)
@@ -499,9 +510,9 @@ template <int NS, int Q> __global__ void k_post_moe(PostMoe a) {
 // 1024 threads per block: the 128 head dimensions use the first 4 warps, the 1024 bias distances use all.
 __global__ void k_attn_prep(const float* proj, const float* qscale, const float* rscale, const float* rel, int is_global, const Row* rows,
                             float* qc, float* bias, float* kring, float* vring, const float* wk, const float* wv, const float* dk,
-                            const float* dv, uint16_t* Kc, uint16_t* Vc, int kv8, size_t kvstride) {
+                            const float* dv, uint16_t* Kc, uint16_t* Vc, int kv8, size_t kvstride, int t0) {
     __shared__ float sh[32 * 2]; __shared__ float sh2[32]; __shared__ float rc[DR];
-    int t = blockIdx.x, d = threadIdx.x; const Row rw = rows[t]; const int p = rw.pos;
+    int t = t0 + blockIdx.x, d = threadIdx.x; const Row rw = rows[t]; const int p = rw.pos;
     const float* pr = proj + (size_t)t * QKVR;
     if (blockIdx.y < H) {
         int h = blockIdx.y; float tau = 1.0f;
@@ -635,18 +646,22 @@ __global__ void k_gate3(const float* h, const float* gain, const float* forget, 
     if (lane == 0) { float a = (1.0f - tanhf(fa)) * dest[(size_t)t * dstride + s * doff + c]; float b = tanhf(ga) * msg[((size_t)t * 4 + s) * D + c]; x[((size_t)t * 3 + s) * D + c] = a + b; }
 }
 __global__ void k_gate3_big(const float* h, const float* gain, const float* forget, const float* dest, int dstride, int doff, const float* msg, float* x, int T) {
-    __shared__ float sh[TMAX * 64]; __shared__ float sg[8 * 64]; __shared__ float sf[8 * 64];
+    __shared__ float sh[HMAX * 64]; __shared__ float sg[8 * 64]; __shared__ float sf[8 * 64];
     int s = blockIdx.y, c0 = blockIdx.x * 8, tid = threadIdx.x;
-    for (int i = tid; i < T * 64; i += 256) sh[i] = h[(size_t)(i >> 6) * 192 + s * 64 + (i & 63)];
     for (int i = tid; i < 8 * 64; i += 256) { sg[i] = gain[((size_t)s * D + c0) * 64 + i]; sf[i] = forget[((size_t)s * D + c0) * 64 + i]; }
-    __syncthreads();
-    for (int p = tid; p < T * 8; p += 256) {
-        int t = p >> 3, w = p & 7, c = c0 + w; const float* hh = sh + t * 64; const float* g = sg + w * 64; const float* f = sf + w * 64;
-        float va[32], vf[32];
-        for (int l = 0; l < 32; l++) { va[l] = fmaf(hh[l], g[l], hh[l + 32] * g[l + 32]); vf[l] = fmaf(hh[l], f[l], hh[l + 32] * f[l + 32]); }
-        for (int o = 16; o > 0; o >>= 1) for (int l = 0; l < o; l++) { va[l] += va[l + o]; vf[l] += vf[l + o]; }   // the order a warp sum takes
-        float a = (1.0f - tanhf(vf[0])) * dest[(size_t)t * dstride + s * doff + c]; float b = tanhf(va[0]) * msg[((size_t)t * 4 + s) * D + c];
-        x[((size_t)t * 3 + s) * D + c] = a + b;
+    for (int t0 = 0; t0 < T; t0 += HMAX) {
+        int n = min(HMAX, T - t0);
+        __syncthreads();
+        for (int i = tid; i < n * 64; i += 256) sh[i] = h[(size_t)(t0 + (i >> 6)) * 192 + s * 64 + (i & 63)];
+        __syncthreads();
+        for (int p = tid; p < n * 8; p += 256) {
+            int t = t0 + (p >> 3), w = p & 7, c = c0 + w; const float* hh = sh + (p >> 3) * 64; const float* g = sg + w * 64; const float* f = sf + w * 64;
+            float va[32], vf[32];
+            for (int l = 0; l < 32; l++) { va[l] = fmaf(hh[l], g[l], hh[l + 32] * g[l + 32]); vf[l] = fmaf(hh[l], f[l], hh[l + 32] * f[l + 32]); }
+            for (int o = 16; o > 0; o >>= 1) for (int l = 0; l < o; l++) { va[l] += va[l + o]; vf[l] += vf[l + o]; }   // the order a warp sum takes
+            float a = (1.0f - tanhf(vf[0])) * dest[(size_t)t * dstride + s * doff + c]; float b = tanhf(va[0]) * msg[((size_t)t * 4 + s) * D + c];
+            x[((size_t)t * 3 + s) * D + c] = a + b;
+        }
     }
 }
 __global__ void k_rms3(const float* x, const float* w, int wstride, float* out) {
@@ -1693,7 +1708,7 @@ int ink_ensure(void* ep, int seq, int tokens) {
     if (tokens <= e->ctx_mapped[seq]) return 0;
     size_t kvt = (size_t)HKV * DH * (e->kv8 ? 1 : 2), dkt = (size_t)HKV * DH * 2;   // bytes per token: one cache of a full-attention visit; drafter
     int bucket = 1024; while (bucket < tokens) bucket *= 2;
-    size_t sc = vround(std::max((size_t)TMAX * H * RING, (size_t)GSUB * H * std::min(bucket, e->max_ctx)) * 4);
+    size_t sc = vround(std::max((size_t)HMAX * H * RING, (size_t)GSUB * H * std::min(bucket, e->max_ctx)) * 4);
     size_t add = sc > e->vsc.mapped ? sc - e->vsc.mapped : 0;
     for (int v = 0; v < NVIS; v++) if (e->vis_global[v]) add += 2 * ((size_t)tokens * kvt - std::min(e->vK[v][seq].mapped, (size_t)tokens * kvt));
     if (d.on) add += 2 * ((size_t)tokens * dkt - std::min(e->vdK[seq].mapped, (size_t)tokens * dkt));
@@ -1725,7 +1740,7 @@ void ink_trim(void* ep, int seq, int tokens) {
     if ((int)left < e->snap_tokens[seq]) e->snap_ok[seq] = false;          // the snapshot's prefix is gone
     int most = 0; for (int q = 0; q < e->nseq; q++) most = std::max(most, e->ctx_mapped[q]);
     int bucket = 1024; while (bucket < most) bucket *= 2;                  // the score scratch follows the longest conversation left
-    e->vsc.shrink(std::max((size_t)TMAX * H * RING, most ? (size_t)GSUB * H * std::min(bucket, e->max_ctx) : 0) * 4);
+    e->vsc.shrink(std::max((size_t)HMAX * H * RING, most ? (size_t)GSUB * H * std::min(bucket, e->max_ctx) : 0) * 4);
 }
 
 // Free memory on the GPU right now, in bytes (used to size the context before loading).
@@ -1907,11 +1922,11 @@ void ink_finalize(void* ep) {
         {   // Fold the head: M = bf16(unembed @ hidden_out.weight) [V0][256], bvec = unembed @ hidden_out.bias [V0]
             std::vector<float> how(D * MR), x((size_t)MR * D), hb(D); host_bf16("markov_head.hidden_out.weight", how.data(), how.size()); host_bf16("markov_head.hidden_out.bias", hb.data(), D);
             for (int c = 0; c < D; c++) for (int j = 0; j < MR; j++) x[(size_t)j * D + c] = how[(size_t)c * MR + j];
-            float *dx, *tmp = dalloc((size_t)TMAX * V0); CK(cudaMalloc(&dx, x.size() * 4)); CK(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+            float *dx, *tmp = dalloc((size_t)HMAX * V0); CK(cudaMalloc(&dx, x.size() * 4)); CK(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
             uint16_t* M; CK(cudaMalloc(&M, (size_t)V0 * MR * 2));
-            for (int c0 = 0; c0 < MR; c0 += TMAX) {
-                gemv(V0, TMAX, e->unembed, D, TMAX, dx + (size_t)c0 * D, dx + (size_t)c0 * D, dx + (size_t)c0 * D, D, V0, V0, tmp, V0, 0);
-                k_fold<<<(unsigned)(((size_t)V0 * TMAX + 255) / 256), 256, 0, g_stream>>>(tmp, M, c0, TMAX);
+            for (int c0 = 0; c0 < MR; c0 += HMAX) {
+                gemv(V0, HMAX, e->unembed, D, HMAX, dx + (size_t)c0 * D, dx + (size_t)c0 * D, dx + (size_t)c0 * D, D, V0, V0, tmp, V0, 0);
+                k_fold<<<(unsigned)(((size_t)V0 * HMAX + 255) / 256), 256, 0, g_stream>>>(tmp, M, c0, HMAX);
             }
             CK(cudaMemcpy(dx, hb.data(), D * 4, cudaMemcpyHostToDevice));
             d.bvec = dalloc(V0); gemv(V0, 1, e->unembed, D, 1, dx, dx, dx, D, V0, V0, d.bvec, V0, 0);
@@ -1960,12 +1975,12 @@ void ink_finalize(void* ep) {
     e->inputs = dalloc(T * 3 * D); e->msg = dalloc(T * 4 * D); e->xin = dalloc(T * 3 * D); e->proj = dalloc(T * QKVR);
     e->dk = dalloc(T * 32); e->dv = dalloc(T * 32); e->qc = dalloc(T * H * DH); e->bias = dalloc(T * H * EXT);
     // Score scratch: T x H x RING for the sliding-window layers; GSUB x H x (context bucket) for full attention, attached on demand.
-    e->vsc.reserved = vround(std::max((size_t)T * H * RING, (size_t)GSUB * H * (size_t)e->max_ctx) * 4); e->vsc.base = vreserve(e->vsc.reserved);
-    if (!e->vsc.grow((size_t)T * H * RING * 4)) { fprintf(stderr, "out of GPU memory for the score scratch\n"); abort(); }
+    e->vsc.reserved = vround(std::max((size_t)HMAX * H * RING, (size_t)GSUB * H * (size_t)e->max_ctx) * 4); e->vsc.base = vreserve(e->vsc.reserved);
+    if (!e->vsc.grow((size_t)HMAX * H * RING * 4)) { fprintf(stderr, "out of GPU memory for the score scratch\n"); abort(); }
     e->att_sc = (float*)e->vsc.base; e->att_l = dalloc(T * H * 2); e->att_y = dalloc(T * H * DH); e->attn_raw = dalloc(T * D); e->attn_out = dalloc(T * D);
     e->mixtmp = dalloc(T * D); e->pair = dalloc(T * 3 * 2 * D); e->hbuf = dalloc(T * 192); e->gx = dalloc(T * 3 * D); e->mlp_in = dalloc(T * D); e->rlogit = dalloc(T * NE); e->gamma = dalloc(T * TOPK); e->xq = dalloc(T * D);
     e->xamax = dalloc(T); e->gu = dalloc(T * TOPK * D); e->act = dalloc(T * TOPK * I2); e->aq = dalloc(T * TOPK * I2); e->aamax = dalloc(T * TOPK);
-    e->down = dalloc(T * TOPK * D); e->moe_out = dalloc(T * D); e->y = dalloc(T * D); e->out = dalloc(T * D); e->logits = dalloc(T * (size_t)V0);
+    e->down = dalloc(T * TOPK * D); e->moe_out = dalloc(T * D); e->y = dalloc(T * D); e->out = dalloc(T * D); e->logits = dalloc(HMAX * (size_t)V0);
     CK(cudaMalloc(&e->tok, T * 4)); CK(cudaMalloc(&e->ids, T * TOPK * 4)); CK(cudaMalloc(&e->arg, T * 4)); CK(cudaMalloc(&e->rows, T * sizeof(Row))); e->feats = dalloc(4 * T * D); e->head_v = dalloc(T * HEAD_PARTS); e->rowmax = dalloc(T); CK(cudaMalloc(&e->head_i, T * HEAD_PARTS * 4));
     CK(cudaMalloc(&e->sparts, T * HEAD_PARTS * sizeof(SampPart))); e->sparam = dalloc(2 * T); CK(cudaMalloc(&e->excl, 2 * TMAX * 4)); e->qrow = e->excl + TMAX; e->rowz = dalloc(T); CK(cudaMalloc(&e->rparts, (size_t)T * HEAD_PARTS * sizeof(ResPart))); CK(cudaMalloc(&e->sres, T * 16));
     CK(cudaMalloc(&e->tasks, T * TOPK * TASKW * 4)); CK(cudaMalloc(&e->ntasks, 4));
@@ -1998,7 +2013,7 @@ static void forward_body(Engine* e, int T, int gchunks, bool head) {
     if (!pf_init) { pf_init = true; if (const char* c = getenv("INK_PF_Q")) sscanf(c, "%lf,%lf,%lf,%lf", &pf_q[0], &pf_q[1], &pf_q[2], &pf_q[3]); }
     k_embed<<<T, 256, 0, g_stream>>>(e->tok, e->embed, e->embed_norm, e->stack[0]);
     if (g_prof) { CK(cudaStreamSynchronize(g_stream)); g_last = now(); }
-    int nb = 0, Q = 0, visit = 0, N = T * TOPK; bool have_inputs = false, have_dests = false;
+    int nb = 0, Q = 0, visit = 0, N = T * TOPK, NTK = max_tasks(N); bool have_inputs = false, have_dests = false;
     for (int seg = 0; seg < 5; seg++) {
         int lo = seg == 0 ? 0 : (seg == 4 ? 18 : 6), hi = seg == 0 ? 6 : (seg == 4 ? 24 : 18), p = seg == 0 || seg == 4 ? 0 : seg - 1;
         for (int i = lo; i < hi; i++, visit++) {
@@ -2046,28 +2061,35 @@ static void forward_body(Engine* e, int T, int gchunks, bool head) {
                 gemv(32, T, L.vproj, D, T, xv_, xv_, xv_, xs, 32, 32, e->dv, 32, 1);
             }
             prof("attn proj gemv");
-            k_attn_prep<<<dim3(T, H + HKV), 1024, 0, g_stream>>>(e->proj, L.qscale, L.rscale, L.rel, L.global, e->rows, e->qc, e->bias, e->ring[visit][0],
-                                                               e->ring[visit][1], L.kconv, L.vconv, e->dk, e->dv, e->Kc[visit], e->Vc[visit], e->kv8, kvs);
+            // Attention, at most HMAX rows at a time. A sliding-window layer keeps its keys and values in a ring with
+            // room for the window plus HMAX new positions, and every row's key and value are written before any score
+            // is read: with more rows in one go, late rows would overwrite slots that early rows still need. Each
+            // half therefore writes and reads before the next one writes - exactly what two smaller steps would do.
+            // (Everything outside this block runs once for the whole step, which is the point: the experts are read once.)
             const bool big = T > CR - 3;                    // only then can a run be too long to store its conv history in-kernel
+            for (int h0 = 0; h0 < T; h0 += HMAX) {
+                int hn = std::min(HMAX, T - h0);
+                k_attn_prep<<<dim3(hn, H + HKV), 1024, 0, g_stream>>>(e->proj, L.qscale, L.rscale, L.rel, L.global, e->rows, e->qc, e->bias, e->ring[visit][0],
+                                                                   e->ring[visit][1], L.kconv, L.vconv, e->dk, e->dv, e->Kc[visit], e->Vc[visit], e->kv8, kvs, h0);
+                prof("attn q/r/kv prep");
+                int ng = L.global ? gchunks * 2 : RING / 16, ns = ng * 16;      // scores, softmax, value sum on the tensor cores
+                if (!L.global) {
+                    k_attn_scores<<<dim3((ng + 7) / 8, hn * HKV), 256, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[visit], e->rows, 0, ng, e->att_sc, RING, h0, e->kv8, kvs);
+                    k_attn_soft<<<dim3(hn, H), 1024, 0, g_stream>>>(e->att_sc, RING, ns, e->att_l, h0);
+                    k_attn_pv<8><<<dim3(8, hn * HKV), 256, 0, g_stream>>>(e->att_sc, RING, (const uint8_t*)e->Vc[visit], ng, e->att_l, e->proj, e->att_y, 0, h0, e->kv8, e->rows, kvs);
+                } else for (int t0 = h0; t0 < h0 + hn; t0 += GSUB) {   // full-attention layers: GSUB tokens at a time, so the scratch stays small
+                    int tn = std::min(GSUB, h0 + hn - t0);
+                    k_attn_scores<<<dim3((ng + 7) / 8, tn * HKV), 256, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[visit], e->rows, 1, ng, e->att_sc, gchunks * 32, t0, e->kv8, kvs);
+                    k_attn_soft<<<dim3(tn, H), 1024, 0, g_stream>>>(e->att_sc, gchunks * 32, ns, e->att_l, t0);
+                    k_attn_pv<32><<<dim3(8, tn * HKV), 1024, 0, g_stream>>>(e->att_sc, gchunks * 32, (const uint8_t*)e->Vc[visit], ng, e->att_l, e->proj, e->att_y, 1, t0, e->kv8, e->rows, kvs);
+                }
+                prof("attn core");
+            }
             if (big) {
                 k_ring_put<<<T, 256, 0, g_stream>>>(e->proj, QKVR, R_K, e->ring[visit][0], 1024, e->rows);
                 k_ring_put<<<T, 256, 0, g_stream>>>(e->proj, QKVR, R_V, e->ring[visit][1], 1024, e->rows);
             }
             prof("attn q/r/kv prep");
-            {   // attention on the tensor cores: scores, softmax, value sum
-                int ng = L.global ? gchunks * 2 : RING / 16, ns = ng * 16;
-                if (!L.global) {
-                    k_attn_scores<<<dim3((ng + 7) / 8, T * HKV), 256, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[visit], e->rows, 0, ng, e->att_sc, RING, 0, e->kv8, kvs);
-                    k_attn_soft<<<dim3(T, H), 1024, 0, g_stream>>>(e->att_sc, RING, ns, e->att_l, 0);
-                    k_attn_pv<8><<<dim3(8, T * HKV), 256, 0, g_stream>>>(e->att_sc, RING, (const uint8_t*)e->Vc[visit], ng, e->att_l, e->proj, e->att_y, 0, 0, e->kv8, e->rows, kvs);
-                } else for (int t0 = 0; t0 < T; t0 += GSUB) {   // full-attention layers: GSUB tokens at a time, so the scratch stays small
-                    int tn = std::min(GSUB, T - t0);
-                    k_attn_scores<<<dim3((ng + 7) / 8, tn * HKV), 256, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[visit], e->rows, 1, ng, e->att_sc, gchunks * 32, t0, e->kv8, kvs);
-                    k_attn_soft<<<dim3(tn, H), 1024, 0, g_stream>>>(e->att_sc, gchunks * 32, ns, e->att_l, t0);
-                    k_attn_pv<32><<<dim3(8, tn * HKV), 1024, 0, g_stream>>>(e->att_sc, gchunks * 32, (const uint8_t*)e->Vc[visit], ng, e->att_l, e->proj, e->att_y, 1, t0, e->kv8, e->rows, kvs);
-                }
-            }
-            prof("attn core");
             if (e->fp8_attn) {
                 k_quant8f<<<dim3((H * DH) / 128, T), 32, 0, g_stream>>>(e->att_y, H * DH, e->tq, e->ts, H * DH);
                 gemm_fp8(L.f_wo, H * DH, T, e->tq, e->ts, e->attn_raw, 1, D);
@@ -2096,20 +2118,20 @@ static void forward_body(Engine* e, int T, int gchunks, bool head) {
             prof("router");
             if (L.fp8) {
                 k_quant8c<<<T, 128, 0, g_stream>>>(e->mlp_in, D, e->xcode8, e->xscale, D);
-                k_expert8_mma<<<dim3(D / 128, N), 256, 0, g_stream>>>(L.w13, L.w13s, e->tasks, e->ntasks, e->xcode8, e->xscale, 0, D, D, e->gu);
+                k_expert8_mma<<<dim3(D / 128, NTK), 256, 0, g_stream>>>(L.w13, L.w13s, e->tasks, e->ntasks, e->xcode8, e->xscale, 0, D, D, e->gu);
                 k_swiglu_quant8<<<N, 64, 0, g_stream>>>(e->gu, e->gamma, e->acode8, e->ascale);
-                k_expert8_mma<<<dim3(D / 128, N), 256, 0, g_stream>>>(L.w2, L.w2s, e->tasks, e->ntasks, e->acode8, e->ascale, 1, D, I2, e->down);
+                k_expert8_mma<<<dim3(D / 128, NTK), 256, 0, g_stream>>>(L.w2, L.w2s, e->tasks, e->ntasks, e->acode8, e->ascale, 1, D, I2, e->down);
             } else {
                 PF pq = pf_slice(nq, QKVR_BYTES, pf_q[0], pf_q[1], T), ps = pf_slice(nq, QKVR_BYTES, pf_q[1], pf_q[2], N);
                 if (q4_native) k_quant4f<<<T + pf_blocks(pq, D / 4), D / 4, 0, g_stream>>>(e->mlp_in, D, e->xamax, e->xcode, e->xscale, pq);
                 else k_quant4c<<<T + pf_blocks(pq, 256), 256, 0, g_stream>>>(e->mlp_in, D, e->xamax, e->xcode, e->xscale, pq);
                 prof("x quant4");
-                k_expert4_mma<<<dim3(D / 32, N), 256, 0, g_stream>>>(L.w13, L.w13s, L.w13amax, L.inv_den13, e->tasks, e->ntasks, e->xcode, e->xscale, e->xamax, 0, D, D, e->gu, 4);
+                k_expert4_mma<<<dim3(D / 32, NTK), 256, 0, g_stream>>>(L.w13, L.w13s, L.w13amax, L.inv_den13, e->tasks, e->ntasks, e->xcode, e->xscale, e->xamax, 0, D, D, e->gu, 4);
                 prof("x mma w13");
                 if (q4_native) k_swiglu_quant4f<<<N + pf_blocks(ps, I2 / 4), I2 / 4, 0, g_stream>>>(e->gu, e->gamma, e->aamax, e->acode, e->ascale, ps);
                 else k_swiglu_quant4<<<N + pf_blocks(ps, 256), 256, 0, g_stream>>>(e->gu, e->gamma, e->aamax, e->acode, e->ascale, ps);
                 prof("x swiglu+quant");
-                k_expert4_mma<<<dim3(D / 64, N), 256, 0, g_stream>>>(L.w2, L.w2s, L.w2amax, L.inv_den2, e->tasks, e->ntasks, e->acode, e->ascale, e->aamax, 1, D, I2, e->down, 2);
+                k_expert4_mma<<<dim3(D / 64, NTK), 256, 0, g_stream>>>(L.w2, L.w2s, L.w2amax, L.inv_den2, e->tasks, e->ntasks, e->acode, e->ascale, e->aamax, 1, D, I2, e->down, 2);
                 prof("x mma w2");
             }
             prof("experts fp8");
@@ -2169,7 +2191,7 @@ void ink_set_sampling(void* ep, float temperature, unsigned seed) { auto* e = (E
 int ink_step(void* ep, int T, const int* tokens, const int* seqs, const int* pos, const int* excl, int* res_out, float* logits_out, int want_head,
              const float* temps, const unsigned* seeds, const int* qrows) {
     auto* e = (Engine*)ep;
-    if (T < 1 || T > TMAX) return 1;
+    if (T < 1 || T > TMAX || ((want_head != 0 || logits_out != nullptr) && T > HMAX)) return 1;
     std::vector<Row> rows(T); int maxpos = 0; bool seen[MAXSEQ] = {};
     for (int t = 0, r0 = 0; t < T; t++) {
         if (seqs[t] < 0 || seqs[t] >= e->nseq || pos[t] < 0 || pos[t] >= e->ctx_mapped[seqs[t]] || tokens[t] < 0 || tokens[t] >= V0) return 1;
@@ -2359,8 +2381,9 @@ void ink_get_feats(void* ep, int T, float* out) {
 }
 
 void ink_microbench(void* ep, int T) {
-    auto* e = (Engine*)ep; int N = T * TOPK;
+    auto* e = (Engine*)ep; int N = T * TOPK, NTK = max_tasks(N);
     auto vis = [](int i) { return i < 18 ? i : i + 24; };
+    if (T < 1 || T > HMAX) { fprintf(stderr, "micro-benchmark: batch sizes 1..%d only\n", HMAX); return; }   // it runs the head and unsplit attention
     fprintf(stderr, "micro-benchmark, T=%d (time per launch)\n", T);
     mbench("empty kernel", 0, [&](int) { k_resid<<<1, 32, 0, g_stream>>>(nullptr, e->y, e->y, e->mixtmp, 1); });
     if (!e->fp8_attn) mbench("qkvr gemm (8600x2304 bf16)", 39.6, [&](int r) { Layer& L = e->L[r % 24]; gemv(QKVR, T, L.qkvr, D, T, e->inputs, e->inputs, e->inputs, D, R_K, R_V, e->proj, QKVR, 1); });
@@ -2372,7 +2395,7 @@ void ink_microbench(void* ep, int T) {
     }
     if (e->fp8_head) mbench("  fp8: output head gemm", 461.0, [&](int) { gemm_fp8(e->f_head, D, T, e->tq, e->ts, e->logits, 0, V0); });
     mbench("attn prep (q/r/bias + kv conv)", 0, [&](int r) { int i = r % 5; Layer& L = e->L[i];
-        k_attn_prep<<<dim3(T, H + HKV), 1024, 0, g_stream>>>(e->proj, L.qscale, L.rscale, L.rel, 0, e->rows, e->qc, e->bias, e->ring[i][0], e->ring[i][1], L.kconv, L.vconv, e->dk, e->dv, e->Kc[i], e->Vc[i], e->kv8, e->kv_local); });
+        k_attn_prep<<<dim3(T, H + HKV), 1024, 0, g_stream>>>(e->proj, L.qscale, L.rscale, L.rel, 0, e->rows, e->qc, e->bias, e->ring[i][0], e->ring[i][1], L.kconv, L.vconv, e->dk, e->dv, e->Kc[i], e->Vc[i], e->kv8, e->kv_local, 0); });
     mbench("attn scores (local, tensor cores)", 0, [&](int r) { int i = r % 5; k_attn_scores<<<dim3(9, T * HKV), 256, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[i], e->rows, 0, RING / 16, e->att_sc, RING, 0, e->kv8, e->kv_local); });
     mbench("attn softmax (local)", 0, [&](int) { k_attn_soft<<<dim3(T, H), 1024, 0, g_stream>>>(e->att_sc, RING, RING, e->att_l, 0); });
     mbench("attn value sum + gate (local)", 0, [&](int r) { int i = r % 5; k_attn_pv<8><<<dim3(8, T * HKV), 256, 0, g_stream>>>(e->att_sc, RING, (const uint8_t*)e->Vc[i], RING / 16, e->att_l, e->proj, e->att_y, 0, 0, e->kv8, e->rows, e->kv_local); });
@@ -2389,9 +2412,9 @@ void ink_microbench(void* ep, int T) {
     mbench("quantise x to NVFP4", 0, [&](int) { k_quant4c<<<T, 256, 0, g_stream>>>(e->mlp_in, D, e->xamax, e->xcode, e->xscale, PF{nullptr, 0, T}); });
     mbench("quantise x to NVFP4 (native cvt)", 0, [&](int) { k_quant4f<<<T, D / 4, 0, g_stream>>>(e->mlp_in, D, e->xamax, e->xcode, e->xscale, PF{nullptr, 0, T}); });
     mbench("swiglu + quantise (native cvt)", 0, [&](int) { k_swiglu_quant4f<<<N, I2 / 4, 0, g_stream>>>(e->gu, e->gamma, e->aamax, e->acode, e->ascale, PF{nullptr, 0, N}); });
-    mbench("experts w13 (NVFP4 mma)", T == 1 ? 23.9 : 0, [&](int r) { Layer& L = e->L[r % 20]; k_expert4_mma<<<dim3(D / 32, N), 256, 0, g_stream>>>(L.w13, L.w13s, L.w13amax, L.inv_den13, e->tasks, e->ntasks, e->xcode, e->xscale, e->xamax, 0, D, D, e->gu, 4); });
+    mbench("experts w13 (NVFP4 mma)", T == 1 ? 23.9 : 0, [&](int r) { Layer& L = e->L[r % 20]; k_expert4_mma<<<dim3(D / 32, NTK), 256, 0, g_stream>>>(L.w13, L.w13s, L.w13amax, L.inv_den13, e->tasks, e->ntasks, e->xcode, e->xscale, e->xamax, 0, D, D, e->gu, 4); });
     mbench("swiglu + quantise", 0, [&](int) { k_swiglu_quant4<<<N, 256, 0, g_stream>>>(e->gu, e->gamma, e->aamax, e->acode, e->ascale, PF{nullptr, 0, N}); });
-    mbench("experts w2 (NVFP4 mma)", T == 1 ? 11.9 : 0, [&](int r) { Layer& L = e->L[r % 20]; k_expert4_mma<<<dim3(D / 64, N), 256, 0, g_stream>>>(L.w2, L.w2s, L.w2amax, L.inv_den2, e->tasks, e->ntasks, e->acode, e->ascale, e->aamax, 1, D, I2, e->down, 2); });
+    mbench("experts w2 (NVFP4 mma)", T == 1 ? 11.9 : 0, [&](int r) { Layer& L = e->L[r % 20]; k_expert4_mma<<<dim3(D / 64, NTK), 256, 0, g_stream>>>(L.w2, L.w2s, L.w2amax, L.inv_den2, e->tasks, e->ntasks, e->acode, e->ascale, e->aamax, 1, D, I2, e->down, 2); });
     mbench("post-moe (combine+conv+resid+mix)", 0, [&](int r) { int i = r % 24; Layer& L = e->L[i]; PostMoe pm{}; pm.down = e->down; pm.ring = e->ring[vis(i)][3]; pm.w = L.mlp_sconv; pm.rows = e->rows;
         pm.attn_out = e->attn_out; pm.moe_out = e->moe_out; pm.partial = e->stack[2]; pm.stack_out = e->gx; pm.ns = 2; pm.src[0] = e->stack[0]; pm.src[1] = e->stack[1];
         pm.q = e->attn_q[i % 23]; pm.Q = 1; pm.norm = e->L[i].mlp_norm; pm.out = e->mixtmp; pm.pf = PF{nullptr, 0, T}; launch_post_moe(T, pm); });

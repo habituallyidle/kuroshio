@@ -8,7 +8,7 @@
 //! Scheduler: every engine step carries rows from all active conversations. Conversations that are generating
 //! contribute their next token (plus drafts worth verifying); conversations still reading their prompt share the
 //! remaining row budget.
-use crate::{chat::Chat, engine::{sampled_drafts, Drafts, Engine, SpecStats, DRAFT_BATCH, TMAX}};
+use crate::{chat::Chat, engine::{sampled_drafts, Drafts, Engine, SpecStats, DRAFT_BATCH, PMAX, TMAX}};
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 use std::{
@@ -339,7 +339,8 @@ impl Speculation {
 
     /// Step time in ms by number of rows, output head included, as measured on an RTX 5090 at short context
     /// (`kuroshio steptime` with INK_STEP_T; linear between the points). Not smooth: the matrix kernels work on
-    /// groups of 8 rows, and the 9th, 57th and 65th row in particular cost more than their neighbours.
+    /// groups of 8 rows; the 9th row costs more than its neighbours (a second group, and inputs are packed from
+    /// there on), so do the 57th (7 and 8 groups run a slower loop) and the 65th (a second launch).
     fn rows_ms(rows: usize) -> f32 {
         const PTS: [(f32, f32); 47] = [
             (1.0, 6.10), (2.0, 6.93), (3.0, 7.68), (4.0, 8.33), (5.0, 8.93), (6.0, 9.54), (7.0, 10.07), (8.0, 10.60),
@@ -715,14 +716,19 @@ fn scheduler(eng: &mut Engine, rx: mpsc::Receiver<Job>, cfg: Options, max_ctx: u
             plan[s] = Some(Plan { r0, n: fed.len() + 1, fed, forcing, confs, tops, sampled, copy_run });
         }
         if prefillers > 0 {
-            let budget = (TMAX - rows.len()).min(if decoders > 0 { prefill_share } else { TMAX });
+            // Where each prompt stops for now: before its snapshot point, or at its end.
+            let stop_of = |a: &Active, done: usize| { let len = a.job.prompt.len(); if prefix_cache && done < snapshot_at(len) { snapshot_at(len) } else { len } };
+            // A step that only reads prompts can carry PMAX rows - unless a prompt could end in it: its last row needs
+            // the output head, which takes TMAX rows at most.
+            let may_finish = slots.iter().filter_map(|sl| sl.active.as_ref()).any(|a| matches!(a.phase, Phase::Prefill { done } if stop_of(a, done) == a.job.prompt.len() && a.job.prompt.len() - done <= PMAX));
+            let most = if decoders == 0 && !may_finish { PMAX } else { TMAX };
+            let budget = (most - rows.len()).min(if decoders > 0 { prefill_share } else { most });
             let each = (budget / prefillers).max(1);
             for (s, slot) in slots.iter_mut().enumerate() {
                 let Some(a) = slot.active.as_ref() else { continue };
                 let Phase::Prefill { done } = a.phase else { continue };
-                let len = a.job.prompt.len();
-                let stop = if prefix_cache && done < snapshot_at(len) { snapshot_at(len) } else { len };
-                let c = each.min(stop - done).min(TMAX - rows.len()).min(slot.cap.saturating_sub(a.pos));
+                let stop = stop_of(a, done);
+                let c = each.min(stop - done).min(most - rows.len()).min(slot.cap.saturating_sub(a.pos));
                 if c == 0 {
                     continue;
                 }
@@ -745,7 +751,9 @@ fn scheduler(eng: &mut Engine, rx: mpsc::Receiver<Job>, cfg: Options, max_ctx: u
         });
         let t_step = Instant::now();
         let res = eng.step_rows_with(&rows, Some(&excl), head, Some(&sampling), Some(&qrows));
-        spec.observe_step(rows.len(), t_step.elapsed().as_secs_f32() * 1e3);
+        if head {
+            spec.observe_step(rows.len(), t_step.elapsed().as_secs_f32() * 1e3); // the step-time table is for steps with the head
+        }
 
         // ---- hand out the results
         for s in 0..nslots {

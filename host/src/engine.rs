@@ -32,6 +32,8 @@ extern "C" {
 
 pub const VOCAB: usize = 200_058;
 pub const TMAX: usize = 128;
+/// Most rows of a step that does not use the output head (prompt rows only).
+pub const PMAX: usize = 256;
 /// Whether drafts for a conversation at this temperature are sampled from the drafter's distribution (and accepted
 /// with probability min(1, p/q)) instead of being its most likely tokens. Off unless asked for (`--sampled-drafts`,
 /// INK_SAMPLED_DRAFTS=1): on Inkling 2 Mini it was measured to be no faster than most-likely-token drafts once the
@@ -178,7 +180,7 @@ impl Engine {
     /// As `step_rows`, with a (temperature, seed) per row.
     /// `qrows`: for a row that verifies a sampled draft, conversation * 7 + draft index; -1 otherwise.
     pub fn step_rows_with(&mut self, rows: &[(usize, usize, u32)], excl: Option<&[i32]>, head: bool, sampling: Option<&[(f32, u32)]>, qrows: Option<&[i32]>) -> Vec<Row> {
-        assert!(!rows.is_empty() && rows.len() <= TMAX);
+        assert!(!rows.is_empty() && rows.len() <= if head { TMAX } else { PMAX });
         let toks: Vec<c_int> = rows.iter().map(|r| r.2 as c_int).collect();
         let seqs: Vec<c_int> = rows.iter().map(|r| r.0 as c_int).collect();
         let pos: Vec<c_int> = rows.iter().map(|r| r.1 as c_int).collect();
@@ -192,6 +194,11 @@ impl Engine {
         assert_eq!(rc, 0, "the engine rejected a step: rows must be grouped by conversation, at consecutive positions, in range");
         self.last_batch = rows.len();
         res.chunks(4).map(|r| Row { greedy: r[0] as u32, sample: r[1] as u32, sample_excl: r[2] as u32, logp_excl: f32::from_bits(r[3] as u32) }).collect()
+    }
+
+    /// Position at which `forward` continues (after rows were fed with `step_rows`).
+    pub fn set_pos(&mut self, pos: usize) {
+        self.pos = pos;
     }
 
     /// Tell the drafter which row of the last step is conversation `seq`'s last valid position.

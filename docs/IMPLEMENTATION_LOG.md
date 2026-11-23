@@ -3459,6 +3459,269 @@ No change beyond the noise of this harness (Step 58), and none was to be expecte
 
 ---
 
+## Step 65 — The time between the matrix reads, and a benchmark line that timed the wrong kernel (2026-11-23)
+
+**What we did**
+
+**The starting point.** Step 64 measured the step time for every number of rows and found jumps at the 9th, 17th, 33rd and 65th row. It then scheduled around them. This step asks where the time of a step with many rows goes, and removes the part that is not the reading of weights. Steps with many rows are what prompt processing runs (128 rows, Step 42), and also several streams (Step 52) and copied drafts (Step 64). Every change in this step leaves the output bit-identical.
+
+**How to look at a cost that is not smooth.** Three measurements, from coarse to fine:
+
+1. *Every batch size.* `INK_STEP_T=... kuroshio steptime` (Step 64) times a step for each number of rows. A curve with jumps says more than a smooth one: something changes at exactly those sizes.
+2. *A per-stage profile on each side of a jump.* The profiler of Step 9 (`INK_PROF=1`) is run for two sizes one row apart, 16 and 17, or 32 and 33. A stage that costs the same on both sides is not the cause. The profiler adds a synchronisation to every stage (Step 22), but it adds the same on both sides, so the difference between the two profiles is not distorted by it.
+3. *One kernel alone, at that batch size.* The micro-benchmark of Step 22 (`kuroshio microbench`) used to run for 1 and 8 rows only. The environment variable `INK_MB_T=1,8,16` now lists the batch sizes to time.
+
+**What two of the jumps were.** The dense matrix kernel `k_gemm_bf16` takes the rows of a step in column groups of 8 (Step 42). The number of groups is a template parameter (Step 23), so each number of groups is a kernel compiled on its own. Only four had been compiled, and the launcher `gemv` took the smallest that was large enough:
+
+| Rows | Column groups needed | Column groups of the kernel that ran |
+|---|---|---|
+| 1–8 | 1 | 1 |
+| 9–16 | 2 | 2 |
+| 17–24 | 3 | 4 |
+| 25–32 | 4 | 4 |
+| 33–56 | 5–7 | 8 |
+| 57–64 | 8 | 8 |
+
+A step of 17 rows paid for 32, and a step of 33 rows paid for 64. An empty column group is not free: the kernel loads nothing for a row that is not there, but it still issues the tensor-core multiply for every group, with zeros.
+
+So the jumps at the 17th and the 33rd row were not a property of the hardware or of the instruction. They came from the list of compiled variants. `gemv` now selects among all eight by the number of groups, `(T + 7) / 8`. The 8-bit kernel `k_gemm_fp8` (Step 35) had the same four variants and got the same change in `gemm_fp8`.
+
+| Rows | Step time before, ms | After, ms |
+|---|---|---|
+| 17 | 16.27 | 15.70 |
+| 33 | 26.07 | 23.57 |
+
+Steps of 17–24 rows became 3.5–4% shorter, steps of 33–48 rows 7–10%.
+
+**One kernel, memory-bound at 8 rows and compute-bound at 64.** The micro-benchmark for the attention projection, the fused matrix of Step 21 with 8,600 rows and 39.6 MB, in µs (microseconds) per launch:
+
+| Rows | Time per launch |
+|---|---|
+| 1–8 | 26 µs |
+| 32 | 51 µs |
+| 64 | 115 µs |
+
+Every line of this table reads the same 39.6 MB. At 1–8 rows the kernel is memory-bound: Step 22 measured 27 µs as the floor for a cold read of 39.7 MB, and the kernel is at that floor. At 64 rows it takes more than four times as long for the same bytes. The extra time cannot be memory. The kernel has become compute-bound (Step 12): the instructions it executes per weight tile now set its speed.
+
+What one thread executes for one slice, 16 columns of the block's 16 weight rows, which is one tile (Step 21):
+
+- one load of 16 bytes of weights;
+- for every column group, two loads of 8 bytes of activations (two 32-bit floats each), and the shifts and masks that turn those four floats into four bf16 values in two 32-bit words, the form in which the instruction takes its second operand;
+- for every column group, one tensor-core multiply.
+
+With 8 column groups that is 16 activation loads and the conversion of 32 values for each weight load. The activations are few bytes and sit in the cache. That does not make loading them free: a GPU thread pays for every load instruction, cached or not (Step 10; a comment in the kernel puts it at roughly 0.1 µs). And the work is repeated. A block handles 16 weight rows, the projection has 538 blocks, and every block loads and converts the same activations again.
+
+**Packing each input once.** For 9 rows or more, `gemv` now first launches a small kernel, `k_pack_bf16`. It writes every input row once in the form the multiply takes it: the row's bf16 bits, ordered so that the 8 bytes one thread needs for one slice lie together. In a warp, 4 threads serve each of the group's 8 tokens. Thread q of the four (q = 0 to 3) supplies values 2q, 2q + 1, 8 + 2q and 9 + 2q of the slice's 16. The packed row is these groups of four, one after another, 8 bytes each. This is the idea of Step 21, to store data in the order in which the instruction consumes it, applied to the activations. The weights could be rearranged once when the model is loaded. The activations are new in every step, so they are rearranged once per matrix multiply.
+
+The kernel for packed inputs, `k_gemm_bf16p`, then does one 8-byte load per slice and column group, and no conversion.
+
+| Micro-benchmark, per launch | Plain kernel | Packed inputs |
+|---|---|---|
+| Attention projection, 16 rows | 32.4 µs | 28.3 µs |
+| Attention projection, 32 rows | 51.3 µs | 38.3 µs |
+| Attention projection, 64 rows | 114.8 µs | 80.5 µs |
+| Output head (0.9 GB), 32 rows | 972 µs | 776 µs |
+
+- **Each distinct input once.** The kernel takes three inputs for three ranges of weight rows, because the fused projection reads different inputs for q, k and v (Step 21). Often all three are the same buffer. `gemv` packs each distinct input once and passes the same packed buffer for the repeats.
+- **Where packing starts.** The threshold (`g_pack_min`) is 9 rows, the measured break-even. Below it there is one column group, the kernel is at its memory floor, and nothing is left between the reads to remove; the packing kernel would only add a launch. `INK_PACK_MIN` changes the threshold for experiments, and a large value turns packing off.
+- **Scratch.** Three buffers, each for 64 rows of up to 4,608 values (`XPK_C`), the widest input of any dense matrix. A matrix with a wider input would run the plain kernel.
+
+**Why the result is bit-identical.** Three things decide the bits of the output, and none of them changed:
+
+1. *The operand bits.* The inputs of these matrices are floats that already hold bf16 values: an earlier kernel has rounded them, and their low 16 bits are zero. A bf16 value is the top 16 bits of a float, so the conversion is a shift and a mask, without rounding. It gives the same bits whether every thread does it at every use or one kernel does it once.
+2. *The instruction.* The same multiply, with the same operands in the same positions.
+3. *The order of additions.* Every column group's running sums receive the slices in ascending order, as before, and the 16 warps' partial sums are added in the same order as before.
+
+This is "the same operations in the same order", as in Steps 16 and 23, and not "the same up to rounding".
+
+**The obstacle: registers per block.** The plain kernel loads the operands of 3 slices before it multiplies, so that their loads are in flight together (Step 16). The packed kernel was written the same way. For 8 column groups it compiled to 133 registers per thread. The block has 512 threads, and a block of 512 threads has 65,536 registers in total, which is 128 per thread. 512 × 133 is 68,096. The kernel compiled, and it did not launch.
+
+The fix: the number of slices per loop iteration is a second template parameter, `U`. It is 3 for 1–6 column groups and 2 for 7 and 8. With 8 groups, a thread holds the activations of 2 slices at a time, 8 × 2 × 2 = 32 words, where 3 slices need 48. The slices are still taken in ascending order, so the sums are unchanged.
+
+**The gate of the loop controller.** In the second and third pass of the loop, the input of each core sublayer is blended with a message from the previous pass (Step 4). The last arithmetic of the blend is the gate (Step 10). For every token and each of the 2,304 channels:
+
+```
+x = (1 − tanh(h · forget_c)) × dest + tanh(h · gain_c) × msg
+```
+
+h is the token's 64 controller values, and `forget_c` and `gain_c` are two rows of 64 learned values for channel c. `k_gate`, and `k_gate3` for the query, key and value inputs (Step 14), give one warp to each (token, channel) pair. Each thread loads two elements of h and two of each table row, the warp adds up its 32 partial sums with shuffles, and its first thread, lane 0, loads `dest` and `msg` and writes the result. (A lane is a thread's index within its warp.)
+
+For one token this is a good shape. With 128 tokens, every token's warps load the same table rows again: 4.7 MB of gain and forget tables, for the four inputs that a looped layer blends, once per token. The gate took 93 µs at 128 rows, and it runs 24 times per step, for the 12 looped layers in two passes.
+
+Three rewrites, each measured at 128 rows:
+
+| Form | Time |
+|---|---|
+| Before: one warp per (token, channel) | 93 µs |
+| 1. One warp per channel, looping over the tokens | 84 µs |
+| 2. The same, with h in shared memory | 79 µs |
+| 3. One thread per (token, channel), with h and the table rows in shared memory | 34 µs |
+
+*Rewrite 1* removes the waste that is easy to see. A warp loads its channel's table rows once and then loops over the tokens. The tables are no longer re-read, and the time barely moved. So the re-reads were not the cost. The loop is serial, and each iteration waits for lane 0's loads from global memory, the GPU's main memory. A warp executes one stream of instructions: while lane 0 waits for a load, the other 31 threads wait with it, and the next token cannot start. That is a load chain (Step 14) of 128 links in a kernel that looked parallel.
+
+*Rewrite 2* moves h into shared memory and gains 5 µs. The loads of h were not the wait either.
+
+*Rewrite 3* changes who waits. A block still covers 8 channels. It first copies h for all tokens and its 8 rows of each table into shared memory. Then every one of its 256 threads takes whole (token, channel) pairs for itself. With 128 tokens a block has 1,024 pairs, four per thread. A thread computes both dot products of 64 terms alone, from shared memory, and then does its own loads of `dest` and `msg` and its own store. Now 256 threads of a block have such loads in flight at once (Step 16), where before one lane per warp had. One launch has one block per 8 channels, where the old form has one per 8 channels and token.
+
+Step 10 warned against much work per thread. Here the long part of a thread's work is arithmetic on shared memory with fixed loop lengths, and at 128 rows every thread has work. At one row it is the other way round. A block has 8 pairs, so 8 of its 256 threads work, and each does serially what a warp did in parallel, after the block has staged data that is used once. That takes 5.7 µs, against 2.0 µs for the old form.
+
+**The same sum, in the same order.** A floating-point sum depends on the order of its additions (Steps 38 and 43). The two forms serve different batch sizes. If they added in different orders, the result of a token would depend on the batch size, which Step 43 forbids. So the serial loop adds in the order of the warp reduction. In the warp form, lane l first combines elements l and l + 32 of the dot product:
+
+```
+v[l] = fma(h[l], g[l], h[l + 32] × g[l + 32])
+```
+
+Then the reduction (`wsum`) runs 5 rounds with distances 16, 8, 4, 2 and 1. In each round, lane l adds the value of lane l + distance. Lane 0 ends with a tree: values 16 apart are added first, then the results 8 apart, and so on. The serial form computes the same 32 values with the same expression into an array and runs the same rounds:
+
+```
+for (o = 16; o > 0; o >>= 1)
+    for (l = 0; l < o; l++) v[l] += v[l + o];      // v[0] is the sum
+```
+
+Every addition has the same two operands as in the warp, so every intermediate result has the same bits. A plain running sum over the 64 products would be an equally valid dot product, and would differ in the last bits.
+
+**Both forms are kept.** `k_gate_big` and `k_gate3_big` run from 48 rows up (`GATE_BIG`), and the warp form below. A comment in the code puts the crossover at about 40 rows. Because the two forms give the same bits, the choice is only about speed. It is made on the host when the step's CUDA graph is recorded (Steps 11 and 59): every number of rows has its own graph, so nothing is decided on the GPU.
+
+**The task list.** The router picks 8 experts for every token. `k_tasks` (Step 13) turns the picks into a list of tasks {expert, up to 8 tokens}, grouped by expert, so that an expert's weights are read once for all its tokens. It is one block of 128 threads, one per expert, and in a step of more than one row it runs in each of the 48 layer visits. In the old kernel every thread read all picks of the step and kept those of its own expert: 1,024 picks at 128 rows, read by each of 128 threads. Then every thread added up the task counts of all experts before it, up to 127 additions, to find where its tasks start in the list.
+
+The new kernel builds the same list in five moves:
+
+1. **A bitmask per expert.** In shared memory every expert has 128 bits, one per token (4 words of 32 bits). Bit t set means that token t picked this expert. One bit is enough, because a token picks an expert at most once. A small second table notes which of the token's 8 picks it was. The threads share out the picks, thread e taking picks e, e + 128, e + 256 and so on, at most 8 each. For each pick a thread sets one bit.
+2. **An atomic OR.** Two threads can set bits in the same word at the same time, for two tokens that picked the same expert. Setting a bit is three operations: read the word, OR the bit in, write the word back. If two threads interleave them, one bit is lost. That is a data race (Step 14). `atomicOr` does the three as one operation that cannot be interleaved, and it works on shared memory.
+3. **Popcount.** The number of tokens of an expert is the number of set bits in its mask. `__popc` counts the set bits of a word in one instruction. The expert's number of tasks is that count divided by 8, rounded up.
+4. **A prefix sum by shuffles.** An expert's first task number is the sum of the task counts of all experts before it. A list of such running sums is called a prefix sum. Inside a warp it takes 5 rounds of shuffles with distances 1, 2, 4, 8 and 16: in each round a thread adds the value of the thread that distance below it, and after the last round it holds the sum of all values up to its own. The last thread of each warp puts the warp's total into shared memory, and a thread adds the totals of the warps before its own, at most 3 numbers.
+5. **Writing the tasks.** A thread walks through its mask from the lowest set bit upwards (`__ffs` finds the lowest set bit, `m &= m - 1` clears it). The tokens come out in ascending order, as in the old scan. The list is the same, entry for entry, so the expert kernels add in the same order as before.
+
+| Rows | Before | After |
+|---|---|---|
+| 16 | 3.6 µs | 1.5 µs |
+| 128 | 19.8 µs | 5.1 µs |
+
+**A measurement mistake.** The micro-benchmark has one line per kind of kernel. Its line "route top-8 + task list" launched `k_route_tasks`, the fused kernel of Step 14 that does the router's choice and the task list in one block. That is what a step of one row runs. A step of several rows runs two other kernels: `k_route`, with one block per token, and then `k_tasks`. The benchmark line launched the fused kernel at whatever batch size it was asked to time. That kernel works through the tokens one after another in its single block, so its time grows with every row. At 32 rows the line read 37.8 µs. Multiplied by the 48 layer visits, this looked like 6–8% of the step. On that figure, the rewrite of the task list was expected to be worth about 7% of a step.
+
+It was caught by the rewrite itself. With the new `k_tasks` in place, the line read what it had read before. A kernel had been rewritten and its measurement had not moved at all. The line was not timing that kernel. What a step of several rows really launches cost 3.8 µs, a tenth of the figure, and the rewrite is worth about 1% of a step, not 7%.
+
+The benchmark now does what the step does: the fused kernel at one row, otherwise two lines, "route top-8" and "task list". Four lines for the 8-bit matrices had the same fault in another form. They launched the kernel for one column group at every batch size. They now call the launcher `gemm_fp8`, the function the step calls, which picks the variant. The gate line chooses between the two forms by `GATE_BIG`, as the step does.
+
+**The step-time table, measured again.** `Speculation::rows_ms` (Step 64) now has 47 measured points. Step time in ms, output head included:
+
+| Rows | Step 64 | Now |
+|---|---|---|
+| 1 | 6.12 | 6.10 |
+| 8 | 10.69 | 10.60 |
+| 9 | 11.57 | 11.55 |
+| 16 | 14.97 | 14.63 |
+| 17 | 16.27 | 15.29 |
+| 24 | 19.30 | 17.81 |
+| 32 | 23.03 | 20.84 |
+| 33 | 26.07 | 21.83 |
+| 48 | 31.96 | 27.62 |
+| 64 | 39.98 | 35.68 |
+| 128 | 72.32 | 62.65 |
+
+The 17th row now adds 0.66 ms where it added 1.30, and the 33rd adds 0.99 ms where it added 3.04. A new column group costs what one group costs, no longer what two or four cost. Three rows still cost visibly more than their neighbours, and the comment on the table names them:
+
+| Row | Step time, ms | What starts there |
+|---|---|---|
+| 9th | 10.60 → 11.55 | The second column group, and packing with it. This jump is as large as it was (0.88 ms in Step 64's table), and this step does not explain it. |
+| 57th | 30.62 → 33.01 | The eighth column group. Why it costs more than the seventh did is not known; the point was added to the table so that the scheduler sees it. |
+| 65th | 35.68 → 37.71 | The second launch: more than 64 rows read every dense matrix twice (Step 42). |
+
+The scheduler's weight of a prompt token against an output token (`PROMPT_TOKEN` in `choose`) went from 0.073 to 0.056: a prompt step of 128 rows, without the head, now takes about 44 ms where the old constant assumed 57.
+
+**Results.** The general harness at temperature 0.6, tokens/s:
+
+| Measurement | Step 64 | This build |
+|---|---|---|
+| 1 stream | 228–263 | 225–244 |
+| 2 streams, aggregate | 376–384 | 369–389 |
+| 4 streams, aggregate | 475–494 | 485–501 |
+| Prompt processing, 4K prompt | 2,394–2,430 | 2,897–2,954 (+21%) |
+
+The test suite of Step 63, prompt processing in tokens/s by prompt length:
+
+| Prompt | Before | Now |
+|---|---|---|
+| 4K | 2,220 | 2,712 |
+| 16K | 2,060 | 2,501 |
+| 48K | 1,486 | 1,699 |
+| 100K | 815 | 863 |
+
+The suite also measured 500 tokens/s for 4 streams, and 3,021 tokens/s of prompt processing in the all-8-bit mode.
+
+**What did not change, and why.** One stream is unchanged. Its steps have at most 8 rows, the next token and up to 7 drafts, and such steps run what they ran before: the dense kernel with one column group and without packing, and the warp form of the gate. The table says the same: 6.12 → 6.10 ms at 1 row and 10.69 → 10.60 ms at 8. The harness range for 1 stream, 225–244 against 228–263, is within what its dependence on the text produces (Step 58). With 2 and 4 streams a step of drafted rows has at most 16 or 32 rows and usually fewer, which is where the table changed least. The harness figures for them moved by about as much as their noise.
+
+**What is left.** A prompt step of 128 rows without the head, about 44 ms:
+
+| Part | Time per step |
+|---|---|
+| Experts | 14.8 ms |
+| Attention kernels | 9.2 ms |
+| Attention projection | 7.9 ms |
+| Attention output projection | 2.7 ms |
+| Router | 1.4 ms |
+
+The experts read all their weights in every such step (Step 42). The attention projection is still compute-bound: with packed inputs it takes 80.5 µs at 64 rows for a read that takes 26 µs.
+
+At 8 rows, 51% of the step is the reading of expert weights, which is bandwidth-bound, and no glue kernel is above 0.34 ms. Little of this step's kind is left to find there.
+
+**How bit-identity was checked.**
+
+- The reference numbers that `scripts/verify.sh` prints, and the NLL (Step 35), are unchanged to the last digit.
+- The outputs of unchanged prompts have the same hashes as with the previous build.
+- The batch-size check of `verify.sh` (Step 43) compares greedy tokens for batches of 128, 100, 56, 48, 38, 37, 30, 24, 9, 8 and 1 with batches of 16. The sizes are chosen by the thresholds in the code. 8 and 9 lie on either side of the packing threshold. 24, 30, 38 and 56 use 3, 4, 5 and 7 column groups, and with 7 the loop takes 2 slices per iteration. 48 is the first size with the per-thread gate. 100 is two launches, of 8 and of 5 column groups. 37 and 38 lie on either side of the history limit of Step 64; the old list still had 13 and 14, the limit before that step.
+- A new check runs batches of 100 with `INK_PACK_MIN=999`, which turns packing off, and compares them with the batches of 16, which are packed: plain kernels against packed ones at 8 and 5 column groups.
+- The interleaving test (Step 51) now uses runs of 1 to 45 rows where it used 1 to 19, so that it crosses the history limit of 37 and several column groups.
+
+**The review.** It found no exactness defect. Three things were fixed:
+
+| Finding | Fix |
+|---|---|
+| `gemv` does not pack an input whose range of weight rows is empty. A later input at the same address would have been handed that buffer, which was never packed. No call site passes such a combination today. | A buffer is reused only if this call has packed it. |
+| With 2 slices per iteration, the 9 slices that a warp has in a matrix of 2,304 columns leave one slice past the end in the last iteration. The packed kernel multiplied it, with zeros. | The slice is skipped, so the kernel issues only the multiplies of real slices. |
+| The new `k_tasks` uses the expert number as an index into its shared tables, where the old one only compared it. A pick that was never set, which NaN router scores can cause, would have written outside the tables. | An expert number out of range is ignored. |
+
+**Quirks we hit**
+
+- **The wrong figure was plausible.** 37.8 µs for the work of choosing and grouping 256 picks did not look absurd. Nothing in the number said that it belonged to a kernel the step does not run.
+- **The waste that was easy to see was not the cost.** Re-reading 4.7 MB of tables per token looked like the problem with the gate. Removing exactly that returned 9 of 93 µs. The three rewrites were measured one by one, and only that showed where the wait was.
+- **The fast form at 128 rows is the slow form at 1 row.** 34 against 93 µs at 128 rows, 5.7 against 2.0 µs at one. Neither form is right for every batch size.
+- **A kernel can compile and still not fit.** The assembler's report (Step 23) gives the registers per thread. Whether a block fits is that number times the threads of the block. The compiler does not know the block size, so nothing checks the product before the launch.
+- **An odd number of slices met a loop that takes two.** A warp has 9 slices of a 2,304-column matrix. The loop of 3 had no remainder there, the loop of 2 has one, and the review looked at exactly that iteration. Step 16 had been spared the question because 36 and 18 are multiples of 6.
+- **The 9th row still costs 0.95 ms.** The kernel for 2 column groups always existed, so nothing was ever paid for unused groups there, and packing, which starts at that row, did not make the jump smaller. Its cause is an open question.
+- **Step 64's rounding of step sizes stays.** Its first purpose is the number of recorded graphs, and that has not changed.
+
+**Why you should care**
+
+- When a cost has jumps, profile on both sides of one. Two runs that differ by a single row isolate what changes there, and the profiler's own overhead is the same in both.
+- A template parameter makes a family of kernels. Check that every member the launcher can need has been compiled. Rounding up to the next compiled size costs time and raises no error.
+- Memory-bound and compute-bound are properties of a kernel at a batch size, not of the kernel (Step 12 made the same point about a workload and its kernels). Compare a kernel's time with its read floor at every size you run, not only at the size where it was tuned.
+- Work that every thread repeats on the same small data belongs in a kernel of its own that does it once, in the layout the consumer wants. This pays only where the consumer is compute-bound; where it is at its memory floor, the extra kernel is pure cost. Measure the break-even and put it in the code as a threshold.
+- An optimisation is bit-identical when it changes where and when values are produced and never which operations run or in what order. For a sum, write the order down and reproduce it, as the serial gate does with the warp's tree.
+- Registers are a budget per block. Holding more values at once buys loads in flight (Step 16) and spends registers; with many threads per block the budget per thread is small.
+- "This is obviously the slow part" is a hypothesis. Try the smallest change that removes only the suspected cost, and measure it before building on it.
+- Keep two forms of a kernel when each wins at some batch size and both give the same bits. The threshold is then a pure speed setting that can be moved without any check of correctness.
+- Bitmask, popcount and prefix sum are the standard parallel way to group and count. Each thread does a bounded amount of work, where a scan by every thread grows with the input.
+- A micro-benchmark must launch what the program launches. The safest way is to call the same launcher function, not to copy a kernel launch into the benchmark. Cross-check it against the staged profile: a line's time, multiplied by its launches per step, has to fit into the stage that contains it. The profile had a "router" stage all along, and it timed the real kernels.
+- A measurement that does not move when the code under it changes is not measuring that code. Look at the figure for the old code again before you trust the figure for the new.
+- Record the corrected estimate next to the wrong one: about 1%, not 7%. The next decision will be made from that number.
+- Every new threshold that depends on the batch size needs a test size on each side of it in the invariance test (Step 43).
+
+**Jargon**
+
+- **Atomic operation**: an operation on a shared memory word that runs as one indivisible step, so that two threads changing the same word cannot overwrite each other's change; `atomicOr` sets bits this way.
+- **Bitmask**: a word or a few words in which each bit stands for one item of a set (here one token), so that membership costs one bit and a whole set is tested, counted or walked through with a few instructions.
+- **Crossover point (break-even)**: the input size at which two ways of doing the same work cost the same; below it one is faster, above it the other, so it is where a threshold between them belongs.
+- **Global memory (GPU)**: the GPU's main memory, where weights and buffers live and which every thread can reach; a load from it is slower than one from a block's shared memory.
+- **Lane**: the index of a thread within its warp, 0 to 31; lane 0 is the warp's first thread.
+- **Packed activations (operand layout)**: activations rewritten once into the bit pattern and byte order in which the tensor-core instruction takes its operand, so that the matrix kernel loads them ready for use instead of converting them in every thread at every use.
+- **Popcount / find-first-set**: popcount is the number of 1 bits in a word; find-first-set gives the position of the lowest 1 bit. CUDA has a built-in function for each (`__popc`, `__ffs`).
+- **Prefix sum (scan)**: for a list of numbers, the list of running totals, each entry being the sum of all entries before it (or up to and including it); it turns a list of counts into the starting positions of the groups.
+- **Reduction tree (order of a sum)**: adding many values pairwise in rounds, halving their number each time, instead of one after another; in floating point the result depends on which values are paired, so two kernels must use the same tree to give the same bits.
+- **Register limit of a block**: the registers available to all threads of one block together (65,536 here), so the registers a kernel may use per thread shrink as its blocks get larger: 128 per thread for a block of 512 threads.
+
+---
+
 ## Glossary
 
 Alphabetical. Later entries extend this list.
@@ -3473,6 +3736,7 @@ Alphabetical. Later entries extend this list.
 - **Argmax**: the position of the largest value in a list; here, the ID of the highest-scoring token.
 - **Associativity (floating point)**: the property that (a × b) × c equals a × (b × c); it holds for real numbers but not for floating-point arithmetic, where each operation rounds.
 - **Asynchronous launch / synchronise**: starting a kernel returns to the CPU before the GPU has done the work; to synchronise is to wait explicitly until the GPU has finished.
+- **Atomic operation**: an operation on a shared memory word that runs as one indivisible step, so that two threads changing the same word cannot overwrite each other's change; `atomicOr` sets bits this way.
 - **Attention**: the part of a layer that lets the current token pull in information from earlier tokens.
 - **Attention sink**: an extra score per head, computed from the current token, that takes part in the softmax like a key with nothing behind it, so a head can put weight on "nothing" and shrink its output.
 - **Bandwidth-bound**: limited by how fast bytes arrive from memory rather than by arithmetic speed.
@@ -3481,6 +3745,7 @@ Alphabetical. Later entries extend this list.
 - **Batch size T**: here, the number of consecutive tokens of one sequence processed in a single forward call.
 - **BF16 (bfloat16)**: a 16-bit floating-point format; it is the top 16 bits of a 32-bit float, so it has the same range but much less precision.
 - **Bit-exact**: producing identical results down to the last bit.
+- **Bitmask**: a word or a few words in which each bit stands for one item of a set (here one token), so that membership costs one bit and a whole set is tested, counted or walked through with a few instructions.
 - **Black-box test**: a test that uses a program only through its public interface, as a user would, with no access to its internals.
 - **Block (CUDA)**: a group of GPU threads that are scheduled together and can share a small scratch memory; a kernel launch runs a grid of blocks.
 - **Block scale**: one shared scale factor that multiplies a small block of low-bit values (in NVFP4, 8 bits per 16 values).
@@ -3511,6 +3776,7 @@ Alphabetical. Later entries extend this list.
 - **Copied draft (prompt-lookup decoding)**: a draft taken from the conversation itself: when the last tokens repeat an earlier passage, the tokens that followed that passage are proposed as the next ones; often called prompt-lookup decoding.
 - **CORS (cross-origin resource sharing)**: the browser rule that a web page may read a reply from a server of another origin (scheme, host and port) only if that server names the page's origin in a response header.
 - **Crate**: a Rust library package.
+- **Crossover point (break-even)**: the input size at which two ways of doing the same work cost the same; below it one is faster, above it the other, so it is where a threshold between them belongs.
 - **CUDA**: NVIDIA's platform and C++ dialect for programming its GPUs.
 - **CUDA graph**: a recorded sequence of GPU operations that can be replayed with a single call.
 - **cuBLAS**: NVIDIA's library of tuned linear-algebra routines.
@@ -3540,6 +3806,7 @@ Alphabetical. Later entries extend this list.
 - **GEMV**: "general matrix times vector", multiplying a matrix of weights by one token's vector.
 - **GGUF**: the single-file weight format used by llama.cpp and LM Studio.
 - **GiB**: 2³⁰ bytes.
+- **Global memory (GPU)**: the GPU's main memory, where weights and buffers live and which every thread can reach; a load from it is slower than one from a block's shared memory.
 - **Golden output**: a recorded output from a trusted implementation, used as the expected answer in tests.
 - **GPU thread**: one of the many small parallel workers a kernel is split into.
 - **Greedy decoding**: always choosing the single most likely next token (temperature 0).
@@ -3558,6 +3825,7 @@ Alphabetical. Later entries extend this list.
 - **Kernel (GPU)**: a function that runs on the GPU, executed by many GPU threads at once; unrelated to an operating-system kernel.
 - **KV cache**: the stored keys and values of earlier tokens, kept so that attention does not recompute them for every new token.
 - **L2 cache (GPU)**: a fast memory inside the GPU chip, shared by all SMs, that keeps recently read data so that a second read does not go to VRAM (96 MB on the RTX 5090).
+- **Lane**: the index of a thread within its warp, 0 to 31; lane 0 is the warp's first thread.
 - **Latency vs throughput**: latency is how long one operation takes from start to finish; throughput is how much work completes per second across all workers.
 - **Launch floor**: the time a kernel costs even when it does nothing (0.69 µs here); a chain of N kernels cannot take less than N times that.
 - **Launch overhead**: the fixed cost of the CPU asking the GPU to start a kernel.
@@ -3598,14 +3866,17 @@ Alphabetical. Later entries extend this list.
 - **Operand order**: which input of an instruction ends up in which position of its result; here the first of two floats lands in the high half of the output.
 - **Oracle**: the trusted source of expected answers in a test.
 - **Output head**: the final matrix that produces one score per vocabulary entry.
+- **Packed activations (operand layout)**: activations rewritten once into the bit pattern and byte order in which the tensor-core instruction takes its operand, so that the matrix kernel loads them ready for use instead of converting them in every thread at every use.
 - **Page cache**: the operating system's in-RAM copy of recently read file data.
 - **Parameters / weights**: the numbers a model learned in training.
 - **Perplexity / NLL**: NLL (negative log-likelihood) is the average, over the tokens of a text, of minus the log-probability the model gave to the actual next token, in nats per token; perplexity is e to the power of the NLL; lower is better for both.
 - **Per-token context cost**: the bytes of VRAM the engine reserves for each token of context capacity; here mostly the keys and values of the full-attention layer visits.
 - **pip wheel**: a pre-built Python package.
+- **Popcount / find-first-set**: popcount is the number of 1 bits in a word; find-first-set gives the position of the lowest 1 bit. CUDA has a built-in function for each (`__popc`, `__ffs`).
 - **Prefetch**: reading data shortly before it is needed, only to get it into the cache.
 - **Prefill**: processing the prompt before the first output token.
 - **Prefix cache**: state a server keeps from a prompt it has already processed (here the KV caches and a snapshot of the ring buffers), which lets a later request that begins with the same tokens skip prefill for that part.
+- **Prefix sum (scan)**: for a list of numbers, the list of running totals, each entry being the sum of all entries before it (or up to and including it); it turns a list of counts into the starting positions of the groups.
 - **Prior (of an estimate)**: the value an estimate starts from before anything has been observed, with a weight that says how many observations it counts for (here 8).
 - **Profiler**: a tool that measures how much time each part of a program takes.
 - **Prometheus counter / metrics endpoint**: a metrics endpoint is an HTTP address where a server publishes running totals about its own work; a Prometheus counter is one such total, in the text format of the Prometheus monitoring system.
@@ -3615,7 +3886,9 @@ Alphabetical. Later entries extend this list.
 - **Quadratic-time bug**: code that repeats work on everything produced so far at every step, so the total work grows with the square of the output length.
 - **Quantisation**: storing numbers in fewer bits to save memory; normally applied to weights ahead of time, and in this model also to activations at run time (see W4A4).
 - **Reduction**: combining many values into one, such as a sum or a maximum.
+- **Reduction tree (order of a sum)**: adding many values pairwise in rounds, halving their number each time, instead of one after another; in floating point the result depends on which values are paired, so two kernels must use the same tree to give the same bits.
 - **Reference implementation**: an existing program that runs the model and is taken as the definition of correct behaviour.
+- **Register limit of a block**: the registers available to all threads of one block together (65,536 here), so the registers a kernel may use per thread shrink as its blocks get larger: 128 per thread for a block of 512 threads.
 - **Register vs stack (per-thread memory)**: a register is a storage slot inside the processor that costs nothing extra to use; the stack is a thread's private memory, where every access is a load or a store.
 - **Regression test**: a check that is re-run after every change to make sure behaviour that used to be correct still is.
 - **Rejection sampling (speculative)**: the rule that keeps a draft token with a probability set by the full model and otherwise draws a replacement from what is left of the full model's distribution, so the output is distributed exactly as without speculation.

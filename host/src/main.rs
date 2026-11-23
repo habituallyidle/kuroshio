@@ -165,7 +165,7 @@ const GRAPH_ROOM_MIB: usize = 320;
 fn vram_base(slots: usize) -> usize {
     let on = |k: &str| std::env::var(k).is_ok();
     let (kv8, dense8, draft) = (on("INK_KV_FP8"), on("INK_FP8"), !on("INK_NO_DRAFT"));
-    let fixed = 19800 * MIB - if dense8 { 800 * MIB } else { 0 } - if draft { 0 } else { 1100 * MIB };
+    let fixed = 19900 * MIB - if dense8 { 800 * MIB } else { 0 } - if draft { 0 } else { 1100 * MIB };
     let per_slot = if kv8 { 141 } else { 246 } * MIB + if on("INK_NO_PREFIX_CACHE") { 0 } else if kv8 { 136 } else { 231 } * MIB;
     fixed + slots * per_slot
 }
@@ -665,7 +665,20 @@ fn main() -> Result<()> {
             let mut eng = engine::Engine::load(&dir, 8192)?;
             let chunk: usize = std::env::var("INK_CHUNK").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
             let mut out = Vec::new();
-            for c in ids[..n].chunks(chunk) {
+            // INK_PRE=tokens,rows: read that many tokens first as prompt-only steps of `rows` rows (no output head, up to
+            // 256 rows), then continue as usual. Their predictions are printed as 0.
+            let pre: Vec<usize> = std::env::var("INK_PRE").ok().map_or(vec![], |v| v.split(',').filter_map(|x| x.parse().ok()).collect());
+            let skip = if pre.len() == 2 { pre[0].min(n) } else { 0 };
+            for (i, c) in ids[..skip].chunks(pre.get(1).copied().unwrap_or(1).clamp(1, engine::PMAX)).enumerate() {
+                let p0 = i * pre[1].clamp(1, engine::PMAX);
+                let rows: Vec<(usize, usize, u32)> = c.iter().enumerate().map(|(j, &t)| (0, p0 + j, t)).collect();
+                let t0 = std::time::Instant::now();
+                eng.step_rows(&rows, None, false);
+                eprintln!("prompt step of {} rows at {p0}: {:.2} ms", c.len(), t0.elapsed().as_secs_f64() * 1e3);
+                out.extend(std::iter::repeat(0u32).take(c.len()));
+            }
+            eng.set_pos(skip);
+            for c in ids[skip..n].chunks(chunk) {
                 out.extend(eng.forward(c, None));
             }
             let hits = out.iter().zip(&ids[1..=n]).filter(|(a, b)| a == b).count();

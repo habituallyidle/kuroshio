@@ -26,14 +26,14 @@ Same RTX 5090, same harness, temperature 0.6, 512-token completions, median of 3
 | Decode, 1 stream (tok/s) | **242** | 200 | +21% |
 | Decode, 2 streams, total | **378** | 310 | +22% |
 | Decode, 4 streams, total | **495** | 431 | +15% |
-| Prompt processing (tok/s, 4K prompt) | **2,900** | 580 | 5.0x |
+| Prompt processing (tok/s, 4K prompt) | **3,150** | 580 | 5.4x |
 | Well-formed tool calls (24 variants of one agent prompt, temperature 0) | **24 / 24** | 9 / 24 | |
 
 - Context: about 240K tokens for one conversation, lossless. With `--kv 8 --dense 8` (the 8-bit cache vLLM was run
-  with, plus 8-bit attention matrices): about 450K tokens, about 260 tok/s, 3,000 tok/s prompt processing.
+  with, plus 8-bit attention matrices): about 450K tokens, about 260 tok/s, 3,500 tok/s prompt processing.
 - Follow-up turns of a conversation skip the part of the prompt the server has already seen: typically 30-50 ms to
   first token in an agent loop, instead of re-reading everything.
-- Prompt processing slows as the context grows: about 2,700 / 2,500 / 1,700 / 860 tok/s at 4K / 16K / 48K / 100K
+- Prompt processing slows as the context grows: about 3,100 / 2,800 / 1,850 / 900 tok/s at 4K / 16K / 48K / 100K
   (measured from request to first token).
 - It starts at about 20 GiB of GPU memory and takes more only as conversations grow, so other programs can use the
   card; when the card is full a conversation stops growing instead of the server crashing.
@@ -172,7 +172,8 @@ Set `reasoning_effort` per request, as a name or a number from 0 to 0.99:
 - **Copied drafts.** Agents repeat themselves: a file rewritten with one line changed, a quoted passage. When the
   last tokens match an earlier part of the conversation, what followed there is verified as a draft, up to 31 tokens
   in one step, with no drafter pass.
-- **128 prompt tokens per step**, and a **prefix cache** that keeps each conversation's state between requests.
+- **256 prompt tokens per step**, so that each expert's weights are read once for many tokens, and a **prefix cache**
+  that keeps each conversation's state between requests.
 
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) describes the model, [docs/IMPLEMENTATION_LOG.md](docs/IMPLEMENTATION_LOG.md)
 is a step-by-step account of how the engine was built and tuned, written for engineers new to GPU inference, and
