@@ -5,7 +5,7 @@ import threading
 import unicodedata
 
 from core import chat, repro, run_parallel, now, pysleep
-from data import (DETERMINISM_PROMPTS, LONG_OUTPUT_PROMPT, MULTI_TURN, PERF_PROMPTS, T, TOOL_CASES, UNICODE_CASES, req,
+from data import (COPY_PROMPTS, DETERMINISM_PROMPTS, LONG_OUTPUT_PROMPT, MULTI_TURN, PERF_PROMPTS, T, TOOL_CASES, UNICODE_CASES, req,
                   sentences, tool_case_request, user)
 
 KEY, TITLE = "determinism", "Determinism and correctness"
@@ -33,7 +33,8 @@ def first_diff(a, b):
 
 def _greedy_set(ctx):
     ps = [(f"greedy-{i}", req(p, GEN_TOKENS)) for i, p in enumerate(DETERMINISM_PROMPTS)]
-    return ps if ctx.full else ps[:2]
+    # answers that repeat the prompt are drafted by copying: they must come out the same as without speculation too
+    return (ps if ctx.full else ps[:2]) + [(f"greedy-copy-{i}", req(p, GEN_TOKENS)) for i, p in enumerate(COPY_PROMPTS)]
 
 
 def _long_prompt():
@@ -43,7 +44,7 @@ def _long_prompt():
 
 def _seeded_set(ctx):
     ps = [(f"seeded-{i}", req(p, GEN_TOKENS, temperature=SEEDED_TEMPERATURE, seed=SEED_A)) for i, p in enumerate(DETERMINISM_PROMPTS[2:4])]
-    return ps if ctx.full else ps[:1]
+    return (ps if ctx.full else ps[:1]) + [("seeded-copy-0", req(COPY_PROMPTS[0], GEN_TOKENS, temperature=SEEDED_TEMPERATURE, seed=SEED_A))]
 
 
 def _run_store(st, ctx, label, items):

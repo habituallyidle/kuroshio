@@ -36,6 +36,9 @@ SERVE OPTIONS
                          chance of acceptance against the time it costs;
                          a number 0-1 verifies those the drafter gives at
                          least that probability
+  --copy N               when the conversation starts repeating an earlier  [31]
+                         passage (a quoted file, rewritten code), verify up
+                         to N copied tokens per step, 0-32; 0 = off
   --prefill-share N      prompt tokens processed per step while another     [48]
                          conversation is generating, 1-128
   --cors ORIGIN          let web pages from this origin call the server     [none]
@@ -163,7 +166,7 @@ fn vram_base(slots: usize) -> usize {
     let on = |k: &str| std::env::var(k).is_ok();
     let (kv8, dense8, draft) = (on("INK_KV_FP8"), on("INK_FP8"), !on("INK_NO_DRAFT"));
     let fixed = 19800 * MIB - if dense8 { 800 * MIB } else { 0 } - if draft { 0 } else { 1100 * MIB };
-    let per_slot = if kv8 { 110 } else { 215 } * MIB + if on("INK_NO_PREFIX_CACHE") { 0 } else if kv8 { 105 } else { 200 } * MIB;
+    let per_slot = if kv8 { 141 } else { 246 } * MIB + if on("INK_NO_PREFIX_CACHE") { 0 } else if kv8 { 136 } else { 231 } * MIB;
     fixed + slots * per_slot
 }
 
@@ -237,7 +240,7 @@ fn main() -> Result<()> {
         // OpenAI-compatible server. Older positional form still works: kuroshio serve [addr] [ctx] [slots]
         Some("serve") => {
             let f = Flags::parse(&args[2..])?;
-            f.check_known(&["host", "port", "slots", "ctx", "reserve", "idle-release", "kv", "dense", "spec", "tau", "prefill-share", "cors", "no-draft", "no-prefix-cache", "no-tool-fix", "sampled-drafts", "model", "name"])?;
+            f.check_known(&["host", "port", "slots", "ctx", "reserve", "idle-release", "kv", "dense", "spec", "tau", "prefill-share", "cors", "no-draft", "no-prefix-cache", "no-tool-fix", "sampled-drafts", "copy", "model", "name"])?;
             f.apply_engine_options()?;
             let addr = match f.pos.first() {
                 Some(a) => a.clone(),
@@ -248,7 +251,9 @@ fn main() -> Result<()> {
                 None => f.get("slots", "", 1)?,
             };
             // Four is the design limit: the card's memory, not its speed, is what conversations compete for.
-            anyhow::ensure!((1..=4).contains(&slots), "--slots must be between 1 and 4");
+            // (INK_UNSUPPORTED_SLOTS=1 lifts it to the engine's 16, for benchmarks: the context left per conversation is tiny.)
+            let most = if std::env::var("INK_UNSUPPORTED_SLOTS").is_ok() { 16 } else { 4 };
+            anyhow::ensure!((1..=most).contains(&slots), "--slots must be between 1 and 4");
             let reserve_mib = parse_mib(&f.get("reserve", "", "512m".to_string())?)? + GRAPH_ROOM_MIB;
             // Memory for conversations: what is free now, minus what the engine takes at start-up, minus the reserve.
             let free = engine::vram_free();
@@ -272,9 +277,12 @@ fn main() -> Result<()> {
                 tool_fix: !f.has("no-tool-fix") && std::env::var("INK_NO_TOOL_FORCE").is_err(),
                 idle_release: f.get("idle-release", "", 0u64)?,
                 cors: Some(f.get("cors", "", String::new())?).filter(|o| !o.is_empty()),
+                copy_max: f.get("copy", "INK_COPY", 31usize)?,
             };
             anyhow::ensure!(opts.cors.as_ref().map_or(true, |o| !o.contains(['\r', '\n'])), "--cors takes an origin such as http://localhost:3000, or *");
             anyhow::ensure!(opts.k_max <= 7, "--spec must be between 0 and 7");
+            // 31 drafts + the next token fill 32 rows: a run the engine can rewind, with room left to resume a conversation that ended on one.
+            anyhow::ensure!(opts.copy_max + 5 <= engine::Engine::max_spec_run(), "--copy must be between 0 and {}", engine::Engine::max_spec_run() - 5);
             anyhow::ensure!((1..=128).contains(&opts.prefill_share), "--prefill-share must be between 1 and 128");
             let dir = weights_dir()?;
             let chat = chat::Chat::load(&dir)?;
@@ -371,7 +379,9 @@ fn main() -> Result<()> {
             let temp: f32 = std::env::var("INK_TEMP").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
             let mut eng = engine::Engine::load(&dir, std::env::var("INK_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(8192))?;
             eng.set_sampling(temp, 1);
-            for &t in &[1usize, 4, 8] {
+            // INK_STEP_T=1,2,3: the batch sizes to time
+            let ts: Vec<usize> = std::env::var("INK_STEP_T").ok().map_or(vec![1, 4, 8], |v| v.split(',').filter_map(|x| x.parse().ok()).collect());
+            for &t in &ts {
                 eng.reset();
                 eng.forward(&ids[..ctx], None);
                 eng.forward(&ids[ctx..ctx + t], None); // capture the graph for this shape

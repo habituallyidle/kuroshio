@@ -33,10 +33,11 @@ const int RING = 1152;                                   // local KV ring: windo
 const int DBATCH = 4;                                     // conversations the drafter handles in one pass
 const int MAXSEQ = 16;                                    // most conversations (slots) one engine can hold
 const int GSUB = 16;                                      // tokens per launch in full-attention layers (bounds the scratch: GSUB * 24 * max_ctx floats)
-const int CR = 16;                                        // conv-input history kept between calls, indexed by position mod CR. Lags inside a batch are
-                                                          // read from the batch itself. Batches of up to CR - 3 tokens store every token in the kernel that
-                                                          // computes it (no slot is read and written in one launch); larger batches store their last CR - 3
-                                                          // tokens with a separate kernel afterwards. 3 positions are needed, up to 7 more after a rejected draft.
+const int CR = 40;                                        // conv-input history kept between calls, indexed by position mod CR. Lags inside a batch are
+                                                          // read from the batch itself. Runs of up to CR - 3 tokens store every token in the kernel that
+                                                          // computes it (no slot is read and written in one launch); longer runs store their last CR - 3
+                                                          // tokens with a separate kernel afterwards. So a step can be rewound into (drafts rejected) only
+                                                          // if its run was at most CR - 3 rows: the 3 positions before the restart point are then intact.
 // One row of a step: a token of conversation `seq` at absolute position `pos`. Consecutive rows of the same
 // conversation form a run (run0 = index of its first row, runlen = its length); only within a run may a row take
 // its convolution history from the batch itself.
@@ -1520,6 +1521,8 @@ struct GraphCache {
             if (!warned) { fprintf(stderr, "warning: no GPU memory left to record a step graph (%s); running without it. Lower --ctx to leave some room.\n", cudaGetErrorString(err)); warned = true; }
             return false;
         }
+        static const bool log = getenv("INK_GRAPH_LOG") != nullptr;   // debugging: how often are step graphs recorded?
+        if (log) fprintf(stderr, "graph: recorded (%zu held)\n", ents.size() + 1);
         ents.push_back({slot, ++tick}); return true;
     }
 } g_graphs;
@@ -2068,6 +2071,8 @@ void ink_forward(void* ep, const int* tokens, int T, int pos0, const int* excl, 
     if (ink_step(ep, T, tokens, seqs, pos, excl, res_out, logits_out, want_head, nullptr, nullptr, qrows)) { fprintf(stderr, "ink_forward: invalid input (T=%d, pos0=%d)\n", T, pos0); abort(); }
 }
 int ink_nseq(void* ep) { return ((Engine*)ep)->nseq; }
+// Longest run of rows (next token + drafts) of one conversation whose rejected tail can be discarded afterwards.
+int ink_max_rewind_run() { return CR - 3; }
 
 // The drafter's kernel sequence: block forward over 8 slots, then 7 steps of the recurrent head.
 // One pass of the drafter for NB conversations (their anchors, positions and slots are in d.anchor / d.L / d.dseq).

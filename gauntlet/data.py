@@ -69,6 +69,29 @@ def sentences(n, seed):
     return out
 
 
+# Prompts whose answer repeats text of the prompt: these exercise drafts copied from the conversation (--copy).
+_COPY_CODE = """def load_config(path):
+    with open(path) as f:
+        data = json.load(f)
+    result = {}
+    for key, value in data.items():
+        if key.startswith("_"):
+            continue
+        result[key.lower()] = value
+    return result
+
+
+def save_config(path, config):
+    data = {key.upper(): value for key, value in config.items()}
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+"""
+COPY_PROMPTS = [
+    "Here is a Python file:\n\n```python\n" + _COPY_CODE + "```\n\nRewrite the whole file with the variable `data` renamed to `raw` everywhere. Output only the complete file in one code block.",
+    "Repeat the following text exactly, word for word, and add nothing:\n\n" + " ".join(sentences(10, 31337)),
+]
+
+
 def haystack(n_sentences, seed, needle_positions=(0.02, 0.5, 0.98)):
     """A document with one needle per position (fractions of its length). Returns (document, [(colour, code)])."""
     rng = random.Random(seed * 7919 + 1)

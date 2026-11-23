@@ -36,6 +36,9 @@ Same RTX 5090, same harness, temperature 0.6, 512-token completions, median of 3
 - Prompt processing slows as the context grows: about 2,300 / 2,100 / 1,500 / 800 tok/s at 4K / 16K / 48K / 100K.
 - It starts at about 20 GiB of GPU memory and takes more only as conversations grow, so other programs can use the
   card; when the card is full a conversation stops growing instead of the server crashing.
+- When the model repeats text it has already seen (rewriting a file with a small change, quoting a document,
+  echoing tool output), tokens are verified up to 31 at a time: 480-620 tok/s on one stream, 15-25% more than the
+  drafter alone manages there (8-13% more in total with 4 streams rewriting code). Ordinary prose is unaffected.
 - Single-stream runs vary by about ±5% with the text being generated (233-253 over four runs).
 - Without speculative decoding the two are level: 158 tok/s (`--spec 0`) against vLLM's 163.
 
@@ -55,8 +58,8 @@ The model is found in the Hugging Face cache. If yours is elsewhere: `./install.
 
 ```bash
 kuroshio serve                          # 1 conversation, up to about 240K tokens
-kuroshio serve --slots 4                # 4 conversations at once, sharing about 205K tokens
-kuroshio serve --slots 4 --kv 8         # 4 conversations, sharing about 385K tokens
+kuroshio serve --slots 4                # 4 conversations at once, sharing about 200K tokens
+kuroshio serve --slots 4 --kv 8         # 4 conversations, sharing about 375K tokens
 kuroshio serve --reserve 6g             # leave 6 GiB of the card for other programs
 kuroshio serve --ctx 64k --port 9000    # cap conversations at 64K tokens, another port
 kuroshio run "Why is the sky blue?" --effort low
@@ -95,6 +98,7 @@ r = client.chat.completions.create(model="inkling-2-mini", messages=[{"role": "u
 | `--dense` | `16`, `8` | `16` | Precision of the attention matrices and output head. `8` decodes about 7% faster, reads prompts about 20% faster and saves 0.8 GiB; lossy. |
 | `--spec` | 0-7 | `7` | Speculative decoding: verify up to this many drafted tokens per step. `0` turns it off. Output is unchanged either way. |
 | `--tau` | `auto`, or 0-1 | `auto` | Which drafts to verify. `auto` weighs each draft's chance of being accepted against the time a row costs, and adapts to load. A number verifies those the drafter gives at least that probability. |
+| `--copy` | 0-32 | `31` | When the conversation starts repeating an earlier passage, verify up to this many copied tokens per step. `0` turns it off. Output is unchanged either way. |
 | `--prefill-share` | 1-128 | `48` | Prompt tokens processed per step while another conversation is generating. Higher favours new requests, lower favours running streams. |
 | `--cors` | origin, or `*` | none | Let web pages from this origin call the server. Off by default: no page can. |
 | `--sampled-drafts` | | | Experimental: when sampling, draw drafts from the drafter's distribution instead of its top token. Exact, but measured no faster. |
@@ -109,14 +113,14 @@ r = client.chat.completions.create(model="inkling-2-mini", messages=[{"role": "u
 
 ### Memory, slots and context
 
-The card's memory is the limit, not its speed. The engine takes about 20 GiB at start-up (plus 0.4 GiB per slot) and
+The card's memory is the limit, not its speed. The engine takes about 20 GiB at start-up (plus 0.5 GiB per slot) and
 then about 40 KB per token of conversation (24 KB with `--kv 8`), **as conversations grow**. Slots share what is
 left, in any proportion: with 4 slots, one agent can hold 150K tokens while three hold 15K each.
 
 | | default | `--kv 8` |
 |---|---:|---:|
 | tokens in total, 1 slot | 240K | 415K |
-| tokens in total, 4 slots | 205K | 385K |
+| tokens in total, 4 slots | 200K | 375K |
 
 - These are for a 5090 that also drives a desktop (about 1.4 GiB in use); the server prints the exact figure at
   start-up and reports the longest conversation it accepts in `GET /v1/models`.
@@ -164,6 +168,9 @@ Set `reasoning_effort` per request, as a name or a number from 0 to 0.99:
 - **Speculative decoding** with the model's bundled DSpark drafter. Drafts for all conversations are computed in
   one pass, and each step verifies only the drafts whose chance of acceptance is worth a row's time, so less is
   speculated as more streams share the card.
+- **Copied drafts.** Agents repeat themselves: a file rewritten with one line changed, a quoted passage. When the
+  last tokens match an earlier part of the conversation, what followed there is verified as a draft, up to 31 tokens
+  in one step, with no drafter pass.
 - **128 prompt tokens per step**, and a **prefix cache** that keeps each conversation's state between requests.
 
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) describes the model, [docs/IMPLEMENTATION_LOG.md](docs/IMPLEMENTATION_LOG.md)

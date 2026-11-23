@@ -12,7 +12,7 @@ use crate::{chat::Chat, engine::{sampled_drafts, Drafts, Engine, SpecStats, DRAF
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io::{BufRead, BufReader, Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
     sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, mpsc, Arc, OnceLock},
@@ -51,6 +51,9 @@ pub struct Options {
     pub cors: Option<String>,
     /// Give back the context memory of a slot that has been idle this many seconds (0: never). Its prefix cache goes too.
     pub idle_release: u64,
+    /// Verify up to this many tokens copied from the conversation itself when it starts repeating an earlier passage
+    /// (0: off). See `Copy`.
+    pub copy_max: usize,
 }
 
 /// What the scheduler sends back to a connection thread.
@@ -113,6 +116,11 @@ struct Active {
     header: Option<Vec<u32>>,
     /// Tokens that must come next (the fixed beginning of a tool call); they are fed to the model, not sampled.
     forced: Vec<u32>,
+    copy: Copy,
+    /// Tokens accepted from copied drafts.
+    copied: usize,
+    /// Drafts the drafter has been getting accepted per step lately: what copying has to beat.
+    draft_yield: f32,
 }
 
 /// Follows the tokens a conversation is about to emit. When the model opens a tool call
@@ -144,6 +152,106 @@ fn watch_tool_call(a: &mut Active, out: &[u32], chat: &Chat) -> usize {
         }
     }
     out.len()
+}
+
+/// Drafts copied from the conversation itself. Models repeat their context all the time - quoting a file they were
+/// shown, rewriting code with one line changed, echoing a tool's output. When the last tokens match an earlier passage,
+/// the tokens that followed it there are a free draft: no drafter pass, any length, and very often right.
+///
+/// `seq` is everything in the conversation so far (prompt, then generated tokens); `idx` maps each run of three tokens
+/// to where it last ended. `src` is the earlier position currently being followed and `run` how many tokens have
+/// matched up to now.
+///
+/// How often copied tokens are accepted differs a lot between conversations (one repeats a file verbatim, another
+/// only quotes a phrase and moves on), so each request keeps its own count, by length of the match.
+struct Copy {
+    seq: Vec<u32>,
+    idx: HashMap<(u32, u32, u32), u32>,
+    src: Option<usize>,
+    run: usize,
+    acc: [f32; 4],
+    ver: [f32; 4],
+}
+
+impl Copy {
+    fn new(prompt: &[u32]) -> Self {
+        let mut c = Self { seq: Vec::with_capacity(prompt.len() + 1024), idx: HashMap::with_capacity(prompt.len()), src: None, run: 0, acc: [0.0; 4], ver: [0.0; 4] };
+        for &t in prompt {
+            c.push(t);
+        }
+        c
+    }
+
+    fn push(&mut self, t: u32) {
+        let i = self.seq.len();
+        self.seq.push(t);
+        // Still agreeing with the passage being followed?
+        match self.src {
+            Some(s) if s + 1 < i && self.seq[s + 1] == t => (self.src, self.run) = (Some(s + 1), self.run + 1),
+            _ => (self.src, self.run) = (None, 0),
+        }
+        if i >= 2 {
+            let earlier = self.idx.insert((self.seq[i - 2], self.seq[i - 1], t), i as u32);
+            if let (None, Some(p)) = (self.src, earlier) {
+                let p = p as usize;
+                let n = (0..64.min(p + 1)).take_while(|&n| self.seq[p - n] == self.seq[i - n]).count();
+                (self.src, self.run) = (Some(p), n);
+            }
+        }
+    }
+
+    /// Matches of 4-5, 6-9, 10-19 and 20+ tokens. Shorter ones are not used: three tokens in a row recur by chance.
+    fn bucket(run: usize) -> usize {
+        match run {
+            0..=5 => 0,
+            6..=9 => 1,
+            10..=19 => 2,
+            _ => 3,
+        }
+    }
+
+    /// Probability that a copied token is accepted (given the ones before it were), for a match of `run` tokens:
+    /// what this request has shown so far, starting from a guess worth 8 observations.
+    fn accept(&self, run: usize) -> f32 {
+        const PRIOR: [f32; 4] = [0.55, 0.7, 0.85, 0.92];
+        let b = Self::bucket(run);
+        ((self.acc[b] + 8.0 * PRIOR[b]) / (self.ver[b] + 8.0)).clamp(0.0, 0.995)
+    }
+
+    fn observe(&mut self, run: usize, accepted: bool) {
+        let b = Self::bucket(run);
+        self.ver[b] = self.ver[b] * 0.98 + 1.0;
+        self.acc[b] = self.acc[b] * 0.98 + accepted as u8 as f32;
+    }
+
+    /// Is copying the better draft right now? Compares the tokens it should yield (`max` drafts, each accepted with
+    /// the probability seen so far) with what the drafter has been yielding per step in this request.
+    fn worth(&self, max: usize, drafter_yield: f32) -> bool {
+        let p = self.accept(self.run);
+        let expected: f32 = (1..=max as i32).map(|j| p.powi(j)).sum();
+        self.run >= 4 && self.src.is_some() && expected > drafter_yield
+    }
+
+    /// Called when a match was not used: what was learnt about matches of this length fades, so that copying is
+    /// tried again after a while (the text may have changed character).
+    fn forget(&mut self) {
+        let b = Self::bucket(self.run);
+        self.ver[b] *= 0.9;
+        self.acc[b] *= 0.9;
+    }
+
+    /// What followed the matched passage: the proposed continuation, at most `max` tokens. When the passage is the
+    /// text just written (a repeating pattern: table rules, a run of zeros), the continuation runs into the drafts
+    /// themselves, which is what a repeat of period P means.
+    fn drafts(&self, max: usize) -> Vec<u32> {
+        let Some(s) = self.src else { return Vec::new() };
+        let period = self.seq.len() - (s + 1);
+        let mut out = Vec::with_capacity(max);
+        for j in 0..max {
+            out.push(if j < period { self.seq[s + 1 + j] } else { out[j - period] });
+        }
+        out
+    }
 }
 
 /// A conversation slot. It keeps what its last request left in the engine's caches, so that a new request sharing a
@@ -180,10 +288,10 @@ fn resume_point(slot: &Slot, prompt: &[u32]) -> (usize, bool) {
     let lcp = slot.hist.iter().zip(prompt).take_while(|(a, b)| a == b).count();
     let mut best = (0usize, false);
     let live = lcp.min(prompt.len() - 1);
-    // The convolution history is a ring of 16 positions, and a long run of rows keeps only its last 13. Resuming at
-    // `live` needs the 3 positions before it, so nothing may have been written 10 or more positions past them -
-    // neither accepted tokens nor rejected drafts.
-    if live > 0 && slot.hi <= live + 10 {
+    // The convolution history is a ring, and a long run of rows keeps only its last `max_spec_run` positions in it.
+    // Resuming at `live` needs the 3 positions before it, so nothing may have been written `max_spec_run - 3` or
+    // more positions past them - neither accepted tokens nor rejected drafts.
+    if live > 0 && slot.hi <= live + Engine::max_spec_run() - 3 {
         best = (live, false);
     }
     if let Some(c) = slot.ckpt {
@@ -229,11 +337,20 @@ impl Speculation {
         Self { acc: [[0.0; 10]; 2], ver: [[0.0; 10]; 2], scale: 1.0, draft_ms: 0.8 }
     }
 
-    /// Step time in ms by number of rows, as measured on an RTX 5090 at short context (linear between the points).
+    /// Step time in ms by number of rows, output head included, as measured on an RTX 5090 at short context
+    /// (`kuroshio steptime` with INK_STEP_T; linear between the points). Not smooth: the matrix kernels work on
+    /// tiles of rows, and the 9th, 17th, 33rd and 65th row each start a new one.
     fn rows_ms(rows: usize) -> f32 {
-        const PTS: [(f32, f32); 7] = [(1.0, 6.1), (4.0, 8.3), (8.0, 10.8), (16.0, 14.9), (32.0, 20.8), (64.0, 31.8), (128.0, 57.0)];
+        const PTS: [(f32, f32); 46] = [
+            (1.0, 6.12), (2.0, 6.97), (3.0, 7.71), (4.0, 8.40), (5.0, 9.01), (6.0, 9.61), (7.0, 10.19), (8.0, 10.69),
+            (9.0, 11.57), (10.0, 12.13), (11.0, 12.59), (12.0, 13.00), (13.0, 13.37), (14.0, 13.90), (15.0, 14.37), (16.0, 14.97),
+            (17.0, 16.27), (18.0, 16.69), (19.0, 17.17), (20.0, 17.62), (21.0, 17.92), (22.0, 18.46), (23.0, 18.92), (24.0, 19.30),
+            (25.0, 19.73), (26.0, 20.19), (27.0, 20.61), (28.0, 21.17), (29.0, 21.56), (30.0, 22.27), (31.0, 22.73), (32.0, 23.03),
+            (33.0, 26.07), (34.0, 26.42), (40.0, 28.62), (41.0, 29.16), (48.0, 31.96), (49.0, 32.67), (56.0, 35.56), (64.0, 39.98),
+            (65.0, 41.82), (72.0, 44.81), (80.0, 48.69), (96.0, 56.49), (112.0, 65.19), (128.0, 72.32),
+        ];
         let r = (rows.max(1) as f32).min(128.0);
-        let i = PTS.iter().position(|p| p.0 >= r).unwrap_or(6).max(1);
+        let i = PTS.iter().position(|p| p.0 >= r).unwrap_or(PTS.len() - 1).max(1);
         let ((x0, y0), (x1, y1)) = (PTS[i - 1], PTS[i]);
         y0 + (y1 - y0) * (r - x0) / (x1 - x0)
     }
@@ -257,31 +374,61 @@ impl Speculation {
         self.scale = (self.scale * 0.98 + 0.02 * ms / Self::rows_ms(rows)).clamp(0.5, 4.0);
     }
 
-    /// How many drafts to verify for each conversation. `drafts`: (slot, confidences, sampled, most allowed);
-    /// `base_rows`: rows the step has anyway; `streams`: conversations that emit a token whatever happens.
-    /// (`drafts`: slot, top probabilities, sampled, most allowed.)
-    fn choose(&self, drafts: &[(usize, [f32; 7], bool, usize)], base_rows: usize, streams: usize, nslots: usize) -> Vec<usize> {
+    /// How many drafts to verify for each conversation. `drafts`: per conversation, its slot and for each of its
+    /// drafts in order the probability that it is accepted given the ones before it were; `base_rows`: rows the step
+    /// has anyway; `streams`: conversations that emit a token whatever happens; `prompt_rows`: rows of the step that
+    /// read prompts (a longer step delays them too); `draft_pass`: a drafter pass was run.
+    ///
+    /// A draft row is worth P(it and all drafts before it are accepted) tokens and costs the step the time of one
+    /// more row; the best n rows are verified, for the n that gives the step the most tokens per millisecond. This maximises the
+    /// server's total output. It is not fair between conversations: one that is copying a long passage takes many
+    /// rows, and the others' tokens arrive more slowly while it does. (Weighing gains in proportion to each
+    /// conversation's own speed was tried: 4 streams lost up to 11% in total.)
+    fn choose(&self, drafts: &[(usize, Vec<f32>)], base_rows: usize, streams: usize, prompt_rows: usize, nslots: usize, draft_pass: bool) -> Vec<usize> {
         let mut k = vec![0usize; nslots];
         let mut cands: Vec<(f32, usize)> = Vec::new();
-        for &(slot, conf, sampled, cap) in drafts {
+        for (slot, probs) in drafts {
             let mut all = 1.0f32;
-            for c in &conf[..cap.min(7)] {
-                all *= self.accept(*c, sampled);
-                cands.push((all, slot));
+            for p in probs {
+                all *= p;
+                cands.push((all, *slot));
             }
         }
-        cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap()); // stable: a conversation's drafts stay in order
-        let (mut rows, mut tokens) = (base_rows.max(1), streams.max(1) as f32);
-        let mut ms = self.scale * Self::rows_ms(rows) + self.draft_ms;
-        for (all, slot) in cands {
-            let extra = self.scale * (Self::rows_ms(rows + 1) - Self::rows_ms(rows));
-            if rows >= TMAX || all * ms < tokens * extra {
-                break; // this row would lower tokens per millisecond, and so would every later one
+        cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)); // stable: a conversation's drafts stay in order
+        // A prompt token counts for the time it would take alone, relative to an output token: 57 ms / 128 against 6.1 ms.
+        const PROMPT_TOKEN: f32 = 0.073;
+        // Take the best n rows, for the n that gives the most tokens per millisecond. (Not "add rows while they pay":
+        // step time jumps at tile boundaries, and the rows after a jump can be worth it together when the first is not.)
+        let base = base_rows.max(1);
+        let fixed = if draft_pass { self.draft_ms } else { 0.0 };
+        let mut tokens = streams.max(1) as f32 + PROMPT_TOKEN * prompt_rows as f32;
+        let (mut best, mut best_n) = (tokens / (self.scale * Self::rows_ms(base) + fixed), 0);
+        for (n, (all, _)) in cands.iter().enumerate().take(TMAX.saturating_sub(base)) {
+            tokens += all;
+            let rate = tokens / (self.scale * Self::rows_ms(base + n + 1) + fixed);
+            if rate > best {
+                (best, best_n) = (rate, n + 1);
             }
+        }
+        let rows = base + best_n;
+        let taken: Vec<usize> = cands[..best_n].iter().map(|c| c.1).collect();
+        // Every distinct number of rows is a recorded step graph (GPU memory, and milliseconds to record again once it
+        // has been dropped), so big steps come in a few sizes only. The rows given up are the least promising ones.
+        let keep = taken.len() - (rows - Self::step_size(rows).max(base_rows.max(1))).min(taken.len());
+        for &slot in &taken[..keep] {
             k[slot] += 1;
-            (rows, tokens, ms) = (rows + 1, tokens + all, ms + extra);
         }
         k
+    }
+
+    /// The step sizes in use: any up to 16 rows, then multiples of 4 up to 64, then multiples of 8. Rounding down
+    /// also lands big steps on full tiles of rows (see `rows_ms`).
+    fn step_size(rows: usize) -> usize {
+        match rows {
+            0..=16 => rows,
+            17..=64 => rows / 4 * 4,
+            _ => rows / 8 * 8,
+        }
     }
 }
 
@@ -297,15 +444,17 @@ struct Plan {
     tops: [f32; 7],
     /// The drafts were sampled from the drafter's distribution (accepted with min(1, p/q)).
     sampled: bool,
+    /// The drafts were copied from the conversation; the length of the match that proposed them.
+    copy_run: Option<usize>,
 }
 
 fn finish(a: Active, why: &'static str) {
     let dt = a.job.t0.elapsed().as_secs_f64() - a.ttft;
     let steps = a.stats.steps.max(1) as f64;
     let summary = format!(
-        "{} prompt tokens ({} cached), ttft {:.0} ms; {} tokens at {:.1} tok/s; {:.2} tokens/step ({:.2} drafts verified, {:.2} accepted); finish={why}",
+        "{} prompt tokens ({} cached), ttft {:.0} ms; {} tokens at {:.1} tok/s; {:.2} tokens/step ({:.2} drafts verified, {:.2} accepted, {} tokens copied); finish={why}",
         a.job.prompt.len(), a.cached, a.ttft * 1e3, a.n_out, (a.n_out.max(2) - 1) as f64 / dt.max(1e-9), a.n_out as f64 / steps,
-        a.stats.verified as f64 / steps, a.stats.accepted as f64 / steps
+        a.stats.verified as f64 / steps, a.stats.accepted as f64 / steps, a.copied
     );
     // Nobody is listening to a request whose client went away: log it here.
     if let Err(mpsc::SendError(Event::Done { summary, .. })) = a.job.tx.send(Event::Done { finish: why, completion_tokens: a.n_out, cached: a.cached, summary }) {
@@ -403,7 +552,8 @@ fn scheduler(eng: &mut Engine, rx: mpsc::Receiver<Job>, cfg: Options, max_ctx: u
             }
             sl.full = false;
             let rng = Rng((job.seed as u64) << 20 | 1);
-            sl.active = Some(Active { job, phase: Phase::Prefill { done: r }, pos: r, n_out: 0, rng, stats: SpecStats::default(), ttft: 0.0, cached: r, header: None, forced: Vec::new() });
+            let copy = if cfg.copy_max > 0 && cfg.k_max > 0 && eng.has_draft() { Copy::new(&job.prompt) } else { Copy::new(&[]) };
+            sl.active = Some(Active { job, phase: Phase::Prefill { done: r }, pos: r, n_out: 0, rng, stats: SpecStats::default(), ttft: 0.0, cached: r, header: None, forced: Vec::new(), copy, copied: 0, draft_yield: 1.0 });
         }
 
         // ---- memory: every active conversation needs room for this step's positions. Attach more as it grows; if the
@@ -472,11 +622,22 @@ fn scheduler(eng: &mut Engine, rx: mpsc::Receiver<Job>, cfg: Options, max_ctx: u
         // per pass, so a pass for four conversations costs little more than a pass for one.
         let mut want: Vec<(usize, u32, usize)> = Vec::new(); // (slot, anchor, anchor position)
         let mut k_cap = vec![0usize; nslots];
+        let mut copied: Vec<Option<(Vec<u32>, usize)>> = (0..nslots).map(|_| None).collect();
         if k_max > 0 && eng.has_draft() {
-            for (s, slot) in slots.iter().enumerate() {
-                let Some(a) = slot.active.as_ref() else { continue };
+            for (s, slot) in slots.iter_mut().enumerate() {
+                let cap = slot.cap;
+                let Some(a) = slot.active.as_mut() else { continue };
                 let Phase::Decode { anchor } = a.phase else { continue };
-                k_cap[s] = if a.forced.is_empty() { k_max.min(7).min(slot.cap.saturating_sub(a.pos + 8)) } else { 0 };
+                k_cap[s] = if a.forced.is_empty() { k_max.min(7).min(cap.saturating_sub(a.pos + 8)) } else { 0 };
+                // A conversation that is repeating an earlier passage drafts by copying, and skips the drafter.
+                if k_cap[s] > 0 && cfg.copy_max > 0 && a.copy.run >= 4 {
+                    let room = cfg.copy_max.min(Engine::max_spec_run() - 1).min(cap.saturating_sub(a.pos + 9));
+                    if a.copy.worth(room, a.draft_yield) {
+                        copied[s] = Some((a.copy.drafts(room), a.copy.run));
+                        continue;
+                    }
+                    a.copy.forget();
+                }
                 if k_cap[s] > 0 {
                     want.push((s, anchor, a.pos));
                 }
@@ -500,25 +661,43 @@ fn scheduler(eng: &mut Engine, rx: mpsc::Receiver<Job>, cfg: Options, max_ctx: u
         // How many of them to verify.
         let is_sampled = |s: usize| slots[s].active.as_ref().map_or(false, |a| sampled_drafts(a.job.temperature));
         let k_take: Vec<usize> = if cfg.tau.is_some() || multi.is_some() {
-            (0..nslots).map(|s| drafted[s].map_or(0, |d| d.top[..k_cap[s]].iter().take_while(|&&c| c >= tau).count())).collect()
+            (0..nslots).map(|s| match (&copied[s], drafted[s]) {
+                // copied tokens: as many as are all accepted together with probability >= tau
+                (Some((d, run)), _) => {
+                    let p = slots[s].active.as_ref().map_or(0.0, |a| a.copy.accept(*run));
+                    (1..=d.len()).take_while(|&j| p.powi(j as i32) >= tau).count()
+                }
+                (None, Some(d)) => d.top[..k_cap[s]].iter().take_while(|&&c| c >= tau).count(),
+                _ => 0,
+            }).collect()
         } else {
-            let list: Vec<(usize, [f32; 7], bool, usize)> = (0..nslots).filter_map(|s| drafted[s].map(|d| (s, d.top, is_sampled(s), k_cap[s]))).collect();
+            let list: Vec<(usize, Vec<f32>)> = (0..nslots).filter_map(|s| match (&copied[s], drafted[s]) {
+                (Some((d, run)), _) => Some((s, vec![slots[s].active.as_ref().map_or(0.0, |a| a.copy.accept(*run)); d.len()])),
+                (None, Some(d)) => Some((s, d.top[..k_cap[s]].iter().map(|&t| spec.accept(t, is_sampled(s))).collect())),
+                _ => None,
+            }).collect();
             let forced_rows: usize = slots.iter().filter_map(|sl| sl.active.as_ref()).map(|a| a.forced.len()).sum();
-            let base = decoders + forced_rows + if prefillers > 0 { prefill_share.min(TMAX - decoders.min(TMAX)) } else { 0 };
-            spec.choose(&list, base, decoders, nslots)
+            let prompt_rows = if prefillers > 0 { prefill_share.min(TMAX - decoders.min(TMAX)) } else { 0 };
+            spec.choose(&list, decoders + forced_rows + prompt_rows, decoders, prompt_rows, nslots, !want.is_empty())
         };
+        // Text the server must supply (the opening of a tool call) has first claim on the step's rows: drafts of
+        // earlier slots may not crowd it out.
+        let forced_len: Vec<usize> = slots.iter().map(|sl| sl.active.as_ref().map_or(0, |a| if matches!(a.phase, Phase::Decode { .. }) { a.forced.len() } else { 0 })).collect();
         for (s, slot) in slots.iter_mut().enumerate() {
             let lim = slot.cap;
             let Some(a) = slot.active.as_mut() else { continue };
             let Phase::Decode { anchor } = a.phase else { continue };
-            let free_rows = TMAX.saturating_sub(rows.len() + 1 + (nslots - s));
-            let (mut fed, mut confs, mut tops, mut sampled) = (Vec::new(), [0f32; 7], [0f32; 7], false);
+            let free_rows = TMAX.saturating_sub(rows.len() + 1 + (nslots - s) + forced_len[s + 1..].iter().sum::<usize>());
+            let (mut fed, mut confs, mut tops, mut sampled, mut copy_run) = (Vec::new(), [0f32; 7], [0f32; 7], false, None);
             let forcing = !a.forced.is_empty() && a.forced.len() <= free_rows.min(lim.saturating_sub(a.pos + 8));
             if forcing {
                 fed = std::mem::take(&mut a.forced);
             } else {
                 a.forced.clear();
-                if let Some(d) = drafted[s] {
+                if let Some((d, run)) = &copied[s] {
+                    fed.extend_from_slice(&d[..k_take[s].min(free_rows).min(d.len())]);
+                    copy_run = Some(*run);
+                } else if let Some(d) = drafted[s] {
                     fed.extend_from_slice(&d.tokens[..k_take[s].min(free_rows)]);
                     (confs, tops, sampled) = (d.conf, d.top, sampled_drafts(a.job.temperature));
                 }
@@ -533,7 +712,7 @@ fn scheduler(eng: &mut Engine, rx: mpsc::Receiver<Job>, cfg: Options, max_ctx: u
             excl.push(-1);
             qrows.push(-1);
             sampling.extend(std::iter::repeat((a.job.temperature, a.job.seed)).take(fed.len() + 1));
-            plan[s] = Some(Plan { r0, n: fed.len() + 1, fed, forcing, confs, tops, sampled });
+            plan[s] = Some(Plan { r0, n: fed.len() + 1, fed, forcing, confs, tops, sampled, copy_run });
         }
         if prefillers > 0 {
             let budget = (TMAX - rows.len()).min(if decoders > 0 { prefill_share } else { TMAX });
@@ -547,7 +726,7 @@ fn scheduler(eng: &mut Engine, rx: mpsc::Receiver<Job>, cfg: Options, max_ctx: u
                 if c == 0 {
                     continue;
                 }
-                plan[s] = Some(Plan { r0: rows.len(), n: c, fed: Vec::new(), forcing: false, confs: [0.0; 7], tops: [0.0; 7], sampled: false });
+                plan[s] = Some(Plan { r0: rows.len(), n: c, fed: Vec::new(), forcing: false, confs: [0.0; 7], tops: [0.0; 7], sampled: false, copy_run: None });
                 for i in 0..c {
                     rows.push((s, a.pos + i, a.job.prompt[done + i]));
                     excl.push(-1);
@@ -570,7 +749,7 @@ fn scheduler(eng: &mut Engine, rx: mpsc::Receiver<Job>, cfg: Options, max_ctx: u
 
         // ---- hand out the results
         for s in 0..nslots {
-            let Some(Plan { r0, n: n_rows, fed: drafts, forcing, confs, tops, sampled: sampled_draft }) = plan[s].take() else { continue };
+            let Some(Plan { r0, n: n_rows, fed: drafts, forcing, confs, tops, sampled: sampled_draft, copy_run }) = plan[s].take() else { continue };
             let mut a = slots[s].active.take().unwrap();
             let sampled = a.job.temperature > 0.0;
             let mut out: Vec<u32> = Vec::new();
@@ -627,7 +806,13 @@ fn scheduler(eng: &mut Engine, rx: mpsc::Receiver<Job>, cfg: Options, max_ctx: u
                             n += 1;
                         }
                     }
-                    if !forcing {
+                    if let Some(run) = copy_run {
+                        for i in 0..(n + 1).min(k) {
+                            a.copy.observe(run, i < n);
+                        }
+                        a.copied += n;
+                    } else if !forcing {
+                        a.draft_yield = 0.9 * a.draft_yield + 0.1 * n as f32;
                         for i in 0..(n + 1).min(k) {
                             spec.observe(tops[i], sampled_draft, i < n); // drafts 0..n were accepted, draft n (if any) was not
                         }
@@ -678,6 +863,11 @@ fn scheduler(eng: &mut Engine, rx: mpsc::Receiver<Job>, cfg: Options, max_ctx: u
                 why = Some("length");
             }
             let last = *send.last().unwrap();
+            if cfg.copy_max > 0 {
+                for &t in &send {
+                    a.copy.push(t);
+                }
+            }
             let alive = a.job.tx.send(Event::Tokens(send)).is_ok();
             slots[s].last_used = Instant::now();
             match why {
@@ -1199,4 +1389,149 @@ pub fn serve(addr: &str, model_name: &str, chat: Chat, eng: &mut Engine, max_ctx
     });
     scheduler(eng, rx, cfg, max_ctx, &sh.chat);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_follows_a_repeated_passage() {
+        // 1..=10, some filler, then the conversation starts repeating 3 4 5
+        let mut c = Copy::new(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 50, 51, 52]);
+        assert!(c.drafts(8).is_empty());
+        for t in [3, 4] {
+            c.push(t);
+        }
+        assert!(c.drafts(8).is_empty()); // two tokens are not enough
+        c.push(5);
+        assert_eq!((c.run, c.drafts(4)), (3, vec![6u32, 7, 8, 9]));
+        assert!(!c.worth(24, 0.0), "a match of three tokens is not used");
+        c.push(6);
+        c.push(7);
+        assert_eq!((c.run, c.drafts(3)), (5, vec![8u32, 9, 10]));
+        assert!(c.worth(24, 1.0) && !c.worth(24, 6.0), "copying has to beat what the drafter yields");
+        c.push(99); // the model went its own way
+        assert_eq!(c.run, 0);
+        assert!(c.drafts(8).is_empty() && !c.worth(24, 0.0));
+    }
+
+    #[test]
+    fn copy_continues_a_repeating_pattern_into_itself() {
+        let mut c = Copy::new(&[7, 8, 9, 7, 8, 9]);
+        // the last three tokens match positions 0..3; what followed there is 7 8 9, and then the pattern again
+        assert_eq!(c.drafts(8), vec![7u32, 8, 9, 7, 8, 9, 7, 8]);
+        c.push(7);
+        assert_eq!(c.drafts(2), vec![8u32, 9]);
+        // a run of one token, and an alternation: as many drafts as asked for, not one or two
+        let ones = Copy::new(&[5, 4, 4, 4, 4, 4]);
+        assert_eq!(ones.drafts(6), vec![4u32; 6]);
+        let two = Copy::new(&[1, 2, 1, 2, 1, 2, 1]);
+        assert_eq!(two.drafts(5), vec![2u32, 1, 2, 1, 2]);
+        assert!(Copy::new(&[]).drafts(4).is_empty() && c.drafts(0).is_empty());
+    }
+
+    #[test]
+    fn copy_matches_are_real_and_drafts_agree_with_brute_force() {
+        // pseudo-random tokens from a tiny vocabulary: many accidental matches
+        let mut x = 12345u32;
+        let mut c = Copy::new(&[]);
+        for _ in 0..3000 {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            c.push((x >> 24) % 5);
+            let i = c.seq.len() - 1;
+            if let Some(s) = c.src {
+                assert!(s < i);
+                assert!(c.run >= 1 && (0..c.run.min(s + 1)).all(|n| c.seq[s - n] == c.seq[i - n]), "claimed match of {} at {s}", c.run);
+                let d = c.drafts(7);
+                assert_eq!(d.len(), 7);
+                let mut ext = c.seq.clone();
+                for (j, &t) in d.iter().enumerate() {
+                    assert_eq!(t, ext[s + 1 + j]); // each draft is what followed the passage, the drafts included
+                    ext.push(t);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn copy_calibration_switches_off_and_comes_back() {
+        let mut c = Copy::new(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(c.run, 10);
+        assert!(c.worth(24, 3.0));
+        for _ in 0..12 {
+            c.observe(c.run, false); // every copied token of this length is rejected
+        }
+        assert!(c.accept(c.run) < 0.4 && !c.worth(24, 3.0));
+        for _ in 0..60 {
+            c.forget(); // not used for a while: the bad record fades
+        }
+        assert!(c.worth(24, 3.0), "copying must be tried again eventually");
+        // a good record makes long copies worth more than a strong drafter
+        for _ in 0..50 {
+            c.observe(c.run, true);
+        }
+        assert!(c.accept(c.run) > 0.95 && c.worth(24, 6.0));
+    }
+
+    #[test]
+    fn resume_needs_the_conv_history_before_the_restart_point() {
+        let hist: Vec<u32> = (0..100).collect();
+        let slot = |hi: usize| Slot { hist: hist.clone(), ckpt: Some(40), hi, ckpt_hi: 0, cap: 4096, full: false, last_used: Instant::now(), active: None };
+        let prompt: Vec<u32> = (0..120).collect();
+        let margin = Engine::max_spec_run() - 3;
+        assert_eq!(resume_point(&slot(100 + margin), &prompt), (100, false)); // live: rejected rows written up to the margin
+        assert_eq!(resume_point(&slot(100 + margin + 1), &prompt), (40, true)); // one more: back to the snapshot
+        let other: Vec<u32> = (500..520).collect();
+        assert_eq!(resume_point(&slot(100), &other), (0, false)); // nothing shared
+    }
+
+    #[test]
+    fn copy_measures_the_match_length_backwards() {
+        let mut c = Copy::new(&[1, 2, 3, 4, 5, 6, 0, 0, 1, 2, 3, 4]);
+        assert_eq!(c.run, 4); // 1 2 3 4 matched, found through its last three tokens
+        c.push(5);
+        assert_eq!((c.run, c.drafts(1)), (5, vec![6u32]));
+    }
+
+    #[test]
+    fn choose_adds_rows_only_while_they_pay() {
+        let spec = Speculation::new();
+        // one stream: near-certain drafts are all taken, hopeless ones are not
+        assert_eq!(spec.choose(&[(0, vec![0.99; 7])], 1, 1, 0, 4, true)[0], 7);
+        assert_eq!(spec.choose(&[(0, vec![0.02; 7])], 1, 1, 0, 4, true)[0], 0);
+        // a conversation's drafts are taken in order, and a weak draft blocks the ones behind it
+        assert_eq!(spec.choose(&[(0, vec![0.9, 0.9, 0.01, 0.99])], 1, 1, 0, 4, true)[0], 2);
+        // with more streams sharing the step, a row has to be worth more
+        let alone = spec.choose(&[(0, vec![0.5; 7])], 1, 1, 0, 4, true)[0];
+        let shared = spec.choose(&[(0, vec![0.5; 7])], 4, 4, 0, 4, true)[0];
+        assert!(shared <= alone, "{shared} > {alone}");
+        // long copied drafts fit, and never exceed the step's row limit
+        let k = spec.choose(&[(0, vec![0.995; 96]), (1, vec![0.995; 96])], 2, 2, 0, 4, false);
+        assert!(k[0] + k[1] + 2 <= TMAX && k[0] >= 24, "{k:?}");
+        // big steps come in few sizes, small ones in any size; rows the step has anyway are never dropped
+        for n in 1..=40 {
+            let k = spec.choose(&[(0, vec![0.999; n]), (1, vec![0.999; n])], 2, 2, 0, 4, false);
+            let rows = 2 + k[0] + k[1];
+            assert!(k[0] <= n && k[1] <= n && (rows <= 16 || (rows <= 64 && rows % 4 == 0) || rows % 8 == 0), "{n}: {k:?}");
+        }
+        assert_eq!(spec.choose(&[(0, vec![0.999; 3])], 1 + 48, 1, 48, 4, true)[0], 3); // 49 rows anyway: 52 is a size
+        assert!(spec.choose(&[(0, vec![f32::NAN; 5])], 1, 1, 0, 4, true)[0] <= 5);
+        // a step that is also reading a prompt is worth more as it is, so drafts have to be better to join it
+        let busy = spec.choose(&[(0, vec![0.5; 7])], 1 + 48, 1, 48, 4, true)[0];
+        let idle = spec.choose(&[(0, vec![0.5; 7])], 1 + 48, 1, 0, 4, true)[0];
+        assert!(busy <= idle, "{busy} > {idle}");
+        // a conversation copying a long passage takes all of it when alone: 31 drafts and its next token fill 32 rows
+        assert_eq!(spec.choose(&[(0, vec![0.995f32; 31])], 1, 1, 0, 4, false)[0], 31);
+        // a 33rd row would start a new tile of rows in every matrix kernel: not for a doubtful draft
+        assert_eq!(spec.choose(&[(0, vec![0.999; 28]), (1, vec![0.999, 0.999, 0.999, 0.3, 0.3])], 2, 2, 0, 4, false), vec![27, 3, 0, 0]);
+    }
+
+    #[test]
+    fn step_time_table_is_monotonic() {
+        assert_eq!(Speculation::rows_ms(1), 6.12);
+        assert_eq!(Speculation::rows_ms(128), 72.32);
+        assert!((Speculation::rows_ms(36) - 27.15).abs() < 0.01); // between the points at 34 and 40
+        assert!((2..=128).all(|r| Speculation::rows_ms(r) > Speculation::rows_ms(r - 1)));
+    }
 }

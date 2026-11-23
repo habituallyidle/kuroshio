@@ -12,6 +12,7 @@ extern "C" {
     fn ink_commit(e: *mut c_void, seq: c_int, row: c_int);
     fn ink_draft_seq(e: *mut c_void, seq: c_int, anchor: c_int, l: c_int, ndraft: c_int, tokens: *mut c_int, conf: *mut f32, temp: f32, seed: u32, top: *mut f32) -> c_int;
     fn ink_nseq(e: *mut c_void) -> c_int;
+    fn ink_max_rewind_run() -> c_int;
     fn ink_vram_free() -> usize;
     fn ink_draft_batch(e: *mut c_void, n: c_int, seqs: *const c_int, anchors: *const c_int, ls: *const c_int, ndraft: c_int, tokens: *mut c_int, conf: *mut f32, temps: *const f32, seeds: *const u32, top: *mut f32) -> c_int;
     fn ink_snapshot(e: *mut c_void, seq: c_int) -> c_int;
@@ -248,6 +249,12 @@ impl Engine {
     /// Give back conversation `seq`'s memory above `tokens` positions.
     pub fn trim(&mut self, seq: usize, tokens: usize) {
         unsafe { ink_trim(self.raw, seq as c_int, tokens as c_int) };
+    }
+
+    /// Longest run of rows of one conversation in a step (its next token plus drafts) that may be partly rejected:
+    /// a longer run does not keep the conv history its own beginning would need to restart from.
+    pub fn max_spec_run() -> usize {
+        unsafe { ink_max_rewind_run() as usize }
     }
 
     pub fn slots(&self) -> usize {
