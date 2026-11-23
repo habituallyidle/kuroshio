@@ -9,7 +9,7 @@ BIN=target/release/kuroshio; PORT=8029; TMP="$(mktemp -d)"
 nap() { timeout "$1" tail -f /dev/null || true; }
 nvcc -O1 -o "$TMP/hog" tools/hog/hog.cu -L"$CUDA_HOME/lib" -l:libcudart.so.13 -Xlinker -rpath,"$CUDA_HOME/lib"
 $BIN serve --port $PORT > "$TMP/serve.log" 2>&1 & SRV=$!
-trap 'kill $SRV 2>/dev/null; pkill -x hog 2>/dev/null; rm -rf "$TMP"' EXIT
+HOG=; trap 'kill $SRV $HOG 2>/dev/null || true; rm -rf "$TMP"' EXIT
 for i in $(seq 1 90); do curl -fsS -m 2 http://127.0.0.1:$PORT/health >/dev/null 2>&1 && break; nap 1; done
 ask() {  # ask <words of prompt> <max_tokens> -> "status finish_reason total_tokens"
   python3 -I - "$1" "$2" <<PY
@@ -24,10 +24,10 @@ PY
 }
 fail() { echo "FAIL: $1"; exit 1; }
 r=$(ask 10 50);    echo "before:                         $r"; [[ $r == 200* ]] || fail "plain request"
-"$TMP/hog" 40 > "$TMP/hog.log" & nap 5; echo "another program: $(cat "$TMP/hog.log")"
+"$TMP/hog" 40 > "$TMP/hog.log" & HOG=$!; nap 5; echo "another program: $(cat "$TMP/hog.log")"
 r=$(ask 10 6000);  echo "same conversation, card full:   $r"; [[ $r == "200 length"* ]] || fail "a generation must end with length at its memory"
 r=$(ask 30000 20); echo "long prompt, card full:         $r"; [[ $r == 503* ]] || fail "a prompt that cannot fit must get 503"
-wait %2 2>/dev/null || true; nap 1
+wait $HOG 2>/dev/null || true; HOG=; nap 1
 r=$(ask 30000 20); echo "long prompt, memory back:       $r"; [[ $r == 200* ]] || fail "must work again once memory is back"
 kill -0 $SRV 2>/dev/null || fail "the server died"
 grep -E "panicked|CUDA error" "$TMP/serve.log" && fail "errors in the server log"

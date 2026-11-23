@@ -14,8 +14,8 @@ use serde_json::{json, Value};
 use std::{
     collections::VecDeque,
     io::{BufRead, BufReader, Read, Write},
-    net::{TcpListener, TcpStream},
-    sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, mpsc, Arc},
+    net::{Shutdown, TcpListener, TcpStream},
+    sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, mpsc, Arc, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -33,7 +33,7 @@ const FIRST_SPECIAL: u32 = 199_998;
 static CALL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Server settings (see `kuroshio --help`).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Options {
     /// Speculative decoding: verify up to `k_max` drafts per step...
     pub k_max: usize,
@@ -47,6 +47,8 @@ pub struct Options {
     pub prefix_cache: bool,
     /// Supply the fixed beginning of a tool call instead of letting the model write it.
     pub tool_fix: bool,
+    /// Origin that browsers are told may call this server (`*` for any); None: no cross-origin access.
+    pub cors: Option<String>,
     /// Give back the context memory of a slot that has been idle this many seconds (0: never). Its prefix cache goes too.
     pub idle_release: u64,
 }
@@ -126,7 +128,8 @@ fn watch_tool_call(a: &mut Active, out: &[u32], chat: &Chat) -> usize {
             if let Some(h) = a.header.take().filter(|h| !h.is_empty()) {
                 let name = chat.decode(&h).unwrap_or_default();
                 let text = format!("{{\"name\":{},\"args\":", serde_json::to_string(&name).unwrap_or_default());
-                if let (false, Ok(toks)) = (name.is_empty(), chat.encode(&text)) {
+                // The name is the model's text, not markup: it must not turn into control tokens on the way back in.
+                if let (false, Ok(toks)) = (name.is_empty(), chat.encode_text(&text)) {
                     a.forced = toks;
                     return j + 1;
                 }
@@ -194,7 +197,7 @@ fn resume_point(slot: &Slot, prompt: &[u32]) -> (usize, bool) {
 /// Fixed-threshold speculation (`--tau X`): how many drafts to try, by number of conversations generating at once.
 /// Measured aggregate tokens/s at 2 / 4 / 8 streams (temperature 0.6, tau 0.5): no speculation 256 / 394 / 576;
 /// up to 3-4 drafts 362-380 / 465-470 / 622-625; up to 7 drafts 382 / 452 / 588.
-fn fixed_k(cfg: Options, decoders: usize, multi: Option<(usize, f32)>) -> (usize, f32) {
+fn fixed_k(cfg: &Options, decoders: usize, multi: Option<(usize, f32)>) -> (usize, f32) {
     let tau = cfg.tau.unwrap_or(0.5);
     if let (Some(m), true) = (multi, decoders > 1) {
         return m;
@@ -304,7 +307,10 @@ fn finish(a: Active, why: &'static str) {
         a.job.prompt.len(), a.cached, a.ttft * 1e3, a.n_out, (a.n_out.max(2) - 1) as f64 / dt.max(1e-9), a.n_out as f64 / steps,
         a.stats.verified as f64 / steps, a.stats.accepted as f64 / steps
     );
-    let _ = a.job.tx.send(Event::Done { finish: why, completion_tokens: a.n_out, cached: a.cached, summary });
+    // Nobody is listening to a request whose client went away: log it here.
+    if let Err(mpsc::SendError(Event::Done { summary, .. })) = a.job.tx.send(Event::Done { finish: why, completion_tokens: a.n_out, cached: a.cached, summary }) {
+        eprintln!("request: {summary}");
+    }
 }
 
 /// Runs forever on the thread that owns the engine.
@@ -349,7 +355,7 @@ fn scheduler(eng: &mut Engine, rx: mpsc::Receiver<Job>, cfg: Options, max_ctx: u
         queue.retain(|j| !j.cancel.load(Ordering::Relaxed));
         for sl in slots.iter_mut() {
             if sl.active.as_ref().map_or(false, |a| a.job.cancel.load(Ordering::Relaxed)) {
-                sl.active = None;
+                finish(sl.active.take().unwrap(), "cancelled");
                 sl.last_used = Instant::now();
             }
         }
@@ -456,7 +462,7 @@ fn scheduler(eng: &mut Engine, rx: mpsc::Receiver<Job>, cfg: Options, max_ctx: u
         // ---- plan the step: generating conversations first, then prompt chunks with what is left
         let decoders = slots.iter().filter_map(|s| s.active.as_ref()).filter(|a| matches!(a.phase, Phase::Decode { .. })).count();
         let prefillers = slots.iter().filter_map(|s| s.active.as_ref()).filter(|a| matches!(a.phase, Phase::Prefill { .. })).count();
-        let (k_max, tau) = if cfg.tau.is_some() || multi.is_some() { fixed_k(cfg, decoders, multi) } else { (cfg.k_max, 0.0) };
+        let (k_max, tau) = if cfg.tau.is_some() || multi.is_some() { fixed_k(&cfg, decoders, multi) } else { (cfg.k_max, 0.0) };
         let mut rows: Vec<(usize, usize, u32)> = Vec::new();
         let mut excl: Vec<i32> = Vec::new();
         let mut sampling: Vec<(f32, u32)> = Vec::new();
@@ -676,7 +682,7 @@ fn scheduler(eng: &mut Engine, rx: mpsc::Receiver<Job>, cfg: Options, max_ctx: u
             slots[s].last_used = Instant::now();
             match why {
                 Some(w) => finish(a, w),
-                None if !alive => {} // client went away: free the slot
+                None if !alive => finish(a, "cancelled"), // client went away: free the slot
                 None => {
                     a.phase = Phase::Decode { anchor: last };
                     slots[s].active = Some(a);
@@ -698,13 +704,22 @@ fn read_line(r: &mut BufReader<&TcpStream>) -> Result<String> {
     Ok(String::from_utf8_lossy(&line).into_owned())
 }
 
-fn read_request(stream: &TcpStream) -> Result<(String, String, Vec<u8>)> {
+struct Request {
+    method: String,
+    path: String,
+    body: Vec<u8>,
+    /// Access-Control-Request-Headers of a CORS preflight.
+    cors_headers: Option<String>,
+}
+
+fn read_request(mut stream: &TcpStream) -> Result<Request> {
     let t0 = Instant::now();
     let mut r = BufReader::new(stream);
     let line = read_line(&mut r)?;
     let mut parts = line.split_whitespace();
-    let (method, path) = (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("").to_string());
-    let mut len = 0usize;
+    let (method, target) = (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or(""));
+    let path = target.split(['?', '#']).next().unwrap_or("").to_string();
+    let (mut len, mut expect, mut cors_headers) = (0usize, false, None);
     for n in 0.. {
         let h = read_line(&mut r)?;
         if h.is_empty() || h == "\r\n" || h == "\n" {
@@ -714,19 +729,27 @@ fn read_request(stream: &TcpStream) -> Result<(String, String, Vec<u8>)> {
             bail!("too many header lines, or headers arriving too slowly");
         }
         if let Some((k, v)) = h.split_once(':') {
+            let v = v.trim();
             if k.eq_ignore_ascii_case("content-length") {
-                len = v.trim().parse().map_err(|_| anyhow!("bad Content-Length"))?;
+                len = v.parse().map_err(|_| anyhow!("bad Content-Length"))?;
             } else if k.eq_ignore_ascii_case("transfer-encoding") {
                 bail!("chunked request bodies are not supported; send Content-Length");
+            } else if k.eq_ignore_ascii_case("expect") {
+                expect = v.eq_ignore_ascii_case("100-continue");
+            } else if k.eq_ignore_ascii_case("access-control-request-headers") {
+                cors_headers = Some(v.to_string());
             }
         }
     }
     if len > MAX_BODY {
         bail!("{TOO_LARGE}: {len} bytes, the limit is {MAX_BODY}");
     }
+    if expect && len > 0 {
+        stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?; // curl waits a second for this before sending a large body
+    }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body)?;
-    Ok((method, path, body))
+    Ok(Request { method, path, body, cors_headers })
 }
 const TOO_LARGE: &str = "request body too large";
 const NO_MEMORY: &str = "out of GPU memory";
@@ -745,11 +768,82 @@ fn client_gone(stream: &TcpStream) -> bool {
     }
 }
 
+/// `--cors`: the origin browsers are told may call this server (none by default).
+static CORS: OnceLock<Option<String>> = OnceLock::new();
+fn cors_header() -> String {
+    CORS.get().and_then(|c| c.as_ref()).map_or(String::new(), |o| format!("Access-Control-Allow-Origin: {o}\r\n"))
+}
+
+/// One write per response: with TCP_NODELAY every write is a packet.
 fn respond(mut s: &TcpStream, status: &str, body: &Value) -> Result<()> {
     let b = serde_json::to_vec(body)?;
-    write!(s, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", b.len())?;
-    s.write_all(&b)?;
+    let mut out = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n", b.len(), cors_header()).into_bytes();
+    out.extend_from_slice(&b);
+    s.write_all(&out)?;
     Ok(())
+}
+
+/// Holds back text that might be the beginning of a stop sequence until it is known not to be one.
+struct StopFilter {
+    stops: Vec<String>,
+    held: String,
+}
+impl StopFilter {
+    /// Takes newly generated text; returns the text that may be shown and whether a stop sequence was reached.
+    fn push(&mut self, piece: &str) -> (String, bool) {
+        if self.stops.is_empty() {
+            return (piece.to_string(), false);
+        }
+        self.held.push_str(piece);
+        if let Some(i) = self.stops.iter().filter_map(|s| self.held.find(s.as_str())).min() {
+            self.held.truncate(i);
+            return (std::mem::take(&mut self.held), true);
+        }
+        // Keep the longest tail that is a proper prefix of a stop sequence.
+        let mut keep = 0;
+        for s in &self.stops {
+            let longest = (1..s.len().min(self.held.len() + 1)).rev().find(|&k| s.is_char_boundary(k) && self.held.ends_with(&s[..k]));
+            keep = keep.max(longest.unwrap_or(0));
+        }
+        let cut = self.held.len() - keep;
+        (self.held.drain(..cut).collect(), false)
+    }
+    fn finish(&mut self) -> String {
+        std::mem::take(&mut self.held)
+    }
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::StopFilter;
+
+    /// Feeds `text` in pieces of `n` bytes; returns what was shown and whether a stop sequence ended it.
+    fn run(stops: &[&str], text: &str, n: usize) -> (String, bool) {
+        let mut f = StopFilter { stops: stops.iter().map(|s| s.to_string()).collect(), held: String::new() };
+        let mut shown = String::new();
+        let chars: Vec<char> = text.chars().collect();
+        for piece in chars.chunks(n) {
+            let (t, hit) = f.push(&piece.iter().collect::<String>());
+            shown.push_str(&t);
+            if hit {
+                return (shown, true);
+            }
+        }
+        shown.push_str(&f.finish());
+        (shown, false)
+    }
+
+    #[test]
+    fn stop_sequences_cut_the_text_however_it_is_split() {
+        for n in 1..12 {
+            assert_eq!(run(&["\nObservation:"], "Thought: look\nAction: read\nObservation: x", n), ("Thought: look\nAction: read".to_string(), true));
+            assert_eq!(run(&["END", "\n\n"], "one\ntwo\n\nthree END", n), ("one\ntwo".to_string(), true));
+            // A beginning of a stop sequence that does not complete is shown after all.
+            assert_eq!(run(&["\nObservation:"], "a\nObserver\nObs", n), ("a\nObserver\nObs".to_string(), false));
+            assert_eq!(run(&["é!"], "caf\u{e9} \u{e9}? \u{e9}!", n), ("caf\u{e9} \u{e9}? ".to_string(), true));
+            assert_eq!(run(&[], "plain", n), ("plain".to_string(), false));
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -775,24 +869,37 @@ fn handle(stream: TcpStream, sh: Arc<Shared>) {
     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
     let mut sse_started = false;
     let result = (|| -> Result<()> {
-        let (method, path, body) = match read_request(&stream) {
+        let req = match read_request(&stream) {
             Ok(r) => r,
             Err(e) if e.downcast_ref::<std::io::Error>().is_none() => {
-                let status = if e.to_string().starts_with(TOO_LARGE) { "413 Payload Too Large" } else { "400 Bad Request" };
-                return respond(&stream, status, &json!({"error": {"message": e.to_string()}}));
+                let too_large = e.to_string().starts_with(TOO_LARGE);
+                respond(&stream, if too_large { "413 Payload Too Large" } else { "400 Bad Request" }, &json!({"error": {"message": e.to_string()}}))?;
+                if too_large {
+                    // Closing with the body unread resets the connection and the client never sees the 413:
+                    // let it finish sending (bounded), then close.
+                    let _ = stream.shutdown(Shutdown::Write);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let (t0, mut sink, mut total) = (Instant::now(), vec![0u8; 1 << 16], 0usize);
+                    while let Ok(n) = (&stream).read(&mut sink) {
+                        total += n;
+                        if n == 0 || total > 8 * MAX_BODY || t0.elapsed() > Duration::from_secs(10) {
+                            break;
+                        }
+                    }
+                }
+                return Ok(());
             }
             Err(e) => return Err(e),
         };
-        match (method.as_str(), path.as_str()) {
+        match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/v1/models") => respond(&stream, "200 OK", &json!({"object": "list", "data": [{"id": sh.model_name, "object": "model", "owned_by": "local",
                 "context_window": sh.max_ctx, "max_model_len": sh.max_ctx, "slots": sh.slots}]})),
             ("GET", "/health") => respond(&stream, "200 OK", &json!({"status": "ok"})),
-            ("POST", "/v1/chat/completions") => match completion(&stream, &body, &sh, &mut sse_started) {
+            ("POST", "/v1/chat/completions") => match completion(&stream, &req.body, &sh, &mut sse_started) {
                 Err(e) if e.downcast_ref::<std::io::Error>().is_none() => {
                     if sse_started {
                         // The 200 and some events are already on the wire: report inside the stream, then end it.
-                        let mut s2 = &stream;
-                        write!(s2, "data: {}\n\ndata: [DONE]\n\n", json!({"error": {"message": e.to_string()}}))?;
+                        (&stream).write_all(format!("data: {}\n\ndata: [DONE]\n\n", json!({"error": {"message": e.to_string()}})).as_bytes())?;
                         Ok(())
                     } else {
                         let status = if e.to_string().starts_with(NO_MEMORY) { "503 Service Unavailable" } else { "400 Bad Request" };
@@ -801,6 +908,12 @@ fn handle(stream: TcpStream, sh: Arc<Shared>) {
                 }
                 other => other,
             },
+            // A browser asks before it posts from another origin. Answered only when --cors names who may.
+            ("OPTIONS", _) if CORS.get().map_or(false, |c| c.is_some()) => {
+                let allow = req.cors_headers.unwrap_or_else(|| "Authorization, Content-Type".into());
+                (&stream).write_all(format!("HTTP/1.1 204 No Content\r\n{}Access-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: {allow}\r\nAccess-Control-Max-Age: 600\r\nConnection: close\r\n\r\n", cors_header()).as_bytes())?;
+                Ok(())
+            }
             _ => respond(&stream, "404 Not Found", &json!({"error": {"message": "not found"}})),
         }
     })();
@@ -813,14 +926,41 @@ fn completion(mut stream: &TcpStream, body: &[u8], sh: &Shared, sse_started: &mu
     let t0 = Instant::now();
     let chat = &sh.chat;
     let req: Value = serde_json::from_slice(body)?;
-    let messages = req.get("messages").ok_or_else(|| anyhow!("missing messages"))?;
+    let messages = req.get("messages").filter(|m| m.as_array().map_or(false, |a| !a.is_empty())).ok_or_else(|| anyhow!("messages must be a non-empty array"))?;
     let effort = req.get("reasoning_effort").or_else(|| req.pointer("/chat_template_kwargs/reasoning_effort")).filter(|v| !v.is_null());
     // tool_choice "none": the model is not shown the tools at all.
     let tools = req.get("tools").filter(|v| !v.is_null() && req.get("tool_choice").and_then(Value::as_str) != Some("none"));
-    let prompt = chat.encode(&chat.render(messages, tools, effort)?)?;
-    if req.get("n").and_then(Value::as_u64).unwrap_or(1) != 1 {
+    // Fields that would change the reply and are not implemented are refused, not ignored: a client that asked for
+    // JSON or for log-probabilities would otherwise fail later, somewhere less obvious.
+    if req.get("n").filter(|v| !v.is_null()).map_or(false, |n| n.as_u64() != Some(1)) {
         bail!("n must be 1");
     }
+    if req.get("logprobs").and_then(Value::as_bool) == Some(true) || req.get("top_logprobs").and_then(Value::as_u64).unwrap_or(0) > 0 {
+        bail!("logprobs are not supported");
+    }
+    if let Some(format) = req.get("response_format").filter(|v| !v.is_null()) {
+        if format.get("type").and_then(Value::as_str) != Some("text") {
+            bail!("response_format is not supported: replies are plain text");
+        }
+    }
+    let stops: Vec<String> = match req.get("stop").filter(|v| !v.is_null()) {
+        None => Vec::new(),
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(a)) if a.len() <= 16 && a.iter().all(Value::is_string) => a.iter().map(|s| s.as_str().unwrap().to_string()).collect(),
+        Some(_) => bail!("stop must be a string or a list of up to 16 strings"),
+    };
+    if stops.iter().any(|s| s.len() > 256) {
+        bail!("a stop sequence can be at most 256 bytes");
+    }
+    // Rendering the prompt takes time that grows faster than the number of tools and tool calls: bound them.
+    if tools.map_or(false, |t| !t.as_array().map_or(false, |a| a.len() <= 512 && a.iter().all(Value::is_object))) {
+        bail!("tools must be a list of at most 512 tool definitions");
+    }
+    if messages.as_array().map_or(0, |a| a.len()) > 8192 {
+        bail!("a conversation can have at most 8192 messages");
+    }
+    let mut stop = StopFilter { stops: stops.into_iter().filter(|s| !s.is_empty()).collect(), held: String::new() };
+    let prompt = chat.encode(&chat.render(messages, tools, effort)?)?;
     if prompt.is_empty() || prompt.len() + 17 >= sh.max_ctx {
         bail!("prompt has {} tokens; this server holds {} tokens of context per conversation", prompt.len(), sh.max_ctx);
     }
@@ -836,54 +976,85 @@ fn completion(mut stream: &TcpStream, body: &[u8], sh: &Shared, sse_started: &mu
     let temperature = if temperature < 0.01 { 0.0 } else { temperature }; // below that it is greedy decoding in all but name
     let streaming = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-    let seed = req.get("seed").and_then(Value::as_u64).map(|s| s as u32).unwrap_or(now.as_nanos() as u32);
+    let seed = match req.get("seed").filter(|v| !v.is_null()) {
+        None => now.as_nanos() as u32,
+        Some(v) if v.as_i64() == Some(-1) => now.as_nanos() as u32, // llama.cpp's spelling of "random"
+        Some(v) => v.as_u64().ok_or_else(|| anyhow!("seed must be a non-negative integer (or -1 for random)"))? as u32,
+    };
     let id = format!("chatcmpl-{:x}", now.as_nanos() as u64 ^ seed as u64);
     let created = now.as_secs();
     let prompt_tokens = prompt.len();
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
+    // Leaving this function for any reason (any `?` below) tells the scheduler to drop the job and free the slot.
     let _cancel_on_exit = CancelOnDrop(cancel.clone());
-    sh.jobs.send(Job { prompt, max_tokens, temperature: temperature as f32, seed, tx, t0, cancel }).map_err(|_| anyhow!("engine stopped"))?;
+    sh.jobs.send(Job { prompt, max_tokens, temperature: temperature as f32, seed, tx, t0, cancel: cancel.clone() }).map_err(|_| anyhow!("engine stopped"))?;
 
-    if streaming {
-        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
-        *sse_started = true;
-    }
     let chunk = |delta: Value, finish: Value, usage: Value| json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": sh.model_name,
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish}], "usage": usage});
+    // Bytes for a streaming client, sent once per batch of tokens. The response header goes out with the first
+    // event, so a request that fails before producing anything can still be answered with a proper status.
+    let mut out: Vec<u8> = Vec::new();
+    macro_rules! sse {
+        ($event:expr) => {
+            if streaming {
+                if !*sse_started {
+                    *sse_started = true;
+                    out.extend_from_slice(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n{}Connection: close\r\n\r\n", cors_header()).as_bytes());
+                    out.extend_from_slice(format!("data: {}\n\n", chunk(json!({"role": "assistant", "content": ""}), Value::Null, Value::Null)).as_bytes());
+                }
+                out.extend_from_slice(format!("data: {}\n\n", $event).as_bytes());
+            }
+        };
+    }
 
     let (mut mode, mut seg) = (Mode::None, Vec::<u32>::new());
     let (mut content, mut reasoning, mut tool_text) = (String::new(), String::new(), String::new());
     let mut tool_calls: Vec<Value> = Vec::new();
-    let (mut finish, mut n_out, mut cached) = ("length", 0usize, 0usize);
+    let (mut finish, mut n_out, mut cached, mut stopped) = ("length", 0usize, 0usize, false);
     let debug_tokens = std::env::var("INK_DEBUG_TOKENS").is_ok();
-    // Ends a tool-call message: the model's {"name", "args"} becomes an OpenAI tool call. Text that is not valid JSON
-    // is handed over as content rather than dropped.
-    macro_rules! finish_tool_call {
+    // Text of the answer: shown once it cannot be the start of a stop sequence.
+    macro_rules! say {
+        ($text:expr) => {{
+            let text: String = $text;
+            if !text.is_empty() {
+                sse!(chunk(json!({"content": text}), Value::Null, Value::Null));
+                content.push_str(&text);
+            }
+        }};
+    }
+    // Ends a message. A tool call's {"name", "args"} becomes an OpenAI tool call; text that is not valid JSON is
+    // handed over as content rather than dropped.
+    macro_rules! end_message {
         () => {
+            if mode == Mode::Content {
+                say!(stop.finish());
+            }
             if mode == Mode::Tool && !tool_text.trim().is_empty() {
                 if let Ok(v) = serde_json::from_str::<Value>(tool_text.trim()) {
                     let call = json!({"index": tool_calls.len(), "id": format!("call_{:x}{:04x}", now.as_nanos() as u64, CALL_SEQ.fetch_add(1, Ordering::Relaxed) & 0xffff), "type": "function",
                         "function": {"name": v.get("name").cloned().unwrap_or(Value::Null), "arguments": v.get("args").or_else(|| v.get("arguments")).map(|a| a.to_string()).unwrap_or_else(|| "{}".into())}});
-                    if streaming {
-                        write!(stream, "data: {}\n\n", chunk(json!({"tool_calls": [call.clone()]}), Value::Null, Value::Null))?;
-                    }
+                    sse!(chunk(json!({"tool_calls": [call.clone()]}), Value::Null, Value::Null));
                     tool_calls.push(call);
                 } else {
-                    content.push_str(&tool_text);
-                    if streaming {
-                        write!(stream, "data: {}\n\n", chunk(json!({"content": tool_text}), Value::Null, Value::Null))?;
-                    }
+                    say!(std::mem::take(&mut tool_text));
                 }
             }
             tool_text.clear();
         };
     }
-    // Leaving this function for any reason (any `?` below) tells the scheduler to drop the job and free the slot.
-    loop {
-        let ev = match rx.recv_timeout(Duration::from_millis(500)) {
+    let mut last_look = Instant::now();
+    'events: loop {
+        // A client that has closed its connection is not waiting for an answer. Checked on the clock, not only
+        // when the engine is quiet: a non-streaming reply writes nothing until it is complete.
+        if last_look.elapsed() >= Duration::from_millis(250) {
+            last_look = Instant::now();
+            if client_gone(stream) {
+                return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client disconnected").into());
+            }
+        }
+        let ev = match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(ev) => ev,
-            Err(mpsc::RecvTimeoutError::Timeout) if client_gone(stream) => return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client disconnected").into()),
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
@@ -891,13 +1062,16 @@ fn completion(mut stream: &TcpStream, body: &[u8], sh: &Shared, sse_started: &mu
             Event::Tokens(t) => t,
             Event::Failed(msg) => bail!(msg),
             Event::Done { finish: f, completion_tokens, cached: c, summary } => {
-                finish = f;
+                finish = if stopped { "stop" } else { f };
                 n_out = completion_tokens;
                 cached = c;
-                eprintln!("request: {summary}");
+                eprintln!("request: {}", if stopped { summary.replace("finish=cancelled", "finish=stop (stop sequence)") } else { summary });
                 break;
             }
         };
+        if stopped {
+            continue; // generated before the scheduler saw the cancellation
+        }
         if debug_tokens {
             eprintln!("tokens: {:?}", toks.iter().map(|&t| (t, chat.decode(&[t]).unwrap_or_default())).collect::<Vec<_>>());
         }
@@ -907,7 +1081,7 @@ fn completion(mut stream: &TcpStream, body: &[u8], sh: &Shared, sse_started: &mu
             }
             if tok >= FIRST_SPECIAL {
                 // Control token: switches between "thinking", "answer", "tool call" and "between messages".
-                finish_tool_call!();
+                end_message!();
                 mode = match tok {
                     T_THINK => Mode::Reasoning,
                     T_TOOL_JSON => Mode::Tool,
@@ -920,44 +1094,65 @@ fn completion(mut stream: &TcpStream, body: &[u8], sh: &Shared, sse_started: &mu
                 // case keep it pending until the character completes.
                 seg.push(tok);
                 let piece = chat.decode(&seg)?;
-                if !piece.ends_with('\u{FFFD}') {
-                    seg.clear();
-                    if mode == Mode::Tool {
-                        tool_text.push_str(&piece);
-                        continue;
+                if piece.ends_with('\u{FFFD}') {
+                    continue;
+                }
+                seg.clear();
+                match mode {
+                    Mode::Tool => tool_text.push_str(&piece),
+                    Mode::Reasoning => {
+                        if !piece.is_empty() {
+                            sse!(chunk(json!({"reasoning_content": piece}), Value::Null, Value::Null));
+                        }
+                        reasoning.push_str(&piece);
                     }
-                    let key = if mode == Mode::Reasoning { reasoning.push_str(&piece); "reasoning_content" } else { content.push_str(&piece); "content" };
-                    if streaming && !piece.is_empty() {
-                        write!(stream, "data: {}\n\n", chunk(json!({ key: piece }), Value::Null, Value::Null))?;
+                    _ => {
+                        let (text, hit) = stop.push(&piece);
+                        say!(text);
+                        if hit {
+                            // The reply ends here. Stop generating, then wait for the scheduler's account of it.
+                            stopped = true;
+                            cancel.store(true, Ordering::Relaxed);
+                            continue 'events;
+                        }
                     }
                 }
             }
         }
-        if streaming {
-            stream.flush()?;
+        if !out.is_empty() {
+            stream.write_all(&out)?;
+            out.clear();
         }
     }
+    if stopped {
+        finish = "stop";
+    }
     // The stream can end inside a message (token limit, or end of turn without <|end_message|>).
-    if !seg.is_empty() && mode != Mode::None {
+    if !seg.is_empty() && mode != Mode::None && !stopped {
         let piece = chat.decode(&seg)?.trim_end_matches('\u{FFFD}').to_string();
         match mode {
             Mode::Tool => tool_text.push_str(&piece),
-            Mode::Reasoning => reasoning.push_str(&piece),
-            _ => content.push_str(&piece),
-        }
-        if streaming && !piece.is_empty() && mode != Mode::Tool {
-            let key = if mode == Mode::Reasoning { "reasoning_content" } else { "content" };
-            write!(stream, "data: {}\n\n", chunk(json!({ key: piece }), Value::Null, Value::Null))?;
+            Mode::Reasoning => {
+                if !piece.is_empty() {
+                    sse!(chunk(json!({"reasoning_content": piece}), Value::Null, Value::Null));
+                }
+                reasoning.push_str(&piece);
+            }
+            _ => say!(stop.push(&piece).0),
         }
     }
-    finish_tool_call!();
+    if !stopped {
+        end_message!();
+    }
     let usage = json!({"prompt_tokens": prompt_tokens, "completion_tokens": n_out, "total_tokens": prompt_tokens + n_out,
         "prompt_tokens_details": {"cached_tokens": cached}});
     if !tool_calls.is_empty() && finish == "stop" {
         finish = "tool_calls";
     }
     if streaming {
-        write!(stream, "data: {}\n\ndata: [DONE]\n\n", chunk(json!({}), json!(finish), usage))?;
+        sse!(chunk(json!({}), json!(finish), usage));
+        out.extend_from_slice(b"data: [DONE]\n\n");
+        stream.write_all(&out)?;
         stream.flush()?;
     } else {
         let mut msg = json!({"role": "assistant", "content": content});
@@ -975,6 +1170,7 @@ fn completion(mut stream: &TcpStream, body: &[u8], sh: &Shared, sse_started: &mu
 
 pub fn serve(addr: &str, model_name: &str, chat: Chat, eng: &mut Engine, max_ctx: usize, cfg: Options) -> Result<()> {
     let listener = TcpListener::bind(addr)?;
+    let _ = CORS.set(cfg.cors.clone());
     eprintln!(
         "listening on http://{addr}/v1  (model id: {model_name}; {} slot(s), a conversation can reach {max_ctx} tokens; speculation: up to {} drafts/step, {})",
         eng.slots(), cfg.k_max, cfg.tau.map_or("chosen by expected gain".to_string(), |t| format!("confidence >= {t}"))

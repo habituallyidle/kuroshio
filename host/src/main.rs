@@ -38,6 +38,8 @@ SERVE OPTIONS
                          least that probability
   --prefill-share N      prompt tokens processed per step while another     [48]
                          conversation is generating, 1-128
+  --cors ORIGIN          let web pages from this origin call the server     [none]
+                         (http://localhost:3000, or * for any)
   --sampled-drafts       when sampling (temperature >= 0.3), draw drafts from the drafter's
                          distribution instead of taking its top token (experimental: exact,
                          but measured no faster)
@@ -235,7 +237,7 @@ fn main() -> Result<()> {
         // OpenAI-compatible server. Older positional form still works: kuroshio serve [addr] [ctx] [slots]
         Some("serve") => {
             let f = Flags::parse(&args[2..])?;
-            f.check_known(&["host", "port", "slots", "ctx", "reserve", "idle-release", "kv", "dense", "spec", "tau", "prefill-share", "no-draft", "no-prefix-cache", "no-tool-fix", "sampled-drafts", "model", "name"])?;
+            f.check_known(&["host", "port", "slots", "ctx", "reserve", "idle-release", "kv", "dense", "spec", "tau", "prefill-share", "cors", "no-draft", "no-prefix-cache", "no-tool-fix", "sampled-drafts", "model", "name"])?;
             f.apply_engine_options()?;
             let addr = match f.pos.first() {
                 Some(a) => a.clone(),
@@ -269,7 +271,9 @@ fn main() -> Result<()> {
                 prefix_cache: !f.has("no-prefix-cache") && std::env::var("INK_NO_PREFIX_CACHE").is_err(),
                 tool_fix: !f.has("no-tool-fix") && std::env::var("INK_NO_TOOL_FORCE").is_err(),
                 idle_release: f.get("idle-release", "", 0u64)?,
+                cors: Some(f.get("cors", "", String::new())?).filter(|o| !o.is_empty()),
             };
+            anyhow::ensure!(opts.cors.as_ref().map_or(true, |o| !o.contains(['\r', '\n'])), "--cors takes an origin such as http://localhost:3000, or *");
             anyhow::ensure!(opts.k_max <= 7, "--spec must be between 0 and 7");
             anyhow::ensure!((1..=128).contains(&opts.prefill_share), "--prefill-share must be between 1 and 128");
             let dir = weights_dir()?;

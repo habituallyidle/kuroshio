@@ -31,8 +31,9 @@ Same RTX 5090, same harness, temperature 0.6, 512-token completions, median of 3
 
 - Context: about 240K tokens for one conversation, lossless. With `--kv 8 --dense 8` (the 8-bit cache vLLM was run
   with, plus 8-bit attention matrices): about 450K tokens, about 250 tok/s, 2,800 tok/s prompt processing.
-- Follow-up turns of a conversation skip the part of the prompt the server has already seen: 11-56 ms to first token
-  in an agent loop, instead of re-reading everything.
+- Follow-up turns of a conversation skip the part of the prompt the server has already seen: typically 30-50 ms to
+  first token in an agent loop, instead of re-reading everything.
+- Prompt processing slows as the context grows: about 2,300 / 2,100 / 1,500 / 800 tok/s at 4K / 16K / 48K / 100K.
 - It starts at about 20 GiB of GPU memory and takes more only as conversations grow, so other programs can use the
   card; when the card is full a conversation stops growing instead of the server crashing.
 - Single-stream runs vary by about ±5% with the text being generated (233-253 over four runs).
@@ -95,6 +96,7 @@ r = client.chat.completions.create(model="inkling-2-mini", messages=[{"role": "u
 | `--spec` | 0-7 | `7` | Speculative decoding: verify up to this many drafted tokens per step. `0` turns it off. Output is unchanged either way. |
 | `--tau` | `auto`, or 0-1 | `auto` | Which drafts to verify. `auto` weighs each draft's chance of being accepted against the time a row costs, and adapts to load. A number verifies those the drafter gives at least that probability. |
 | `--prefill-share` | 1-128 | `48` | Prompt tokens processed per step while another conversation is generating. Higher favours new requests, lower favours running streams. |
+| `--cors` | origin, or `*` | none | Let web pages from this origin call the server. Off by default: no page can. |
 | `--sampled-drafts` | | | Experimental: when sampling, draw drafts from the drafter's distribution instead of its top token. Exact, but measured no faster. |
 | `--no-draft` | | | Do not load the drafter: saves 1.1 GiB, no speculation. |
 | `--no-prefix-cache` | | | Always re-read the whole prompt: saves 0.2 GiB per slot. |
@@ -128,10 +130,14 @@ left, in any proportion: with 4 slots, one agent can hold 150K tokens while thre
 `POST /v1/chat/completions` (streaming or not), `GET /v1/models`, `GET /health`.
 
 - Supported request fields: `messages`, `tools`, `tool_choice: "none"`, `max_tokens` / `max_completion_tokens`,
-  `temperature` (0-2), `seed`, `stream`, `reasoning_effort` (also as `chat_template_kwargs.reasoning_effort`).
+  `temperature` (0-2), `seed`, `stop`, `stream`, `reasoning_effort` (also as `chat_template_kwargs.reasoning_effort`).
 - The model's thinking is returned as `reasoning_content`; `usage.prompt_tokens_details.cached_tokens` reports what
   the prefix cache saved.
-- Not supported: `stop`, `top_p`, `n` > 1, `logprobs`, `response_format`, images.
+- `top_p` is accepted and ignored. `logprobs`, `response_format` other than text and `n` > 1 are refused with a 400.
+  Images are not supported.
+- Closing the connection, or its sending half, cancels the request and frees its slot.
+- Text in messages and tool results is only ever text: a control token such as `<|end_message|>` spelt out in it
+  cannot end a message or start one.
 - **Tool calls.** The model often garbles the fixed opening of a tool call (`{"name":"…","args":`); vLLM shows the
   same broken calls. The chat template allows only one spelling of that opening, so the server writes it and lets
   the model continue with the arguments.
@@ -171,6 +177,7 @@ source scripts/env.sh
 scripts/verify.sh        # correctness: reference tokens, batch-size invariance, speculation, concurrency
 scripts/verify.sh full   # adds sampling statistics and a GPU memory checker
 scripts/fullcard.sh      # another program takes the whole GPU mid-run: nothing may crash
+python3 gauntlet/run.py --suite quick   # the server from outside: API, robustness, speed, memory, an agent (10 min)
 ```
 
 Correctness is defined against vLLM's output and a slow PyTorch reference (`ref/`). The model is numerically
