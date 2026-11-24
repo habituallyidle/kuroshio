@@ -622,8 +622,12 @@ __global__ void k_attn_prep(const float* proj, const float* qscale, const float*
         if (d < DH) { float v = x * fminf(QK_CLIP / (sqrtf(n2[0]) + EPS), 1.0f); if (is_global) v = bf16r(v) * tau; qc[((size_t)t * H + h) * DH + d] = bf16r(v); }
         if (d < DR) { float u = y * fminf(REL_CLIP / (sqrtf(n2[1]) + EPS), 1.0f); if (is_global) u = bf16r(u) * tau; rc[d] = bf16r(u); }
         __syncthreads();
-        float acc = 0; for (int i = 0; i < DR; i++) acc = fmaf(rc[i], rel[i * EXT + d], acc);      // thread d = distance d
-        bias[((size_t)t * H + h) * EXT + d] = bf16r(acc);
+        // Bias per distance: a thread takes EXT / blockDim distances (a block of 1,024 threads for 16 multiply-adds each
+        // cost more to start than to run).
+        for (int dd = d; dd < EXT; dd += blockDim.x) {
+            float acc = 0; for (int i = 0; i < DR; i++) acc = fmaf(rc[i], rel[i * EXT + dd], acc);
+            bias[((size_t)t * H + h) * EXT + dd] = bf16r(acc);
+        }
         return;
     }
     int j = blockIdx.y - H, c = j * DH + d; float out[2] = {0, 0};
@@ -1933,6 +1937,9 @@ void gemm_fp8(const Fp8Mat& f, int C, int T, const uint8_t* xcode, const uint8_t
 const int XPK_C = 4608;
 static uint2* g_xpk[3];
 static int g_attn_group = getenv("INK_ATTN_GROUP") ? atoi(getenv("INK_ATTN_GROUP")) : 17;   // rows from which attention runs in groups of 8 (at most GSUB)
+// Threads per block of k_attn_prep for n rows, as measured (us per launch with 1024 / 512 / 256 / 128 threads: 1 row
+// 2.6 / 2.9 / 3.1 / 5.9; 8 rows 6.1 / 4.6 / 5.3 / 6.1; 32 rows 15.9 / 7.5 / 5.7 / 6.7; 128 rows 44.5 / 19.8 / 14.6 / 12.9).
+static inline int prep_threads(int n) { return n <= 4 ? 1024 : n <= 16 ? 512 : n <= 48 ? 256 : 128; }
 static int g_xwide = getenv("INK_XWIDE") ? atoi(getenv("INK_XWIDE")) : 48;          // rows from which experts run as wide tasks
 static int g_pack_min = getenv("INK_PACK_MIN") ? atoi(getenv("INK_PACK_MIN")) : 9;
 static int g_bulk_min = getenv("INK_BULK_MIN") ? atoi(getenv("INK_BULK_MIN")) : 9;    // from here on: k_gemm_bf16_bulk (a large value: the older packed kernel)
@@ -2742,7 +2749,7 @@ static void forward_body(Engine* e, int T, int gchunks, int hm, int cls) {
             const bool big = T > CR - 3;                    // only then can a run be too long to store its conv history in-kernel
             for (int h0 = 0; h0 < T; h0 += HMAX) {
                 int hn = std::min(HMAX, T - h0);
-                k_attn_prep<<<dim3(hn, H + HKV), 1024, 0, g_stream>>>(e->proj, L.qscale, L.rscale, L.rel, L.global, e->rows, e->qc, e->bias, e->ring[visit][0],
+                k_attn_prep<<<dim3(hn, H + HKV), prep_threads(hn), 0, g_stream>>>(e->proj, L.qscale, L.rscale, L.rel, L.global, e->rows, e->qc, e->bias, e->ring[visit][0],
                                                                    e->ring[visit][1], L.kconv, L.vconv, e->dk, e->dv, e->Kc[visit], e->Vc[visit], e->kv8, kvs, h0);
                 prof("attn q/r/kv prep");
                 int ng = L.global ? gchunks * 2 : RING / 16, ns = ng * 16;      // scores, softmax, value sum on the tensor cores
@@ -3133,7 +3140,7 @@ void ink_microbench(void* ep, int T) {
     }
     if (e->fp8_head) mbench("  fp8: output head gemm", 461.0, [&](int) { gemm_fp8(e->f_head, D, T, e->tq, e->ts, e->logits, 0, V0); });
     mbench("attn prep (q/r/bias + kv conv)", 0, [&](int r) { int i = r % 5; Layer& L = e->L[i];
-        k_attn_prep<<<dim3(T, H + HKV), 1024, 0, g_stream>>>(e->proj, L.qscale, L.rscale, L.rel, 0, e->rows, e->qc, e->bias, e->ring[i][0], e->ring[i][1], L.kconv, L.vconv, e->dk, e->dv, e->Kc[i], e->Vc[i], e->kv8, e->kv_local, 0); });
+        k_attn_prep<<<dim3(T, H + HKV), prep_threads(T), 0, g_stream>>>(e->proj, L.qscale, L.rscale, L.rel, 0, e->rows, e->qc, e->bias, e->ring[i][0], e->ring[i][1], L.kconv, L.vconv, e->dk, e->dv, e->Kc[i], e->Vc[i], e->kv8, e->kv_local, 0); });
     {   // the rows as one run: groups of 8
         Grp grp[TMAX]; int gb[TMAX / 16 + 2], rowg[TMAX], cso[TMAX + 1], n = 0;
         for (int t = 0; t < T; t++) { if (t % 16 == 0) gb[t / 16] = n; if (t % 8 == 0) grp[n++] = Grp{t, 0}; grp[n - 1].n++; rowg[t] = n - 1; }
