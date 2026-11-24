@@ -1271,6 +1271,52 @@ __global__ void k_attn_fused_fin(const float* part, int nch, int fch, const floa
         }
     }
 }
+// The gate for prompt-only steps (the fast prompt path): h . gain and h . forget are two small matrix products, so the
+// tensor cores do them: 16 tokens x 8 channels per multiplication instead of one thread per (token, channel) adding
+// 64 products. h and the tables hold bf16 values, so every product is the same as above; the sums are taken in the
+// tensor cores' order (not the warp order above), and tanh is 1 - 2 / (1 + 2^(2x log2 e)) with the approximate
+// 2^x instruction. Every output depends on its own token and channel only.
+// Grid: (D / (8 GCT), 3 streams), 256 threads: the block stages its GCT x 8 channels of both tables as B operands,
+// its 8 warps take every 8th tile of 16 tokens.
+const int GCT = 4;
+__device__ __forceinline__ float tanh_fast(float x) { return 1.0f - 2.0f / (1.0f + ex2f(x * 2.8853900817779268f)); }
+__global__ void k_gate3_fast(const float* h, const float* gain, const float* forget, const float* dest, int dstride, int doff, const float* msg, float* x, int T) {
+    __shared__ uint2 sg[GCT][4][32]; __shared__ uint2 sf[GCT][4][32];
+    const int s = blockIdx.y, c0 = blockIdx.x * (8 * GCT), tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, qq = lane & 3, g = lane >> 2;
+    for (int e = tid; e < GCT * 4 * 32; e += 256) {       // B operands [k][channel g of the tile]: k = 2q, 2q+1 and 8+2q, 9+2q of each 16
+        const int ct = e >> 7, ks = (e >> 5) & 3, ln = e & 31, c = c0 + ct * 8 + (ln >> 2), k = ks * 16 + 2 * (ln & 3);
+        const float* gp = gain + ((size_t)s * D + c) * 64 + k; const float* fp = forget + ((size_t)s * D + c) * 64 + k;
+        sg[ct][ks][ln] = make_uint2(pack_bf16(gp[0], gp[1]), pack_bf16(gp[8], gp[9]));
+        sf[ct][ks][ln] = make_uint2(pack_bf16(fp[0], fp[1]), pack_bf16(fp[8], fp[9]));
+    }
+    __syncthreads();
+    for (int tt = warp; tt * 16 < T; tt += 8) {
+        const int r0 = tt * 16 + g, r1 = r0 + 8;          // this lane's two tokens
+        uint32_t a[4][4];                                 // A operands: h of tokens g, g+8, k = 2q, 2q+1 and 8+2q, 9+2q of each 16
+        #pragma unroll
+        for (int ks = 0; ks < 4; ks++) {
+            const float* h0 = h + (size_t)min(r0, T - 1) * 192 + s * 64 + ks * 16 + 2 * qq; const float* h1 = h + (size_t)min(r1, T - 1) * 192 + s * 64 + ks * 16 + 2 * qq;
+            a[ks][0] = pack_bf16(h0[0], h0[1]); a[ks][1] = pack_bf16(h1[0], h1[1]); a[ks][2] = pack_bf16(h0[8], h0[9]); a[ks][3] = pack_bf16(h1[8], h1[9]);
+        }
+        #pragma unroll
+        for (int ct = 0; ct < GCT; ct++) {
+            float ga[4] = {0, 0, 0, 0}, fa[4] = {0, 0, 0, 0};
+            #pragma unroll
+            for (int ks = 0; ks < 4; ks++) {
+                const uint2 bg = sg[ct][ks][lane], bf = sf[ct][ks][lane];
+                mma_bf16(ga, a[ks][0], a[ks][1], a[ks][2], a[ks][3], bg.x, bg.y); mma_bf16(fa, a[ks][0], a[ks][1], a[ks][2], a[ks][3], bf.x, bf.y);
+            }
+            const int c = c0 + ct * 8 + 2 * qq;           // results: [token g][c, c+1], [token g+8][c, c+1]
+            #pragma unroll
+            for (int b = 0; b < 2; b++) {
+                const int t = b ? r1 : r0; if (t >= T) continue;
+                const float2 dv = *(const float2*)(dest + (size_t)t * dstride + s * doff + c), mv = *(const float2*)(msg + ((size_t)t * 4 + s) * D + c);
+                float2 o; o.x = (1.0f - tanh_fast(fa[2 * b])) * dv.x + tanh_fast(ga[2 * b]) * mv.x; o.y = (1.0f - tanh_fast(fa[2 * b + 1])) * dv.y + tanh_fast(ga[2 * b + 1]) * mv.y;
+                *(float2*)(x + ((size_t)t * 3 + s) * D + c) = o;
+            }
+        }
+    }
+}
 // t0: first token handled by this launch; scratch rows are relative to it (the scratch holds one sub-batch).
 __global__ void k_attn_scores(const float* qc, const float* bias, const uint8_t* Kt, const Row* rows, int is_global, int ngroups, float* scratch, int smax, int t0, int kv8, size_t kvstride) {
     __shared__ float q[3][DH];
@@ -2178,6 +2224,7 @@ static bool fast_allowed() { static const bool v = getenv("INK_EXACT_PROMPTS") =
 static bool g_fast = false;
 const int FA = 0, FW = 2;
 static const bool g_fused = getenv("INK_NO_FUSED") == nullptr;   // experiment switch: the fused attention kernels of the fast path
+static const bool g_fgate = getenv("INK_NO_FGATE") == nullptr;   // experiment switch: the tensor-core gate of the fast path
 // Key tiles per chunk of the fused attention: 12 of the sliding window's 72, and 64 (1,024 keys) in full attention.
 // Fixed numbers, and chunks start at fixed keys, on purpose: together with the kernel's row-by-row arithmetic this
 // makes what the fast path computes for a row independent of the step the row is in.
@@ -2978,7 +3025,8 @@ static void forward_body(Engine* e, int T, int gchunks, int hm, int cls, bool on
                 int ds = Q * D, doff = Q == 3 ? D : 0;
                 k_pair3<<<dim3(T, 3), NT, 0, g_stream>>>(e->inputs, ds, doff, e->msg, e->pair);
                 gemv(192, T, L.ctl3_down, 2 * D, T, e->pair, e->pair + 2 * D, e->pair + 4 * D, 6 * D, 64, 128, e->hbuf, 192, 1);
-                if (T >= GATE_BIG) k_gate3_big<<<dim3(D / 8, 3), 256, 0, g_stream>>>(e->hbuf, L.ctl3_gain, L.ctl3_forget, e->inputs, ds, doff, e->msg, e->gx, T);
+                if (g_fast && g_fgate) k_gate3_fast<<<dim3(D / (8 * GCT), 3), 256, 0, g_stream>>>(e->hbuf, L.ctl3_gain, L.ctl3_forget, e->inputs, ds, doff, e->msg, e->gx, T);
+                else if (T >= GATE_BIG) k_gate3_big<<<dim3(D / 8, 3), 256, 0, g_stream>>>(e->hbuf, L.ctl3_gain, L.ctl3_forget, e->inputs, ds, doff, e->msg, e->gx, T);
                 else k_gate3<<<dim3(D / 8, T * 3), 256, 0, g_stream>>>(e->hbuf, L.ctl3_gain, L.ctl3_forget, e->inputs, ds, doff, e->msg, e->gx);
                 k_rms3<<<dim3(T, 3), NT, 0, g_stream>>>(e->gx, L.in_norm, L.global ? D : 0, e->xin);
                 xq_ = e->xin; xk_ = e->xin + D; xv_ = e->xin + 2 * D; xs = 3 * D;
@@ -3484,6 +3532,20 @@ void ink_microbench(void* ep, int T) {
     mbench("loop: pair x3", 0, [&](int) { k_pair3<<<dim3(T, 3), NT, 0, g_stream>>>(e->xin, 3 * D, D, e->msg, e->pair); });
     mbench("loop: controller gemm (192x4608)", 1.77, [&](int r) { Layer& L = e->L[6 + r % 12]; gemv(192, T, L.ctl3_down, 2 * D, T, e->pair, e->pair + 2 * D, e->pair + 4 * D, 6 * D, 64, 128, e->hbuf, 192, 1); });
     mbench("loop: gate x3", 3.5, [&](int r) { Layer& L = e->L[6 + r % 12]; if (T >= GATE_BIG) k_gate3_big<<<dim3(D / 8, 3), 256, 0, g_stream>>>(e->hbuf, L.ctl3_gain, L.ctl3_forget, e->xin, 3 * D, D, e->msg, e->gx, T); else k_gate3<<<dim3(D / 8, T * 3), 256, 0, g_stream>>>(e->hbuf, L.ctl3_gain, L.ctl3_forget, e->xin, 3 * D, D, e->msg, e->gx); });
+    mbench("loop: gate x3, fast path", 0, [&](int r) { Layer& L = e->L[6 + r % 12]; k_gate3_fast<<<dim3(D / (8 * GCT), 3), 256, 0, g_stream>>>(e->hbuf, L.ctl3_gain, L.ctl3_forget, e->xin, 3 * D, D, e->msg, e->gx, T); });
+    {   // the fast path's gate against the exact kernels on the same inputs
+        Layer& L = e->L[6]; std::vector<float> ya((size_t)T * 3 * D), yb(ya.size());
+        if (T >= GATE_BIG) k_gate3_big<<<dim3(D / 8, 3), 256, 0, g_stream>>>(e->hbuf, L.ctl3_gain, L.ctl3_forget, e->xin, 3 * D, D, e->msg, e->gx, T);
+        else k_gate3<<<dim3(D / 8, T * 3), 256, 0, g_stream>>>(e->hbuf, L.ctl3_gain, L.ctl3_forget, e->xin, 3 * D, D, e->msg, e->gx);
+        CK(cudaStreamSynchronize(g_stream)); CK(cudaMemcpy(ya.data(), e->gx, ya.size() * 4, cudaMemcpyDeviceToHost));
+        k_gate3_fast<<<dim3(D / (8 * GCT), 3), 256, 0, g_stream>>>(e->hbuf, L.ctl3_gain, L.ctl3_forget, e->xin, 3 * D, D, e->msg, e->gx, T);
+        CK(cudaStreamSynchronize(g_stream)); CK(cudaMemcpy(yb.data(), e->gx, yb.size() * 4, cudaMemcpyDeviceToHost));
+        auto differ = [&](const char* what) {
+            double mx = 0, big = 0, sq = 0, sn = 0; for (size_t k = 0; k < ya.size(); k++) { mx = std::max(mx, (double)fabsf(ya[k] - yb[k])); big = std::max(big, (double)fabsf(ya[k])); sq += (double)(ya[k] - yb[k]) * (ya[k] - yb[k]); sn += (double)ya[k] * ya[k]; }
+            printf("  %s: fast against exact: largest difference %.3g (largest value %.3g), relative error %.3g\n", what, mx, big, sqrt(sq / std::max(sn, 1e-30)));
+        };
+        differ("gate");
+    }
     mbench("loop: norm x3", 0, [&](int r) { Layer& L = e->L[6 + r % 12]; k_rms3<<<dim3(T, 3), NT, 0, g_stream>>>(e->gx, L.in_norm, 0, e->xin); });
     if (e->unembed) mbench("unembed gemm (200058x2304 bf16)", 921.9, [&](int) { gemv(V0, T, e->unembed, D, T, e->out, e->out, e->out, D, V0, V0, e->logits, V0, 0); });
     mbench("softcap + argmax", 0, [&](int) { k_head_part<<<dim3(HEAD_PARTS, T), 1024, 0, g_stream>>>(e->logits, e->head_v, e->head_i); k_head_final<<<T, 32, 0, g_stream>>>(e->head_v, e->head_i, e->arg, e->rowmax); });

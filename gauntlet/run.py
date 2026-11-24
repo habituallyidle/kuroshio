@@ -36,11 +36,15 @@ CONFIGS = [
     ("default", ()),
     ("ctx4k", ("--ctx", "4096")),
     ("spec0", ("--spec", "0")),
-    ("nocache", ("--no-prefix-cache",)),
+    # The default reads prompts with faster kernels whose results differ from generation's in the last bits; the
+    # bit-for-bit guarantees (cache on/off, alone or alongside other streams) belong to --exact-prompts.
+    ("exact", ("--exact-prompts",)),
+    ("nocache", ("--no-prefix-cache", "--exact-prompts")),
     ("8bit", ("--kv", "8", "--dense", "8")),
     ("reserve", ("--slots", "2", "--reserve", "6g")),
     ("idle", ("--idle-release", "5")),
     ("slots4", ("--slots", "4")),
+    ("exact-slots4", ("--slots", "4", "--exact-prompts")),
     (None, None),  # parts that need no server (comparisons across configurations, external scripts)
 ]
 

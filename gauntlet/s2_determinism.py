@@ -333,6 +333,24 @@ def spec0(st, ctx):
     _run_store(st, ctx, "spec0", [("long-prompt", lp)])
 
 
+def exact(st, ctx):
+    """The same requests on a server started with --exact-prompts: the reference for the bit-for-bit comparisons."""
+    _run_store(st, ctx, "exact", _greedy_set(ctx) + _seeded_set(ctx))
+    lp = _long_prompt()
+    c1, c2 = chat(lp), chat(lp)
+    if st.check("[exact] long prompt answered", c1.ok and c2.ok, c1.brief()[:150], repro(lp, "200", c1.brief())):
+        ctx.shared["det"]["exact"]["long-prompt"] = {"text": c1.text(), "tokens": c1.completion_tokens, "payload": lp, "cached": c1.cached_tokens}
+        st.check("[exact] temperature 0: answer from the cached prompt is identical to the uncached one", c1.text() == c2.text(),
+                 "identical" if c1.text() == c2.text() else first_diff(c1.text(), c2.text())[1],
+                 repro(lp, "identical text whether the prompt was cached or not (send it twice)", first_diff(c1.text(), c2.text())[1]))
+    _run_multi_turn(st, ctx, "exact", True)
+    # The default (fast prompt reading) against it: not required to be identical, reported for the record.
+    d, e = ctx.shared.get("det", {}).get("default", {}), ctx.shared.get("det", {}).get("exact", {})
+    both = [pid for pid in d if pid in e and "text" in d[pid] and "text" in e[pid]]
+    if both:
+        st.num("outputs identical with default and --exact-prompts", f"{sum(d[p]['text'] == e[p]['text'] for p in both)}/{len(both)}", "requests")
+
+
 def nocache(st, ctx):
     _run_store(st, ctx, "nocache", _greedy_set(ctx))
     lp = _long_prompt()
@@ -401,14 +419,14 @@ def compare(st, ctx):
     seeded = [pid for pid, _ in _seeded_set(ctx)]
     for pid in greedy + ["long-prompt"]:
         _cmp(st, ctx, f"temperature 0: {pid} identical with --spec 0 and with default speculation", "default", "spec0", pid, "with and without speculation")
-        _cmp(st, ctx, f"temperature 0: {pid} identical with --no-prefix-cache", "default", "nocache", pid, "with and without the prefix cache")
+        _cmp(st, ctx, f"temperature 0: {pid} identical with --no-prefix-cache (--exact-prompts)", "exact", "nocache", pid, "with and without the prefix cache")
     for pid in greedy:
-        _cmp(st, ctx, f"temperature 0: {pid} identical on a 4-slot server (alone) and on a 1-slot server", "default", "slots4-alone", pid, "with --slots 4 and --slots 1")
-        _cmp(st, ctx, f"temperature 0: {pid} identical alone and alongside 3 active streams (4 slots)", "slots4-alone", "slots4-busy", pid, "alone and under concurrency")
+        _cmp(st, ctx, f"temperature 0: {pid} identical on a 4-slot server (alone) and on a 1-slot server (--exact-prompts)", "exact", "slots4-alone", pid, "with --slots 4 and --slots 1")
+        _cmp(st, ctx, f"temperature 0: {pid} identical alone and alongside 3 active streams (4 slots, --exact-prompts)", "slots4-alone", "slots4-busy", pid, "alone and under concurrency")
     for pid in seeded:
         _cmp(st, ctx, f"seeded sampling: {pid} identical with --spec 0 and with default speculation", "default", "spec0", pid, "for the same seed with and without speculation")
-        _cmp(st, ctx, f"seeded sampling: {pid} identical alone and alongside 3 active streams (4 slots)", "slots4-alone", "slots4-busy", pid, "for the same seed alone and under concurrency")
-    a, b = det.get("default", {}).get("multi-turn"), det.get("nocache", {}).get("multi-turn")
+        _cmp(st, ctx, f"seeded sampling: {pid} identical alone and alongside 3 active streams (4 slots, --exact-prompts)", "slots4-alone", "slots4-busy", pid, "for the same seed alone and under concurrency")
+    a, b = det.get("exact", {}).get("multi-turn"), det.get("nocache", {}).get("multi-turn")
     if a and b:
         n = min(len(a["answers"]), len(b["answers"]))
         diffs = [i + 1 for i in range(n) if a["answers"][i] != b["answers"][i]]
@@ -416,7 +434,7 @@ def compare(st, ctx):
                  f"{n} turns identical; cached tokens per turn {a['cached']} for prompts of {a['prompts']} tokens" if not diffs else
                  f"turns {diffs} differ; turn {diffs[0]}: " + first_diff(a["answers"][diffs[0] - 1], b["answers"][diffs[0] - 1])[1],
                  repro({"conversation": MULTI_TURN}, "identical answers", f"turns {diffs} differ",
-                       note="replay the user turns, feeding each assistant answer back, once on a default server and once with --no-prefix-cache"))
+                       note="replay the user turns, feeding each assistant answer back, on servers started with --exact-prompts, once with and once without --no-prefix-cache"))
         if a["prompts"]:
             st.num("multi-turn cached tokens per turn", "/".join(map(str, a["cached"])), "tokens")
     else:
@@ -425,5 +443,5 @@ def compare(st, ctx):
 
 def parts(suite):
     return [("base", "default", base), ("unicode", "default", unicode_part), ("tools", "default", tools_part),
-            ("spec0", "spec0", spec0), ("nocache", "nocache", nocache), ("concurrent", "slots4", concurrent),
+            ("spec0", "spec0", spec0), ("exact", "exact", exact), ("nocache", "nocache", nocache), ("concurrent", "exact-slots4", concurrent),
             ("compare", None, compare)]

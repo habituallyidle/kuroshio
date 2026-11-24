@@ -37,9 +37,9 @@ for rows in 1024 512 200 129 37 5; do INK_PRE=2400,$rows $BIN argmaxes 2900 > "$
 INK_EXACT_PROMPTS=1 INK_PRE=2400,1024 $BIN argmaxes 2900 > "$TMP/fe.txt" 2>/dev/null
 same=$(paste -d' ' <(tr ' ' '\n' < "$TMP/fe.txt" | tail -n 500) <(tr ' ' '\n' < "$TMP/f1024.txt" | tail -n 500) | awk '$1 == $2' | wc -l)
 [ "$same" -ge 450 ] || { echo "FAIL: after a fast-read prompt only $same of 500 greedy tokens agree with the exact path (about 485 expected)"; exit 1; }
-# the fused attention kernels against the exact ones on the same inputs: the difference must stay at rounding level
-INK_MB_T=128 $BIN microbench 2>/dev/null | grep "fused against exact" > "$TMP/fused.txt"; cat "$TMP/fused.txt"
-[ "$(wc -l < "$TMP/fused.txt")" -eq 2 ] && awk '{ if ($NF + 0 > 0.002 || $NF + 0 <= 0) bad = 1 } END { exit bad }' "$TMP/fused.txt" || { echo "FAIL: the fused attention is further from the exact kernels than rounding explains"; exit 1; }
+# the fast path's attention and gate kernels against the exact ones on the same inputs: the difference must stay at rounding level
+INK_MB_T=128 $BIN microbench 2>/dev/null | grep -E "(fused|fast) against exact" > "$TMP/fused.txt"; cat "$TMP/fused.txt"
+[ "$(wc -l < "$TMP/fused.txt")" -eq 3 ] && awk '{ lim = /gate/ ? 0.00001 : 0.002; if ($NF + 0 > lim || $NF + 0 <= 0) bad = 1 } END { exit bad }' "$TMP/fused.txt" || { echo "FAIL: a fast prompt kernel is further from the exact kernels than rounding explains"; exit 1; }
 NE=$(INK_EXACT_PROMPTS=1 INK_PRE=3072,1024 $BIN nll 4000 2>/dev/null | tail -1 | sed -E 's/.*NLL ([0-9.]+).*/\1/'); NF_=$(INK_PRE=3072,1024 $BIN nll 4000 2>/dev/null | tail -1 | sed -E 's/.*NLL ([0-9.]+).*/\1/')
 echo "NLL of the text after a 3,072-token prompt: $NE read exactly, $NF_ read fast ($same of 500 greedy tokens agree)"
 awk -v a="$NE" -v b="$NF_" 'BEGIN { d = a - b; if (d < 0) d = -d; exit !(a > 0 && b > 0 && d < 0.03) }' || { echo "FAIL: quality after a fast-read prompt differs from the exact path by more than noise"; exit 1; }; echo "ok"
