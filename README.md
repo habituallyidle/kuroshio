@@ -6,42 +6,68 @@
 
 <p align="center"><em>The "black current": the fast, warm stream off Japan's Pacific coast. Dark as ink, and full of squid.</em></p>
 
-**Run [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on your RTX 5090, faster than vLLM.**
-Kuroshio is an inference engine built for exactly one model and one GPU: hand-written CUDA kernels for Blackwell's
-tensor cores behind an OpenAI-compatible server. One binary, nothing to configure.
+**Run [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on your RTX 5090, at the highest
+single-stream speed measured for it.** Kuroshio is an inference engine built for exactly one model and one GPU:
+hand-written CUDA kernels for Blackwell's tensor cores behind an OpenAI-compatible server. One binary, nothing to
+configure.
 
-- **26% faster** on one stream, **5.6x faster** at reading prompts
+- **27% faster than vLLM** on one stream and twice as fast as Strata; ahead of both up to 4 streams
 - **240K tokens** of context, lossless, and follow-up turns answer in milliseconds
-- **Tool calls that parse**: 24 of 24 where the reference stack manages 9
+- **Tool calls that parse**: 24 of 24, where vLLM manages 15 and Strata 2
 - **Shares the card**: takes memory as conversations grow, and survives another program filling the GPU
+- **Not the fastest at everything**: vLLM and Strata read long prompts faster, and vLLM is ahead beyond 4 streams
+  (see below)
 
 ## Headline
 
-Same RTX 5090, same harness, temperature 0.6, 512-token completions, median of 3 runs. vLLM is the official
-`vllm/vllm-openai:inkling-2-mini` image with its DSpark drafter and an 8-bit KV cache; Kuroshio runs at its defaults
-(lossless 16-bit cache).
+Same RTX 5090, same hour, same harness (`bench.py`, temperature 0.6, 512-token completions); every cell is the
+median of 10 runs. vLLM is the official `vllm/vllm-openai:inkling-2-mini` image with an 8-bit KV cache, with and
+without its DSpark drafter; Strata is 0.2.19 with its `inkling-2-mini-sq-20` pack and DSpark drafting; Kuroshio runs
+at its defaults (lossless 16-bit cache).
 
-| | Kuroshio | vLLM | |
+| Decode, tok/s in total | Kuroshio | vLLM + DSpark | vLLM, no drafter | Strata |
+|---|---:|---:|---:|---:|
+| 1 stream | **248** | 196 | 170 | 119 |
+| 2 streams | **389** | 336 | 239 | 181 |
+| 4 streams | **502** | 458 | 397 | 273 |
+| 8 streams † | 704 | **742** | 664 | 392 |
+| 16 streams † | 949 | **1,220** | 1,068 | 562 |
+
+| Prompt processing, tok/s (text never seen before) | Kuroshio | vLLM | Strata |
 |---|---:|---:|---:|
-| Decode, 1 stream (tok/s) | **252** | 200 | +26% |
-| Decode, 2 streams, total | **395** | 310 | +27% |
-| Decode, 4 streams, total | **500** | 431 | +16% |
-| Prompt processing (tok/s, 4K prompt) | **3,250** | 580 | 5.6x |
-| Well-formed tool calls (24 variants of one agent prompt, temperature 0) | **24 / 24** | 9 / 24 | |
+| 4.7K tokens | 3,330 | 2,480 | **7,280** |
+| 19K tokens | 2,850 | **6,800** | 6,520 |
+| 34K tokens (Strata: 28K, its limit is 32K) | 2,470 | **8,710** | 5,840 |
 
-- Context: about 240K tokens for one conversation, lossless. With `--kv 8 --dense 8` (the 8-bit cache vLLM was run
-  with, plus 8-bit attention matrices): about 450K tokens, about 260 tok/s, 3,500 tok/s prompt processing.
-- Follow-up turns of a conversation skip the part of the prompt the server has already seen: typically 30-50 ms to
-  first token in an agent loop, instead of re-reading everything.
-- Prompt processing slows as the context grows: about 3,100 / 2,800 / 1,850 / 900 tok/s at 4K / 16K / 48K / 100K
-  (measured from request to first token).
+| Tool calls | Kuroshio | vLLM + DSpark | vLLM, no drafter | Strata |
+|---|---:|---:|---:|---:|
+| Well-formed, of 24 (median of 10 passes; range) | **24** (24-24) | 15 (11-15) | 13 (8-13) | 2 (2-2) |
+
+† Kuroshio supports 4 slots; these rows use a benchmark-only override. At 8 slots its conversations share 160K
+tokens of context, at 16 slots 61K (under 4K each). Beyond 4 streams vLLM scales better: its step time grows more
+slowly with the number of conversations.
+
+How to read these:
+
+- **Single-stream speed is tokens over the whole request**, hidden work included. Strata generates its thinking
+  without streaming it and counts those tokens; timed from the first visible token it would show 274 tok/s. Timed
+  that way Kuroshio is 250 and vLLM 199.
+- **Prompt processing is where Kuroshio is behind.** It reads 256 tokens per step; vLLM reads a whole prompt in one
+  pass after about 1.7 s of fixed start-up, and Strata is faster still on short prompts. On a 100K-token prompt
+  Kuroshio falls to about 900 tok/s. What it does have is the prefix cache: a follow-up turn skips what the server
+  has already read (typically 30-50 ms to first token in an agent loop).
+- **The tool-call failures are the model's, not the parsers'.** After `{"name":"read_file"` the model often skips
+  the comma, and that one token is numerically unstable: for the same token ids, vLLM puts 0.95 on the comma while
+  generating and 0.27 when it re-reads them as a prompt. vLLM's raw output, with no parser involved, has the same
+  broken calls. The chat template allows only one spelling of that opening, so Kuroshio writes it itself.
+- Single-stream runs vary by about ±5% with the text being generated (236-259 over the ten runs).
+- When the model repeats text it has already seen (rewriting a file with a small change, quoting a document,
+  echoing tool output), tokens are verified up to 31 at a time: 480-620 tok/s on one stream.
+- With `--kv 8 --dense 8` (the 8-bit cache vLLM was run with, plus 8-bit attention matrices): about 450K tokens of
+  context, about 260 tok/s, 3,500 tok/s prompt processing at 4K.
 - It starts at about 20 GiB of GPU memory and takes more only as conversations grow, so other programs can use the
   card; when the card is full a conversation stops growing instead of the server crashing.
-- When the model repeats text it has already seen (rewriting a file with a small change, quoting a document,
-  echoing tool output), tokens are verified up to 31 at a time: 480-620 tok/s on one stream, 15-25% more than the
-  drafter alone manages there (8-13% more in total with 4 streams rewriting code). Ordinary prose is unaffected.
-- Single-stream runs vary by about ±5% with the text being generated (241-257 over four runs).
-- Without speculative decoding the two are level: 166 tok/s (`--spec 0`) against vLLM's 163.
+- Without speculative decoding: 166 tok/s (`--spec 0`) against vLLM's 170.
 
 ## Install
 
@@ -99,11 +125,11 @@ r = client.chat.completions.create(model="inkling-2-mini", messages=[{"role": "u
 | `--dense` | `16`, `8` | `16` | Precision of the attention matrices and output head. `8` decodes about 7% faster, reads prompts about 10% faster and saves 0.8 GiB; lossy. |
 | `--spec` | 0-7 | `7` | Speculative decoding: verify up to this many drafted tokens per step. `0` turns it off. Output is unchanged either way. |
 | `--tau` | `auto`, or 0-1 | `auto` | Which drafts to verify. `auto` weighs each draft's chance of being accepted against the time a row costs, and adapts to load. A number verifies those the drafter gives at least that probability. |
-| `--copy` | 0-32 | `31` | When the conversation starts repeating an earlier passage, verify up to this many copied tokens per step. `0` turns it off. Output is unchanged either way. |
+| `--copy` | 0-32 | `31` | When the conversation starts repeating an earlier passage, verify up to this many copied tokens per step. `0` turns it off. Needs speculation on (`--spec` above 0, drafter loaded). Output is unchanged either way. |
 | `--prefill-share` | 1-128 | `48` | Prompt tokens processed per step while another conversation is generating. Higher favours new requests, lower favours running streams. |
 | `--cors` | origin, or `*` | none | Let web pages from this origin call the server. Off by default: no page can. |
 | `--sampled-drafts` | | | Experimental: when sampling, draw drafts from the drafter's distribution instead of its top token. Exact, but measured no faster. |
-| `--no-draft` | | | Do not load the drafter: saves 1.1 GiB, no speculation. |
+| `--no-draft` | | | Do not load the drafter: saves 1.1 GiB; no speculation, and the output head runs in full (about 4% slower per step). |
 | `--no-prefix-cache` | | | Always re-read the whole prompt: saves 0.2 GiB per slot. |
 | `--no-tool-fix` | | | Let the model write the fixed opening of a tool call itself (see below). |
 | `--model` | directory | auto | Model snapshot directory. Also `INKLING_WEIGHTS`. |
@@ -135,7 +161,9 @@ left, in any proportion: with 4 slots, one agent can hold 150K tokens while thre
 `POST /v1/chat/completions` (streaming or not), `GET /v1/models`, `GET /health`.
 
 - Supported request fields: `messages`, `tools`, `tool_choice: "none"`, `max_tokens` / `max_completion_tokens`,
-  `temperature` (0-2), `seed`, `stop`, `stream`, `reasoning_effort` (also as `chat_template_kwargs.reasoning_effort`).
+  `temperature` (0-2), `seed` (-1 = random), `stop`, `stream`, `reasoning_effort` (also as
+  `chat_template_kwargs.reasoning_effort`).
+- `stop` applies to the answer text, not to thinking or tool calls: up to 16 strings of at most 256 bytes.
 - The model's thinking is returned as `reasoning_content`; `usage.prompt_tokens_details.cached_tokens` reports what
   the prefix cache saved.
 - `top_p` is accepted and ignored. `logprobs`, `response_format` other than text and `n` > 1 are refused with a 400.
@@ -143,9 +171,9 @@ left, in any proportion: with 4 slots, one agent can hold 150K tokens while thre
 - Closing the connection, or its sending half, cancels the request and frees its slot.
 - Text in messages and tool results is only ever text: a control token such as `<|end_message|>` spelt out in it
   cannot end a message or start one.
-- **Tool calls.** The model often garbles the fixed opening of a tool call (`{"name":"…","args":`); vLLM shows the
-  same broken calls. The chat template allows only one spelling of that opening, so the server writes it and lets
-  the model continue with the arguments.
+- **Tool calls.** The model often garbles the fixed opening of a tool call (`{"name":"…","args":`), on any engine
+  (see the headline notes). The chat template allows only one spelling of that opening, so the server writes it and
+  lets the model continue with the arguments. `--no-tool-fix` turns that off.
 
 ### Thinking level
 
@@ -200,6 +228,9 @@ statistically, not bit for bit. Benchmarks use `bench.py` from the
 ## Limits
 
 - Inkling 2 Mini only, text only, one GPU, RTX 5090 only (the kernels use instructions other cards lack).
+- At most 4 conversations at once; more wait in a queue. For 8 or more streams vLLM gives more in total.
+- Long prompts are read at 2,500-3,300 tok/s (about 900 at 100K tokens): a new 30K-token document takes about
+  13 seconds, where vLLM takes 4.
 - Sampling is temperature only.
 
 ## License

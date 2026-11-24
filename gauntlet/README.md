@@ -77,7 +77,7 @@ that the suite could not interpret it; the traceback is in the detail.
   survives.
 - Warn-only observations about things real clients do: whether an SSE event arrives in one piece or in many tiny
   packets, `Expect: 100-continue`, CORS preflight, query strings,
-  empty `messages`, unsupported fields (`stop`, `top_p`, `response_format`, `logprobs`) being silently ignored,
+  empty `messages`, `stop` being honoured, unsupported fields (`response_format`, `logprobs`) being refused,
   whether a stock client can read the 413.
 - Command line: invalid options (`--slots 5`, `--ctx 100`, `--spec 9`, unknown flag, ...) must be refused at once.
 

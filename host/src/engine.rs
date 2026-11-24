@@ -32,6 +32,7 @@ extern "C" {
 }
 
 pub const VOCAB: usize = 200_058;
+/// Most rows of a step that uses the output head (the engine calls this HMAX; its own TMAX is `PMAX` here).
 pub const TMAX: usize = 128;
 /// Most rows of a step that does not use the output head (prompt rows only).
 pub const PMAX: usize = 256;
@@ -173,7 +174,9 @@ impl Engine {
     }
 
     /// One step over rows that may belong to different conversations: (conversation, position, token). Rows of one
-    /// conversation must be adjacent and in order. Returns the sampler's result for each row.
+    /// conversation must be adjacent and in order. Returns each row's `greedy` and `sample`. `sample_excl` and
+    /// `logp_excl` are only meaningful for a step with a row that verifies a sampled draft (`step_rows_with`'s `qrows`):
+    /// other steps may use the two-stage output head, which does not compute them.
     pub fn step_rows(&mut self, rows: &[(usize, usize, u32)], excl: Option<&[i32]>, head: bool) -> Vec<Row> {
         self.step_rows_with(rows, excl, head, None, None)
     }

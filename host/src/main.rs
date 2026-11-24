@@ -59,7 +59,8 @@ RUN OPTIONS
   --seed N                                                                  [1]
   plus --spec, --tau, --kv, --dense, --no-draft, --model as above
 
-Developer commands (see docs/): check, steptime, microbench, interleave, draftcheck, samptest, nll, topk, render, inspect.
+Developer commands (see docs/): check, argmaxes, headcheck, interleave, draftcheck, samptest, nll, topk, steptime,
+microbench, graphmem, gen, render, inspect.
 ";
 
 /// Command-line flags: `--name value` pairs and bare `--name` switches, plus positional arguments.
@@ -253,7 +254,7 @@ fn main() -> Result<()> {
             // Four is the design limit: the card's memory, not its speed, is what conversations compete for.
             // (INK_UNSUPPORTED_SLOTS=1 lifts it to the engine's 16, for benchmarks: the context left per conversation is tiny.)
             let most = if std::env::var("INK_UNSUPPORTED_SLOTS").is_ok() { 16 } else { 4 };
-            anyhow::ensure!((1..=most).contains(&slots), "--slots must be between 1 and 4");
+            anyhow::ensure!((1..=most).contains(&slots), "--slots must be between 1 and {most}");
             let reserve_mib = parse_mib(&f.get("reserve", "", "512m".to_string())?)? + GRAPH_ROOM_MIB;
             // Memory for conversations: what is free now, minus what the engine takes at start-up, minus the reserve.
             let free = engine::vram_free();
@@ -370,7 +371,8 @@ fn main() -> Result<()> {
                     (out.len() - 1) as f64 / stats.steps as f64, dt * 1e3 / stats.steps as f64);
             }
         }
-        // Raw step timing: inkling steptime [context_tokens]   (batch sizes 1..16 after that much context)
+        // Raw step timing: kuroshio steptime [context_tokens]   (batch sizes 1, 4, 8 after that much context, or those in
+        // INK_STEP_T; INK_STEP_FAST=1 times steps as the server runs them: the two-stage head for up to 32 rows)
         Some("steptime") => {
             let ctx: usize = args.get(2).map(|s| s.parse()).transpose()?.unwrap_or(64);
             let dir = weights_dir()?;
@@ -384,14 +386,23 @@ fn main() -> Result<()> {
             for &t in &ts {
                 eng.reset();
                 eng.forward(&ids[..ctx], None);
-                eng.forward(&ids[ctx..ctx + t], None); // capture the graph for this shape
+                let fast = std::env::var("INK_STEP_FAST").is_ok();
+                let run = |eng: &mut engine::Engine, off: usize| {
+                    if fast {
+                        let rows: Vec<(usize, usize, u32)> = (0..t).map(|i| (0, off + i, ids[off + i])).collect();
+                        eng.step_rows(&rows, None, true);
+                    } else {
+                        eng.forward(&ids[off..off + t], None);
+                    }
+                };
+                run(&mut eng, ctx); // capture the graph for this shape
                 eng.prof_report(1);
                 let (mut times, mut off) = (Vec::new(), ctx + t);
                 let reps = (ids.len() - off - 16) / t;
                 let reps = reps.min(300);
                 for _ in 0..reps {
                     let t0 = std::time::Instant::now();
-                    eng.forward(&ids[off..off + t], None);
+                    run(&mut eng, off);
                     times.push(t0.elapsed().as_secs_f64() * 1e3);
                     off += t;
                 }
@@ -645,6 +656,24 @@ fn main() -> Result<()> {
             }
             // 2. all conversations together, each contributing an irregular number of rows per step
             let (mut pos, mut mixed, mut steps, mut seed) = (vec![0usize; nseq], vec![Vec::new(); nseq], 0usize, 12345u64);
+            // INK_IL_PRE=n: first read n tokens of every conversation as prompt-only steps of up to 256 rows that mix the
+            // conversations in irregular runs (runs straddle the attention halves of a big step). What follows must still
+            // match the separate runs.
+            let pre = std::env::var("INK_IL_PRE").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(n);
+            while pos.iter().any(|&p| p < pre) {
+                let mut rows = Vec::new();
+                for s in 0..nseq {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let c = (1 + (seed >> 33) as usize % 200).min(pre - pos[s]).min(engine::PMAX - rows.len());
+                    rows.extend((0..c).map(|i| (nseq + s, pos[s] + i, texts[s][pos[s] + i])));
+                    pos[s] += c;
+                }
+                eng.step_rows(&rows, None, false);
+                steps += 1;
+            }
+            for s in 0..nseq {
+                mixed[s] = alone[s][..pos[s]].to_vec(); // not predicted in this run
+            }
             while pos.iter().any(|&p| p < n) {
                 let (mut rows, mut owner) = (Vec::new(), Vec::new());
                 for s in 0..nseq {

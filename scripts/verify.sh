@@ -24,6 +24,8 @@ echo "== the two-stage output head must pick what the full head picks (argmax an
 $BIN headcheck 1200 2>/dev/null | tail -1 | grep -q IDENTICAL || { echo "FAIL: two-stage head differs from the full head"; $BIN headcheck 1200 2>/dev/null | tail -3; exit 1; }; echo "ok"
 echo "== conversations advanced together must match separate runs"
 $BIN interleave 3 1300 2>/dev/null | tail -1 | grep -q IDENTICAL || { echo "FAIL: interleaved conversations differ from separate runs"; exit 1; }; echo "ok"
+# several prompts read together in steps of up to 256 rows, then the same comparison
+INK_IL_PRE=1250 $BIN interleave 3 1300 2>/dev/null | tail -1 | grep -q IDENTICAL || { echo "FAIL: after prompt steps shared by several conversations the tokens differ"; exit 1; }; echo "ok"
 # the same when the two-stage head always gives up and the full head runs after it (its overflow path)
 INK_HEAD_FALLBACK=1 $BIN interleave 3 500 2>/dev/null | tail -1 | grep -q IDENTICAL || { echo "FAIL: the output head's fall-back path gives different tokens"; exit 1; }; echo "ok"
 echo "== drafts computed for several conversations at once must match one at a time"
@@ -45,7 +47,11 @@ for mode in 0 1; do for P in "Write a Python function that checks whether a stri
     cmp -s "$TMP/plain.txt" "$TMP/spec.txt" || { echo "FAIL: output differs with speculation (INK_FP8=$mode k=$k)"; exit 1; }; done
 done; done; echo "ok"
 echo "== quality on text"
-$BIN nll 4000 2>/dev/null | tail -1; INK_FP8=1 $BIN nll 4000 2>/dev/null | tail -1 | sed 's/^/8-bit mode: /'
+# The numbers are a fingerprint of the engine's arithmetic: every change so far that was meant to be bit-identical left
+# them unchanged to the last digit. A different value is not necessarily wrong, but it must be intended: update it here.
+N16=$($BIN nll 4000 2>/dev/null | tail -1); N8=$(INK_FP8=1 $BIN nll 4000 2>/dev/null | tail -1); echo "$N16"; echo "8-bit mode: $N8"
+case "$N16" in *"NLL 0.9007 "*) ;; *) echo "FAIL: the lossless mode's NLL on docs/ARCHITECTURE.md was 0.9007 (the arithmetic changed, or that file did)"; exit 1;; esac
+case "$N8" in *"NLL 0.9068 "*) ;; *) echo "FAIL: the 8-bit mode's NLL on docs/ARCHITECTURE.md was 0.9068 (the arithmetic changed, or that file did)"; exit 1;; esac
 if [ "${1:-}" = full ]; then
   echo "== sampling distribution with and without speculation"; $BIN samptest 2000 2>/dev/null | tail -4
   echo "== memory checker"; compute-sanitizer --tool memcheck --error-exitcode 7 $BIN gen "Hi there" none 12 2>&1 | grep -E "ERROR SUMMARY"

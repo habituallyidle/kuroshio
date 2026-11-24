@@ -338,17 +338,18 @@ impl Speculation {
     }
 
     /// Step time in ms by number of rows, output head included, as measured on an RTX 5090 at short context
-    /// (`kuroshio steptime` with INK_STEP_T; linear between the points). Not smooth: the matrix kernels work on
+    /// (`INK_STEP_FAST=1 kuroshio steptime` with INK_STEP_T: steps as the server runs them, the two-stage head up to
+    /// 32 rows; linear between the points). Not smooth: the matrix kernels work on
     /// groups of 8 rows; the 9th row costs more than its neighbours (a second group, and inputs are packed from
     /// there on), so do the 57th (7 and 8 groups run a slower loop) and the 65th (a second launch).
     fn rows_ms(rows: usize) -> f32 {
         const PTS: [(f32, f32); 47] = [
-            (1.0, 6.10), (2.0, 6.93), (3.0, 7.68), (4.0, 8.33), (5.0, 8.93), (6.0, 9.54), (7.0, 10.07), (8.0, 10.60),
-            (9.0, 11.55), (10.0, 12.04), (11.0, 12.52), (12.0, 12.97), (13.0, 13.30), (14.0, 13.74), (15.0, 14.20), (16.0, 14.63),
-            (17.0, 15.29), (18.0, 15.63), (19.0, 16.07), (20.0, 16.41), (21.0, 16.73), (22.0, 17.19), (23.0, 17.45), (24.0, 17.81),
-            (25.0, 18.11), (26.0, 18.64), (27.0, 18.86), (28.0, 19.25), (29.0, 19.83), (30.0, 20.19), (31.0, 20.38), (32.0, 20.84),
-            (33.0, 21.83), (34.0, 22.14), (40.0, 24.42), (41.0, 24.85), (48.0, 27.62), (49.0, 27.91), (56.0, 30.62), (57.0, 33.01),
-            (64.0, 35.68), (65.0, 37.71), (72.0, 40.55), (80.0, 43.78), (96.0, 49.71), (112.0, 56.10), (128.0, 62.65),
+            (1.0, 5.88), (2.0, 6.73), (3.0, 7.48), (4.0, 8.08), (5.0, 8.75), (6.0, 9.31), (7.0, 9.93), (8.0, 10.46),
+            (9.0, 11.25), (10.0, 11.80), (11.0, 12.28), (12.0, 12.65), (13.0, 12.98), (14.0, 13.49), (15.0, 13.91), (16.0, 14.45),
+            (17.0, 15.08), (18.0, 15.39), (19.0, 15.85), (20.0, 16.08), (21.0, 16.37), (22.0, 16.92), (23.0, 17.15), (24.0, 17.42),
+            (25.0, 18.21), (26.0, 18.41), (27.0, 18.90), (28.0, 19.17), (29.0, 19.61), (30.0, 19.93), (31.0, 20.35), (32.0, 20.66),
+            (33.0, 21.71), (34.0, 22.11), (40.0, 24.41), (41.0, 24.65), (48.0, 27.14), (49.0, 27.81), (56.0, 30.15), (57.0, 32.46),
+            (64.0, 34.92), (65.0, 36.84), (72.0, 39.58), (80.0, 42.16), (96.0, 47.91), (112.0, 52.36), (128.0, 60.22),
         ];
         let r = (rows.max(1) as f32).min(128.0);
         let i = PTS.iter().position(|p| p.0 >= r).unwrap_or(PTS.len() - 1).max(1);
@@ -396,7 +397,7 @@ impl Speculation {
             }
         }
         cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)); // stable: a conversation's drafts stay in order
-        // A prompt token counts for the time it would take alone, relative to an output token: 44 ms / 128 against 6.1 ms.
+        // A prompt token counts for the time it would take alone, relative to an output token: 84 ms / 256 against 5.9 ms.
         const PROMPT_TOKEN: f32 = 0.056;
         // Take the best n rows, for the n that gives the most tokens per millisecond. (Not "add rows while they pay":
         // step time jumps at tile boundaries, and the rows after a jump can be worth it together when the first is not.)
@@ -690,9 +691,11 @@ fn scheduler(eng: &mut Engine, rx: mpsc::Receiver<Job>, cfg: Options, max_ctx: u
             let Phase::Decode { anchor } = a.phase else { continue };
             let free_rows = TMAX.saturating_sub(rows.len() + 1 + (nslots - s) + forced_len[s + 1..].iter().sum::<usize>());
             let (mut fed, mut confs, mut tops, mut sampled, mut copy_run) = (Vec::new(), [0f32; 7], [0f32; 7], false, None);
-            let forcing = !a.forced.is_empty() && a.forced.len() <= free_rows.min(lim.saturating_sub(a.pos + 8));
+            // Supplied text goes in as far as this step has room; the rest follows in the next step (see the results).
+            let n_force = a.forced.len().min(free_rows).min(lim.saturating_sub(a.pos + 8));
+            let forcing = n_force > 0;
             if forcing {
-                fed = std::mem::take(&mut a.forced);
+                fed = a.forced.drain(..n_force).collect();
             } else {
                 a.forced.clear();
                 if let Some((d, run)) = &copied[s] {
@@ -790,6 +793,9 @@ fn scheduler(eng: &mut Engine, rx: mpsc::Receiver<Job>, cfg: Options, max_ctx: u
                     let (mut n, mut last) = (0usize, None);
                     if forcing {
                         n = k; // supplied tokens are taken as they are
+                        if !a.forced.is_empty() {
+                            last = Some(a.forced.remove(0)); // more of it to come: that, not the model's choice, is the next token
+                        }
                     } else if sampled && sampled_draft {
                         // Drafts drawn from the drafter's distribution q: kept with probability min(1, p / q); a rejected
                         // position takes the row's sample from the leftover distribution.
@@ -845,6 +851,13 @@ fn scheduler(eng: &mut Engine, rx: mpsc::Receiver<Job>, cfg: Options, max_ctx: u
                     eng.commit(s, r0 + n);
                 }
             }
+            if out.iter().any(|&t| t as usize >= crate::engine::VOCAB) {
+                // Both output heads return an impossible token when every logit is NaN. Feeding it back would be refused
+                // by the engine and stop the whole server; this request ends instead.
+                let _ = a.job.tx.send(Event::Failed(format!("{NO_TOKEN} (a numerical failure); the request was stopped")));
+                slots[s].last_used = Instant::now();
+                continue;
+            }
             if out.is_empty() {
                 slots[s].active = Some(a);
                 continue;
@@ -871,7 +884,7 @@ fn scheduler(eng: &mut Engine, rx: mpsc::Receiver<Job>, cfg: Options, max_ctx: u
                 why = Some("length");
             }
             let last = *send.last().unwrap();
-            if cfg.copy_max > 0 {
+            if cfg.copy_max > 0 && cfg.k_max > 0 && eng.has_draft() {
                 for &t in &send {
                     a.copy.push(t);
                 }
@@ -892,12 +905,33 @@ fn scheduler(eng: &mut Engine, rx: mpsc::Receiver<Job>, cfg: Options, max_ctx: u
 
 // ------------------------------------------------------------------------------------------- HTTP side
 /// One header line, at most 8 KiB.
-fn read_line(r: &mut BufReader<&TcpStream>) -> Result<String> {
-    const MAX_LINE: u64 = 8192;
+/// One header line. `deadline` bounds the whole header: a read timeout alone restarts with every byte, so a client
+/// sending one byte every few seconds could hold a connection thread for hours.
+fn read_line(r: &mut BufReader<&TcpStream>, deadline: Instant) -> Result<String> {
+    const MAX_LINE: usize = 8192;
     let mut line = Vec::new();
-    let n = r.by_ref().take(MAX_LINE).read_until(b'\n', &mut line)?;
-    if n as u64 == MAX_LINE && !line.ends_with(b"\n") {
-        bail!("header line too long");
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            bail!("the request is arriving too slowly");
+        }
+        r.get_ref().set_read_timeout(Some(left.min(Duration::from_secs(15))))?;
+        let buf = r.fill_buf()?;
+        if buf.is_empty() {
+            break; // connection closed
+        }
+        let (take, done) = match buf.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (buf.len(), false),
+        };
+        if line.len() + take > MAX_LINE {
+            bail!("header line too long");
+        }
+        line.extend_from_slice(&buf[..take]);
+        r.consume(take);
+        if done {
+            break;
+        }
     }
     Ok(String::from_utf8_lossy(&line).into_owned())
 }
@@ -911,20 +945,20 @@ struct Request {
 }
 
 fn read_request(mut stream: &TcpStream) -> Result<Request> {
-    let t0 = Instant::now();
+    let deadline = Instant::now() + Duration::from_secs(60); // for all header lines together
     let mut r = BufReader::new(stream);
-    let line = read_line(&mut r)?;
+    let line = read_line(&mut r, deadline)?;
     let mut parts = line.split_whitespace();
     let (method, target) = (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or(""));
     let path = target.split(['?', '#']).next().unwrap_or("").to_string();
     let (mut len, mut expect, mut cors_headers) = (0usize, false, None);
     for n in 0.. {
-        let h = read_line(&mut r)?;
+        let h = read_line(&mut r, deadline)?;
         if h.is_empty() || h == "\r\n" || h == "\n" {
             break;
         }
-        if n >= 128 || t0.elapsed() > Duration::from_secs(60) {
-            bail!("too many header lines, or headers arriving too slowly");
+        if n >= 128 {
+            bail!("too many header lines");
         }
         if let Some((k, v)) = h.split_once(':') {
             let v = v.trim();
@@ -945,25 +979,49 @@ fn read_request(mut stream: &TcpStream) -> Result<Request> {
     if expect && len > 0 {
         stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?; // curl waits a second for this before sending a large body
     }
-    let mut body = vec![0u8; len];
-    r.read_exact(&mut body)?;
+    // The body gets 30 s plus a second per 256 KiB: slower than that is not a client worth a thread.
+    let deadline = Instant::now() + Duration::from_secs(30) + Duration::from_millis(len as u64 / 256);
+    let (mut body, mut got) = (vec![0u8; len], 0);
+    while got < len {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            bail!("the request body is arriving too slowly");
+        }
+        r.get_ref().set_read_timeout(Some(left.min(Duration::from_secs(15))))?;
+        match r.read(&mut body[got..])? {
+            0 => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "connection closed in the middle of a request").into()),
+            n => got += n,
+        }
+    }
     Ok(Request { method, path, body, cors_headers })
 }
 const TOO_LARGE: &str = "request body too large";
 const NO_MEMORY: &str = "out of GPU memory";
+const NO_TOKEN: &str = "the model produced no valid token";
 
-/// True once the client has closed its side of the connection.
-fn client_gone(stream: &TcpStream) -> bool {
+/// True once the client has closed its side of the connection. Bytes it sent after its request are discarded
+/// (every reply closes the connection, so nothing more will be read from it): left in place they would hide the close.
+fn client_gone(mut stream: &TcpStream) -> bool {
     if stream.set_nonblocking(true).is_err() {
         return true;
     }
-    let r = stream.peek(&mut [0u8; 1]);
-    let _ = stream.set_nonblocking(false);
-    match r {
-        Ok(0) => true,
-        Ok(_) => false,
-        Err(e) => e.kind() != std::io::ErrorKind::WouldBlock,
+    let mut gone = false;
+    let mut sink = [0u8; 4096];
+    for _ in 0..64 {
+        match stream.read(&mut sink) {
+            Ok(0) => {
+                gone = true;
+                break;
+            }
+            Ok(_) => continue,
+            Err(e) => {
+                gone = e.kind() != std::io::ErrorKind::WouldBlock;
+                break;
+            }
+        }
     }
+    let _ = stream.set_nonblocking(false);
+    gone
 }
 
 /// `--cors`: the origin browsers are told may call this server (none by default).
@@ -1100,7 +1158,8 @@ fn handle(stream: TcpStream, sh: Arc<Shared>) {
                         (&stream).write_all(format!("data: {}\n\ndata: [DONE]\n\n", json!({"error": {"message": e.to_string()}})).as_bytes())?;
                         Ok(())
                     } else {
-                        let status = if e.to_string().starts_with(NO_MEMORY) { "503 Service Unavailable" } else { "400 Bad Request" };
+                        let msg = e.to_string();
+                        let status = if msg.starts_with(NO_MEMORY) { "503 Service Unavailable" } else if msg.starts_with(NO_TOKEN) { "500 Internal Server Error" } else { "400 Bad Request" };
                         respond(&stream, status, &json!({"error": {"message": e.to_string()}}))
                     }
                 }
@@ -1394,15 +1453,21 @@ pub fn serve(addr: &str, model_name: &str, chat: Chat, eng: &mut Engine, max_ctx
                 std::thread::sleep(Duration::from_millis(50)); // e.g. out of file descriptors: do not spin
                 continue;
             };
-            if OPEN.fetch_add(1, Ordering::Relaxed) >= MAX_CONNECTIONS {
-                OPEN.fetch_sub(1, Ordering::Relaxed);
+            struct Place; // one of the MAX_CONNECTIONS places, given back however the thread ends (a panic included)
+            impl Drop for Place {
+                fn drop(&mut self) {
+                    OPEN.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+            let place = (OPEN.fetch_add(1, Ordering::Relaxed), Place);
+            if place.0 >= MAX_CONNECTIONS {
                 let _ = respond(&stream, "503 Service Unavailable", &json!({"error": {"message": "too many connections"}}));
                 continue;
             }
             let sh = sh2.clone();
             std::thread::spawn(move || {
+                let _place = place;
                 handle(stream, sh);
-                OPEN.fetch_sub(1, Ordering::Relaxed);
             });
         }
     });
@@ -1548,9 +1613,9 @@ mod tests {
 
     #[test]
     fn step_time_table_is_monotonic() {
-        assert_eq!(Speculation::rows_ms(1), 6.10);
-        assert_eq!(Speculation::rows_ms(128), 62.65);
-        assert!((Speculation::rows_ms(36) - 22.90).abs() < 0.01); // between the points at 34 and 40
+        assert_eq!(Speculation::rows_ms(1), 5.88);
+        assert_eq!(Speculation::rows_ms(128), 60.22);
+        assert!((Speculation::rows_ms(36) - 22.877).abs() < 0.01); // between the points at 34 and 40
         assert!((2..=128).all(|r| Speculation::rows_ms(r) > Speculation::rows_ms(r - 1)));
     }
 }

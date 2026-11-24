@@ -3934,6 +3934,274 @@ The attention loop would take three or four sub-batches as it is written. Two ot
 
 ---
 
+## Step 67 — An exact output head in two stages, and a memory warning that was not a leak (2026-11-23)
+
+**What we did**
+
+**The starting point.** The output head is the last matrix of a step. It has one row for each of the 200,058 tokens the model can produce (Step 17) and 2,304 columns, stored in bf16: 922 MB. The code calls it the unembedding matrix (`unembed`). Every row of a step ends as a vector of 2,304 values, called its hidden state below. The logit of a token is the dot product of that token's matrix row with the hidden state, so a full set of logits needs every byte of the matrix. The product takes 563 µs for a step of one row and 776 µs for 32 rows. Prompt steps have skipped it since Step 42. This step is about the steps that need it.
+
+What those steps read is far less than 200,058 logits. For each row the caller wants one token, or two: the token with the largest logit, and for a row that samples, the token with the largest noisy score (the Gumbel-max trick of Step 27). The head now finds these winners in two stages: a cheap approximate pass over all tokens, then exact work on the few tokens that could still win. It returns the tokens that the full head returns. One stream became 2.3% to 3.2% faster.
+
+**What "winner" means in the full head.** The model does not compare raw logits. Every logit x first passes a soft cap, 30 × tanh(x / 30), which changes small values little and keeps every value below 30 (`k_head_part`). The argmax is the token with the largest capped logit, and of equal ones the token with the lower id. A sampling row takes the largest of "capped logit ÷ temperature + noise". The two-stage head has to reproduce these rules, not an idealised argmax. The cap never reverses an order: a larger raw logit never gives a smaller capped one. So an upper limit for a raw logit, once capped, is an upper limit for the capped logit.
+
+**The idea.**
+
+1. *Approximate logits for all tokens.* The drafter already keeps an 8-bit copy (MXFP8) of the head's matrix (Step 33). Multiplying that copy by the hidden states, quantised to 8 bits as well, reads half the bytes. It takes 289–307 µs for 1 to 32 rows.
+2. *A bound on the error.* For every token and every row, a number that the difference between the approximate and the exact logit cannot exceed.
+3. *A threshold.* The token that wins the approximate pass gets its exact logit computed. The true winner's exact logit is at least as large, whichever token that is. A token whose approximate logit plus its bound stays below the threshold therefore cannot be the winner. All other tokens are candidates.
+4. *Exact logits of the candidates*, and the winner among them by the full head's rules.
+
+**Why this is exact and not "lossy but close".** The 8-bit pass never chooses the token. It decides only which tokens get an exact logit. A token is left out only when an inequality proves that its exact logit lies below an exact logit that has really been computed, so it would not have won in the full head either. The true winner is therefore always among the candidates. Its exact logit is then computed to the same bits as in the full head, and the same comparisons pick it.
+
+Step 35 offers the same 8-bit product as an optional head, and there it is lossy, because the approximate logits are the answer. Here they are a filter. It is the pattern of Step 33: where something exact checks the result of an approximation, a poor approximation costs speed and never correctness.
+
+The whole argument rests on point 2. If the bound is too small even once, a token can be dropped that should have won. So the bound has to be proved, not estimated.
+
+**The bound, step by step.** Four vectors of 2,304 values each:
+
+```
+u    the token's row of the matrix, in bf16        ũ    the same row in the 8-bit copy
+h    the row's hidden state                        h̃    the hidden state quantised to 8 bits
+```
+
+The exact logit is u·h and the approximate one is ũ·h̃. Their difference splits into two parts:
+
+```
+u·h − ũ·h̃  =  (u − ũ)·h̃  +  u·(h − h̃)
+```
+
+To check, multiply out the right-hand side: u·h̃ − ũ·h̃ + u·h − u·h̃, and the two terms u·h̃ cancel. The first part is the error of the weights, weighed by the quantised hidden state. The second is the error of the hidden state, weighed by the exact weights.
+
+Neither part can be computed without the exact row u, and not reading u is the purpose of the pass. But each part can be bounded. Write |x| for the length of a vector x, the square root of the sum of its squared elements; it is also called the norm of x. The Cauchy–Schwarz inequality says that a dot product is never larger in size than the product of the two lengths: |a·b| ≤ |a| × |b|. Applied to both parts:
+
+```
+|u·h − ũ·h̃|  ≤  |u − ũ| × |h̃|  +  |u| × |h − h̃|
+```
+
+The right-hand side consists of four lengths, and none of them needs the matrix during a step:
+
+| Length of | What it measures | Belongs to | Computed |
+|---|---|---|---|
+| u − ũ | The quantisation error of the token's row | The token | Once, at load (`k_fp8_rowerr`) |
+| u | The size of the token's row | The token | Once, at load |
+| h̃ | The size of the quantised hidden state | The row of the step | In every step (`k_hbound`) |
+| h − h̃ | The quantisation error of the hidden state | The row of the step | In every step |
+
+Two numbers per token are stored, in two arrays of 200,058 floats. Two numbers per row are computed from the 2,304 values of its hidden state. The bound for one token in one row is then two multiplications and an addition.
+
+*Measured from the stored codes.* The 8-bit copy is made at load by a quantiser (`k_to_mxfp8`, Step 33). `k_fp8_rowerr` runs after it. For every weight it takes the bf16 value and the code and scale that were stored for it, decodes them to the value the multiply will use, and adds up the squared differences. So |u − ũ| is the distance to the copy that is really in memory. A figure derived from the format, of the kind "an 8-bit float is within a few per cent of the original", would hold only if the quantiser rounds as assumed. The measured distance holds whatever the quantiser did. The hidden state is treated the same way in every step: `k_hbound` reads the codes that the quantiser of Step 34 (`k_quant8f`) has just written.
+
+*An allowance for rounding.* The inequality is about exact arithmetic. The two kernels compute their dot products in 32-bit floats and round at every addition, so each computed logit is slightly off the mathematical one. The rounding error of a sum of products grows with the sizes of the products, and those add up to at most |u| × |h| (Cauchy–Schwarz once more). The bound therefore gets 0.0005 × |u| × |h| on top (`HEAD_ROUNDING`), and a constant 0.001:
+
+```
+bound  =  |u − ũ| × |h̃|  +  |u| × (|h − h̃| + 0.0005 × |h|)  +  0.001
+```
+
+*Everything is rounded up.* The two directions of error are not alike. A bound that is a little too large lets a few more tokens through, which costs microseconds. A bound that is too small in its last digit can drop the winner. So the lengths are summed in 64-bit floats and multiplied by 1.0001 before they are stored, the thresholds are lowered by a small margin (`HEAD_MARGIN`), and the test is "reaches or exceeds".
+
+**Feasibility before building.** Such a bound is useful only if it is small against the distances between the logits. The formula does not say whether it is. That was measured first, on the CPU, with real hidden states: 2,300 teacher-forced positions, 456 positions taken from the engine, and 9,200 more as a check of robustness. Two facts came out. The top logit of a row is around 50 before the cap, and every row of the matrix has norm 1.000. And with 8-bit weights and 8-bit activations the bound is about 10 logits. Then five designs were compared by the number of candidates they leave per row:
+
+| Design | Candidates per row |
+|---|---|
+| 8-bit weights and activations; threshold: the best lower limit, the largest "approximate logit − bound" of any token | Mean 1,650, 99th percentile 47K |
+| The same; threshold: the exact logit of the approximate winner | Mean 3 to 17, 99th percentile at most 350, largest about 4,600 (a legal text) |
+| 4-bit weights | Mean 1,800 on the legal text |
+| 4-bit weights and 4-bit activations | Unusable |
+| A low-rank projection of the matrix | The bound is 120–150 logits: every token is a candidate |
+
+The first design is the obvious one, and it was useless. It uses nothing exact, so its threshold is itself uncertain by one bound. A token then stays in if its approximate logit is within two bounds of the top: one for its own error and one for the top token's. Computing a single exact logit removes the second. The threshold becomes a known number, the window below the top is one bound wide, and far fewer tokens lie in it: between 3 and 17 on average, against 1,650.
+
+The other three fail on the size of the bound. A 4-bit copy would read a quarter of the bytes, but its quantisation error |u − ũ| is larger, and the bound grows with it. A low-rank projection replaces the matrix by the product of two much smaller ones. What the small ones cannot represent is its error, and here that gave a bound of 120–150 logits, more than the top logit itself. Such a bound excludes nothing.
+
+About an hour of measurement on the CPU chose between five designs before any kernel was written. It also found the detail on which the design depends, the source of the threshold, which none of the formulas shows.
+
+**What was built** (`head_two_stage`):
+
+| Stage | Kernels | What it does |
+|---|---|---|
+| 1 | `k_quant8f`, `gemm_fp8` | Quantises the hidden states to 8 bits and multiplies them by the drafter's 8-bit copy of the matrix: approximate logits for all tokens. |
+| 2 | `k_hbound` | The two lengths per row. |
+| 3 | `k_apx_part`, `k_apx_final` | The approximate winner of each row, found like the argmax of Step 23: 49 blocks per row, then one small block. |
+| 4 | `k_gemm_rows` | The exact logits of the approximate winners. |
+| 5 | `k_head_thr` | The thresholds, and the candidate counter set to zero. |
+| 6 | `k_head_cand` | Tests every token: the most its capped logit can be, against the threshold. Tokens that pass go on a list. |
+| 7 | `k_gemm_rows` | The exact logits of the listed candidates. |
+| 8 | `k_head_pick` | The winner of each row among the candidates: soft cap, largest value, ties to the lower token id. |
+
+Any token's exact logit would be a valid threshold in stage 5, because the winner is at least as large as every token. The approximate winner is used because it is the best guess at the true winner, and the higher the threshold, the fewer the candidates.
+
+Nothing large is stored twice. The 8-bit matrix is the drafter's. New are the two arrays per token and some scratch buffers, the largest of which, for the candidates' exact logits, is 8 MiB.
+
+**In a recorded graph, which cannot branch.** A step is replayed from a CUDA graph (Step 11): a fixed list of kernel launches, each with the grid it had when it was recorded (Step 15). The number of candidates differs from step to step and is known only on the GPU, after stage 6. Three things follow from that.
+
+- *A fixed grid with an early exit.* Stage 7 is always launched with 4,096 blocks (`CAND_CAP`), one for each entry the list can hold. Each block reads the number of entries from GPU memory and returns at once if its own index lies beyond it. This is the device of Steps 15 and 66: the grid is the worst case, and the data decide how much of it works.
+- *A list that many threads fill at once.* Stage 6 runs 49 blocks of 1,024 threads for every row, and any thread can find a candidate. Each needs a place in the list that no other thread has. `atomicAdd(count, 1)` adds 1 to the counter as one indivisible operation (Step 65) and returns the value from before the addition. No two threads get the same value, and that value is the thread's place. The order of the entries therefore depends on timing and differs from run to run. Nothing may depend on it, and nothing does: stage 8 takes a maximum, and equal values are decided by the token id.
+- *Overflow leaves the graph.* A thread that draws a place of 4,096 or more stores nothing, and the counter keeps counting. Stage 8 writes two more numbers behind the results: whether the counter passed the limit, and the count. "If the list overflowed, run the full head" is a branch, and a recorded graph has none. So the host takes it. `ink_step` waits for the step and copies the results in any case, and it now copies the two numbers with them. If the flag is set, it launches the full head (`head_full`) for the same rows directly, outside the graph, and returns that result. The hidden states are still in their buffer. Such a step pays for both heads. The first time it happens, the engine prints a note.
+
+There is one list for all rows of a step, and it holds blocks of 16 tokens, for a reason given in the next paragraph. A block can be listed more than once, by two of its tokens or for two rows. Every listed block is scored for every row. A row therefore also sees tokens that were candidates only for another row. That is harmless: the exact logit of a token that cannot win does not change who wins.
+
+**Exact logits by the block, bit for bit.** The matrix is stored as tiles (Step 21). A tile holds 16 columns of 16 consecutive rows, and one tensor-core multiply consumes it whole. The weights of a token lie interleaved with those of the 15 other tokens of its group. The unit of exact work is therefore a block of 16 tokens: 16 × 2,304 values of 2 bytes, which is 73,728 bytes. The list stores block numbers, the token id divided by 16, and the 15 neighbours of a candidate get exact logits with it.
+
+`k_gemm_rows` computes a listed block the way the full product (`k_gemm_bf16`, Step 65) computes that block. It is the same loop. 16 warps share the columns, each takes its 9 slices in ascending order through the same multiply-accumulate instruction, and the 16 partial sums are added in the same order. The one difference is where the block number comes from: from the list, where the full product takes it from the block's index in the grid. (From 9 rows on, the full head runs the packed form of Step 65, which gives the same bits again.)
+
+This is "the same operations in the same order" (Steps 16, 23 and 65), and here it is a requirement. A sum of 2,304 products added in another order is an equally good logit, and it can differ in the last bit (Steps 38 and 43). The winner is decided by comparing floats. If the candidates' logits were merely very close to the full head's, two tokens that are nearly level could come out the other way round, and "the same token as the full head" would be true almost always. With the same bits, `k_head_pick` makes the full head's comparisons on the full head's numbers. That the two heads agree then follows from the argument, and a test only has to confirm that the code follows the argument.
+
+**Rows that sample.** For a row with a temperature above 0, the full head returns the token with the largest score:
+
+```
+score(v)  =  capped logit(v) ÷ temperature  +  noise(v)
+```
+
+The noise is Gumbel noise (Step 27). At this point it is not random: it is a hash of the seed, the position and the token id, so any kernel can compute the exact noise of any token. Only the logit is uncertain. The scheme is therefore the same, with scores in the place of logits:
+
+- the approximate winner is the token with the largest score computed from the approximate logits;
+- the threshold is that token's exact score;
+- a token is a candidate if the most its capped logit can be, divided by the temperature, plus its own noise, reaches the threshold.
+
+A token with a low logit and large noise can pass, as it must: it may be the sample. Every row also returns its argmax, so a sampling row has two approximate winners and two thresholds, and a token is listed if it passes either test. A greedy row has only the first.
+
+**Who gets which head.** The two-stage head returns the argmax and the sample of each row. It cannot return a probability. A probability is a token's share of a sum over all 200,058 tokens (Steps 27 and 30), and that sum needs every exact logit. Three kinds of caller need more than the winners:
+
+- a row that verifies a sampled draft (Step 62): whether the draft is accepted depends on the model's probability for it, and a rejected draft is replaced by a draw from the leftover distribution;
+- the `nll` command (Step 35), and any caller that asks for the logits themselves;
+- the optional 8-bit head (`INK_FP8=1`, Step 35), which is by its definition the 8-bit product.
+
+Which head runs is stated at every level. `ink_step` takes the kind of head as a number: 0 for none, 1 for the full head, 2 for "argmax and sample are enough". In the host, `step_rows_with` passes 2 only when no row of the step carries a sampled draft. The entry point for whole texts (`forward`), which `nll` uses, passes 0 or 1. The engine uses the two-stage head only if it was asked for 2, no logits buffer was passed, the step has at most 32 rows (`FAST_T`), and both the 8-bit copy and the exact matrix exist. A 2 is a permission, never an order.
+
+The server's default path qualifies. Under sampling it keeps a most-likely-token draft exactly when the draft equals the sample drawn at that position (`server.rs`), so it reads the sample and no probability. 32 rows cover every step that one stream builds by default: at most 8 rows with the drafter and 32 with copied drafts (Step 64). Larger steps take the full head. `INK_HEAD_FULL=1` turns the two-stage head off.
+
+**The self-check: `kuroshio headcheck`.** A claim of exactness is tested by equality (Step 27). The command feeds three texts, `docs/ARCHITECTURE.md`, `host/src/server.rs` and `LICENSE`, in steps of 1 to 32 rows. After every step the engine runs both heads again on the same hidden states (`ink_headcheck`) and reports:
+
+- the rows whose argmax or sample differ between the two heads;
+- for every token of every row, the real error |exact − approximate| against its bound: the worst value of "error − bound", which must be negative, and the worst ratio of the two;
+- the number of candidate blocks, and whether the list overflowed.
+
+The second item tests the bound itself, on all 200,058 tokens of every row and not only on the tokens that happened to decide a row.
+
+| First version of the check | |
+|---|---|
+| Steps and rows | 302 steps, 3,254 rows, at temperatures 0, 0.6 and 1 |
+| Rows that differ from the full head | 0 |
+| Worst error | 12.4% of its bound |
+| Candidate blocks per row | 7.1 on average |
+| Largest list in one step | 3,265 blocks, for 32 rows of the licence text; the limit is 4,096 |
+| Steps that overflowed | 0 |
+
+`scripts/verify.sh` runs the command on up to 1,200 tokens of each text. No step of the check overflowed, so nothing in it runs the fall-back path. A second line of the script forces that path: with `INK_HEAD_FALLBACK=1` every step discards the two-stage result and runs the full head after it, and the interleaving test (Step 51) must still report identical tokens.
+
+**What the review changed.** An independent review found no defect on realistic inputs. It changed three things.
+
+| Finding | Why it matters | Change |
+|---|---|---|
+| Two tokens can have exactly the same sample score. The full head then kept whichever its reduction met first. The two-stage head has no such order, because the order of its list depends on timing. | A tie occurs in about one row in a million. Which head runs depends on the size of the step and on overflow, and so on what else the server is doing. With two tie rules, a seeded request could give different text under load, which is the fault of Step 57 in a new place. | Both heads decide equal scores for the lower token id (`k_samp_part`, `k_samp_final`, `k_head_pick`), as the argmax always has. |
+| The thresholds were compared as raw logits. The full head compares capped logits. | The cap flattens out. Above about 150 logits, two different raw logits can become the same capped number. The full head sees a tie there and takes the lower id. A raw threshold could have dropped exactly that token. | The upper limit and the threshold are both capped before they are compared, the unit the full head compares in, with a margin for the last digit of `tanh`. |
+| A row can have no valid approximate winner: every approximate logit is NaN (Step 37), and the search ends with the "no token" marker it started from. | That marker is not a token id and must not select a block of the matrix. | `k_apx_final` turns the marker into −1. Nothing of that row passes the test, as the full head finds nothing in such a row either. |
+
+None of the three showed up in a test, and none was likely to. Top logits are around 50, not 150. A tie needs a million rows. A row of NaN means that something else has already failed. But "identical to the full head" is a statement about every input, and a test covers the inputs it was given. The review read the code for the inputs that the tests do not reach.
+
+It also strengthened the check, in two ways.
+
+- *The step's own result is compared.* The first version ran both heads after the step, outside the recorded graph, and compared those two results with each other. What the server uses is a third result: the one the step itself returned, from the replay of the graph, through the copy and the overflow branch in `ink_step`. Nothing compared that one. `ink_headcheck` now saves it before it runs anything, and compares it with the full head as well.
+- *Temperatures are mixed within a step.* In two steps out of three the temperature changes from row to row, through 0, 0.05, 0.3, 0.6, 1 and 2. The server puts greedy and sampling conversations into one step (Step 51), and thresholds, margins and noise are per row. A temperature of 0.05 multiplies every logit difference by 20. At 2, the noise counts for more against the logits than at any other of these settings.
+
+With both: 482 steps, 5,254 rows, none differ.
+
+**Results.** A/B with fixed prompts and seeds, one stream, tokens/s, full head → two-stage head. Each kind of text was measured in two settings, each setting twice, and the repeats agree within 0.5%:
+
+| Text | Full head → two-stage head |
+|---|---|
+| Prose | 222 → 228 and 226 → 232 |
+| Rewrite code with a change | 484 → 496 and 623 → 638 |
+| Quote or repeat a document | 443 → 455 and 412 → 422 |
+| Repeating patterns | 379 → 389 and 421 → 432 |
+
+That is +2.3% to +3.2% in every line. The hashes of the greedy outputs are identical.
+
+The general harness at temperature 0.6, on a quiet machine, tokens/s:
+
+| Measurement | Before | This build |
+|---|---|---|
+| 1 stream | 225–244 (Step 65) | 241 / 251 / 253 / 257 |
+| 2 streams, aggregate | 394–396 (Step 66) | 386 / 395 / 405 |
+| 4 streams, aggregate | 485–490 (Step 66) | 495 / 501 / 516 |
+| Prompt processing, 4K prompt | 3,105 / 3,150 / 3,289 (Step 66) | 3,207 / 3,290 / 3,302 |
+| 1 stream without speculation (`--spec 0`) | 158 | 166.2 |
+
+The harness lines carry their usual spread (Step 58), and the "before" columns are from earlier sessions, so only the A/B above is a measurement of this change. Prompt steps run without a head and cannot have gained from it. The line without speculation moved most. That fits: every step there has one row and yields one token, so what the head saves per step is a larger share of the time per token.
+
+**The soak's memory warning.** The soak of the test suite (Step 63) runs a mixed load, for 15 minutes in the full suite, and watches the server's memory on the GPU and on the host. Host memory here is the process's resident set size (RSS): the part of its memory that is in physical RAM, as the operating system reports it. The soak gave a warning about memory that grows. Three things could have been growing, and each was tested on its own.
+
+| Suspect | Test | Result |
+|---|---|---|
+| GPU memory | Its course over the soak | 23.0 → 23.6 GiB within the first 3 minutes, then up and down for the rest of the 15. A plateau, not a leak. |
+| Host memory lost with every recorded graph. Graphs are recorded all the time (Steps 59 and 64), and this step adds a third kind per step shape. | `kuroshio graphmem` with `INK_GM_ROUNDS` goes through all step sizes again and again, so that every step records a graph that had been dropped, and prints the process's own memory. `INK_GM_STEP=1` makes it run steps as the server does. | 1,536 re-recordings: +35 MiB, then flat. No leak. |
+| Host memory of the server process | Its course over the soak | 778 → 894 MiB in 15 minutes, still creeping. Real. |
+
+The third was not a leak in the strict sense either: no memory was lost. It was held by the allocator. The server starts one thread per connection (Step 52). The C library (glibc) does not serve all threads from one pool. It keeps several pools, called arenas, up to eight per processor core, so that threads which allocate at the same time do not wait for one lock. Memory that a thread frees goes back to the arena it came from and stays there for reuse. It is not handed to the other arenas, and mostly not back to the operating system. A new connection thread may be given any arena. Whenever a large request lands in an arena that has not yet seen one, that arena grows by a few MiB and keeps them. Seen from outside, the process creeps upwards for as long as there are arenas that have not had their large request, and with eight per core that is a long time.
+
+The fix is one call at the top of `serve`: `mallopt(M_ARENA_MAX, 2)`, which limits the process to two arenas. On a repeating load of 7 minutes the host memory was then flat at 958 MiB over the last 4 minutes, where it had still been rising before. Two arenas mean more threads per lock. A connection thread spends its time on HTTP and on decoding text, not on allocating, and the next paragraph has the measurement.
+
+**A scare, resolved.** After the review's changes and the arena limit were in, the prose A/B was run again. The two-stage head read 224 and 228 tokens/s. It had read 228 and 232 before, and 224 and 228 are barely above the 222 and 226 that the full head had read then. The gain seemed to have gone. There were two suspects: the review's changes add work to the head, and the arena limit touches every connection thread.
+
+Reasoning about which of the two it was would have been a guess. Four configurations were run back to back instead:
+
+| Prose, tokens/s | With the arena limit | Without |
+|---|---|---|
+| Full head | 218 / 223 | 219 / 223 |
+| Two-stage head | 226 / 229 | 226 / 229 |
+
+The columns are the same: the arena limit costs nothing. The rows differ as they did before: the head is worth +2.5% to +3.5%. And the full head now read 218–219 and 223 where it had read 222 and 226. The whole machine was about 1.5% slower in that hour. The alarming comparison had set a new B against an A from an earlier session.
+
+**Quirks we hit**
+
+- **The bound is about eight times looser than the worst error seen, and that is its job.** Cauchy–Schwarz is reached only when the error vector points exactly along the other vector. Real quantisation errors point in no particular direction, so the real error was at most 12.4% of the bound. A proof cannot use "in no particular direction". The price of rigour is paid in candidates, 7.1 blocks per row, and not in correctness.
+- **The same 8-bit product is lossy in Step 35 and exact here.** What differs is its use: as the answer there, as a filter here.
+- **The hardest text was legal text, twice.** The CPU study found its largest row, about 4,600 candidates, in a legal text. The check found its largest list, 3,265 of 4,096 blocks, in the licence. Why such text leaves so many tokens near the top was not examined. It is the reason why overflow is a path with its own test and not an assertion.
+- **The approximate logits use the logits buffer.** After a two-stage step that buffer holds 8-bit approximations. This is why a caller that asks for logits always gets the full head.
+- **A third recorded graph per step shape.** The graphs are now kept per number of rows, context bucket and kind of head: none, full or two-stage. All share the limit of 48 (Step 59).
+- **The list is in a different order in every run, and the result is not.** A maximum with a tie rule by token id does not depend on the order of its inputs. A rule such as "the first one found" would.
+- **The tie rule changed the full head as well.** In about one row in a million, a seeded sample of the full head can now be a different token than in the previous build. Both tokens are correct draws: their scores are equal.
+- **The limit on arenas is not in Rust's standard library.** The server declares glibc's `mallopt` itself and calls it with the parameter number −8, which is `M_ARENA_MAX`. The call is compiled only for glibc targets.
+- **The memory figures before and after the fix are from different loads.** 894 MiB after the 15-minute soak and 958 MiB on the 7-minute repeating load are not to be compared. What counts is the course: still rising before, flat after.
+- **The README's headline figures were measured again**: 252, 395 and 500 tokens/s for 1, 2 and 4 streams, 3,250 tokens/s of prompt processing, and 166 tokens/s without speculation. The speed stage of the test suite (Step 63) checks against these.
+
+**Why you should care**
+
+- Ask what the consumer of a computation reads. One winner out of 200,058 does not need 200,058 exact values. Step 27 made the same point about copying: return the decision, not the array.
+- An approximation with a proved error bound, followed by exact work on what the bound cannot exclude, gives an exact result. The approximation only decides where to look.
+- The bound must hold always, not typically. Round every part of it upwards, and accept that a rigorous bound is loose. Looseness costs time, and a bound that fails once costs the claim.
+- Measure the error of a quantised copy on the copy that is stored. A bound taken from the format's description assumes that the code which made the copy has no surprises.
+- Before building, measure on real data whether the idea can work, and which variant. Here the sizes of logits and of matrix rows decided it, and a CPU script found them. The difference between two variants was at most 17 candidates on average against 1,650, and no formula showed it.
+- When a quantity can be made exact for the price of one small computation, do it. One exact logit turned a threshold with an uncertainty into a known number and halved the window.
+- A recorded graph can take work whose amount depends on the data: fix the grid at the worst case, keep the count on the device, and let the surplus blocks exit. It cannot take a decision that depends on the data. Bring a flag back with the results and decide on the host.
+- A path that normal inputs never take needs a switch that forces it, and a test that uses the switch (Step 66: a test must reach the hazard).
+- Two implementations that must agree need the same rule for ties, and the rule must be defined on the data, such as the lower id, not on the order of traversal. A parallel list has no order to rely on.
+- Compare in the units of the reference. The full head compares capped logits, so a filter that compares raw logits answers a slightly different question.
+- "The same bits" is stronger than "the same value up to rounding", and where a comparison follows, only the first makes agreement an argument and not a statistic.
+- A self-check must check the result that production uses. Re-running the function next to the production path tests the function.
+- Findings that no test can show are what a review is for. Read for the inputs the tests do not contain: ties, saturation, NaN.
+- Memory that grows is not always a leak. List what could be growing, and test each suspect alone: watch whether it levels off, or repeat the suspected operation a thousand times.
+- A server with a thread per connection on glibc should limit the allocator's arenas, or expect its memory to creep for a long time before it levels off.
+- When a gain seems to have vanished, measure both sides again, now, back to back. Never compare today's B with yesterday's A (Steps 29, 31 and 63).
+
+**Jargon**
+
+- **Allocator arena (malloc arena)**: a pool of memory that the C library's allocator manages under one lock; glibc spreads threads over several arenas so that they do not wait for each other, and memory freed into an arena stays there for reuse instead of going back to the operating system.
+- **Candidate (in a two-stage search)**: an item that the cheap first stage could not rule out, so that the exact second stage has to score it; here a token whose approximate logit plus its error bound reaches the threshold.
+- **Cauchy–Schwarz inequality**: the size of a dot product is at most the product of the lengths of its two vectors, |a·b| ≤ |a| × |b|; it bounds a dot product without computing it.
+- **Error bound (rigorous)**: a number that the difference between an approximate and an exact value is proved never to exceed, as opposed to an estimate of how large the difference usually is; only a proved bound allows results to be ruled out without loss.
+- **Fall-back path**: the slower, simpler way a program takes when its fast way cannot handle a case, here the full head after the candidate list has overflowed; normal inputs rarely reach it, so it needs a test that forces it.
+- **Hidden state (final)**: the vector of 2,304 values that a row has after the last layer, which the output head turns into logits.
+- **Low-rank approximation**: replacing a large matrix by the product of two much smaller ones, which is cheaper to apply and is exact only for the part of the matrix that the smaller ones can represent.
+- **Norm (of a vector)**: its length, the square root of the sum of the squares of its elements; written |x| here.
+- **Resident set size (RSS)**: the part of a process's memory that is in physical RAM at the moment, as the operating system reports it; it includes memory that the program has freed and its allocator has kept.
+- **Soft cap (of logits)**: the function 30 × tanh(x / 30), applied to every logit before tokens are compared; it changes small values little and keeps every value below 30 in size.
+- **Tie rule (tie-breaking)**: the rule that decides between items with exactly equal scores, here "the lower token id"; two implementations that must agree need the same one, and it must not depend on the order in which the items are visited.
+- **Two-stage output head (filter and refine)**: finding each row's winning token by a cheap approximate pass over all tokens, which together with an error bound rules most of them out, followed by an exact computation for the rest; the result is the full head's.
+- **Unembedding matrix**: the output head's matrix, with one row per token; the dot product of a token's row with a hidden state is that token's logit.
+
+---
+
 ## Glossary
 
 Alphabetical. Later entries extend this list.
@@ -3944,6 +4212,7 @@ Alphabetical. Later entries extend this list.
 - **Activation**: an intermediate value the model computes for a token while it runs, as opposed to a fixed weight.
 - **Admission / queueing**: admission is letting a waiting request start, here by giving it a free slot; queueing is holding requests in order of arrival until that is possible.
 - **Aggregate throughput**: the tokens per second of all concurrent streams added together.
+- **Allocator arena (malloc arena)**: a pool of memory that the C library's allocator manages under one lock; glibc spreads threads over several arenas so that they do not wait for each other, and memory freed into an arena stays there for reuse instead of going back to the operating system.
 - **Anchor token**: the last token the main model produced, which the drafter takes as the starting point for its guesses.
 - **Argmax**: the position of the largest value in a list; here, the ID of the highest-scoring token.
 - **Associativity (floating point)**: the property that (a × b) × c equals a × (b × c); it holds for real numbers but not for floating-point arithmetic, where each operation rounds.
@@ -3965,6 +4234,8 @@ Alphabetical. Later entries extend this list.
 - **Cache sector**: the unit in which the cache fetches data from memory, here 32 bytes; touching one byte brings in its whole sector.
 - **Calibration (of a probability estimate)**: adjusting an estimated probability so that it matches how often the event really happens; here, learning from verified drafts how often a draft of a given kind is accepted.
 - **Cancel flag**: a value shared between two threads that one sets to ask the other to stop a piece of work; the other checks it at points where stopping is safe.
+- **Candidate (in a two-stage search)**: an item that the cheap first stage could not rule out, so that the exact second stage has to score it; here a token whose approximate logit plus its error bound reaches the threshold.
+- **Cauchy–Schwarz inequality**: the size of a dot product is at most the product of the lengths of its two vectors, |a·b| ≤ |a| × |b|; it bounds a dot product without computing it.
 - **Causality (attention mask)**: the rule that a token may attend only to itself and earlier positions, never to later ones; the mask is whatever enforces it, here probability 0 for slots that are not visible.
 - **Ceiling**: the best speed the hardware could reach in theory for a workload.
 - **Channel (thread communication)**: a queue through which one thread sends values to another, so the two need not share memory; sending fails once the receiving side is gone.
@@ -4005,8 +4276,10 @@ Alphabetical. Later entries extend this list.
 - **E2M1**: a 4-bit floating-point format with 1 sign bit, 2 exponent bits and 1 mantissa bit; its values are 0, 0.5, 1, 1.5, 2, 3, 4 and 6, positive or negative.
 - **E4M3**: an 8-bit floating-point format with 1 sign bit, 4 exponent bits and 3 mantissa bits; the value format of MXFP8.
 - **Embeddings**: the table that turns each token ID into its starting vector.
+- **Error bound (rigorous)**: a number that the difference between an approximate and an exact value is proved never to exceed, as opposed to an estimate of how large the difference usually is; only a proved bound allows results to be ruled out without loss.
 - **Expected gain / marginal cost**: the expected gain of an action is what it yields on average, here the probability that a draft ends up producing a token; its marginal cost is what one more unit adds to the total, here the time of one more row in the step.
 - **Expert**: one of the alternative MLPs in a mixture-of-experts layer.
+- **Fall-back path**: the slower, simpler way a program takes when its fast way cannot handle a case, here the full head after the candidate list has overflowed; normal inputs rarely reach it, so it needs a test that forces it.
 - **FFI (foreign function interface) / bindings**: the declarations that let one language (here Rust) call functions compiled from another (here CUDA C++).
 - **FLOPS / TFLOPS**: floating-point operations per second; TFLOPS is 10¹² of them.
 - **FMA / fused multiply-add and contraction**: an FMA computes a × b + c in one instruction with a single rounding; contraction is the compiler replacing a separate multiply and add by an FMA, which can change the last bit of the result.
@@ -4029,6 +4302,7 @@ Alphabetical. Later entries extend this list.
 - **Head-of-line blocking**: one large piece of work at the front holding up everything behind it, here a long prompt delaying every other conversation's next token.
 - **Headroom (of a ring buffer)**: the slots a ring buffer has beyond the entries that must stay readable; they decide how many new entries may be written before anything is read (here 128 slots beyond a window of 1,024 positions).
 - **Hidden size**: the length of the vector that represents one token inside the model (2304 here).
+- **Hidden state (final)**: the vector of 2,304 values that a row has after the last layer, which the output head turns into logits.
 - **High-water mark**: the highest value a growing quantity has ever reached; here the highest position ever written in a slot's ring buffers, rejected drafts included.
 - **Host**: the CPU side of the program.
 - **Host overhead**: CPU time per token spent between GPU steps.
@@ -4052,6 +4326,7 @@ Alphabetical. Later entries extend this list.
 - **Loop**: running a block of stored layers more than once per token (here layers 6 to 17, 3 times).
 - **Loop unrolling**: a compiler optimisation that replaces a loop of known length with its iterations written out one after another, which lets each array element get its own register.
 - **Lossy vs lossless optimisation**: a lossless optimisation leaves the model's output (or its output distribution) unchanged; a lossy one changes it a little in exchange for speed and needs a quality measurement.
+- **Low-rank approximation**: replacing a large matrix by the product of two much smaller ones, which is cheaper to apply and is exact only for the part of the matrix that the smaller ones can represent.
 - **LRU cache**: a cache of fixed size that, when full, drops the entry that has gone unused the longest ("least recently used").
 - **Mean vs median vs percentile (p90)**: the mean is the sum of the samples divided by their number, the median is the middle sample, and the 90th percentile (p90) is the value that 90% of the samples do not exceed.
 - **Median**: the middle value of a set of samples.
@@ -4071,6 +4346,7 @@ Alphabetical. Later entries extend this list.
 - **Negative result**: an experiment showing that an idea does not help; worth recording so that it is not repeated blind.
 - **Noise floor (of a metric)**: the amount a metric moves under changes that should not matter; a difference smaller than that cannot be attributed to the thing being tested.
 - **Noncharacter (Unicode)**: a code that the Unicode standard reserves for a program's internal use and that is not meant to appear in text exchanged between programs; here U+FDD0 marks where the prompt is cut.
+- **Norm (of a vector)**: its length, the square root of the sum of the squares of its elements; written |x| here.
 - **Nucleus sampling (`top_p`)**: sampling only among the most likely tokens, the smallest set whose probabilities add up to p.
 - **Numerically chaotic**: tiny differences in arithmetic grow into visibly different outputs.
 - **nvcc**: the CUDA compiler.
@@ -4108,6 +4384,7 @@ Alphabetical. Later entries extend this list.
 - **Regression test**: a check that is re-run after every change to make sure behaviour that used to be correct still is.
 - **Rejection sampling (speculative)**: the rule that keeps a draft token with a probability set by the full model and otherwise draws a replacement from what is left of the full model's distribution, so the output is distributed exactly as without speculation.
 - **Relative position bias**: a learned amount added to an attention score that depends only on how many tokens apart the two tokens are.
+- **Resident set size (RSS)**: the part of a process's memory that is in physical RAM at the moment, as the operating system reports it; it includes memory that the program has freed and its allocator has kept.
 - **Residual stream**: in an ordinary transformer, the single running vector per token that every layer reads and adds its output to.
 - **Rewind (of a run)**: setting a conversation's position back to its first rejected draft, so that the next step overwrites the rejected rows; the state stored for the positions before that point must still be intact.
 - **Ring buffer**: a fixed-size array written in a circle, so the newest entry overwrites the oldest.
@@ -4131,6 +4408,7 @@ Alphabetical. Later entries extend this list.
 - **Slot (conversation slot)**: one of a fixed number of places for a conversation in the engine, each with its own caches and histories; a request occupies one from its first prompt token to its last output token.
 - **Snapshot (of ring buffers)**: a copy of a slot's ring buffers taken at a known position, so the slot can later be put back to that position.
 - **Soak test**: a long run under realistic, varied load, meant to find problems that build up over time, such as memory that is never released.
+- **Soft cap (of logits)**: the function 30 × tanh(x / 30), applied to every logit before tokens are compared; it changes small values little and keeps every value below 30 in size.
 - **Softmax**: the function that turns a list of scores into positive weights that sum to 1; attention uses it to turn the scores of the visible keys into the weights of its weighted sum of values.
 - **Spec**: a written, exact description of what a program must compute.
 - **Special token**: a token that marks structure rather than text, such as the start of a message.
@@ -4152,6 +4430,7 @@ Alphabetical. Later entries extend this list.
 - **Tensor**: an array of numbers with a shape.
 - **Tensor core**: a hardware unit in NVIDIA GPUs that multiplies small matrices in one instruction.
 - **Throughput work vs latency work**: throughput work is judged by how much completes per second and gains from large batches (prefill); latency work is judged by how soon one result arrives and gains from short steps (single-token decoding).
+- **Tie rule (tie-breaking)**: the rule that decides between items with exactly equal scores, here "the lower token id"; two implementations that must agree need the same one, and it must not depend on the order in which the items are visited.
 - **Tile**: the piece of a weight matrix one tensor-core instruction consumes, here 16 rows × 32 bytes = 512 bytes.
 - **Tile of rows**: the group of rows of a step that the matrix kernels handle together (8, 16, 32 or 64 here); the first row beyond a full group moves the step to the next size and adds far more time than a row inside a group.
 - **Time-slicing (GPU)**: the GPU serving several programs by switching between them in short turns, so each one waits while another has its turn.
@@ -4164,7 +4443,9 @@ Alphabetical. Later entries extend this list.
 - **Transposed layout**: storing a matrix with rows and columns swapped; here the value cache has dimensions as rows and keys as columns, the orientation the value product needs.
 - **Trigram index**: a table from every run of three consecutive tokens (a trigram) to the place where that run last occurred, used to find an earlier passage that ends in the same tokens.
 - **Triton**: a Python-based language for writing GPU kernels.
+- **Two-stage output head (filter and refine)**: finding each row's winning token by a cheap approximate pass over all tokens, which together with an error bound rules most of them out, followed by an exact computation for the rest; the result is the full head's.
 - **Underflow (floating point)**: a result too close to zero for the number format to represent, which is silently replaced by 0.
+- **Unembedding matrix**: the output head's matrix, with one row per token; the dot product of a token's row with a hidden state is that token's logit.
 - **Unit scale (quantisation)**: storing values in a low-bit format directly, with no scale factor, which works when the values are already bounded to a range the format covers.
 - **UTF-8**: the standard text encoding, in which one character takes 1 to 4 bytes; a token may end partway through a character.
 - **Verify step**: the forward pass of the full model in speculative decoding that processes the anchor token and the draft tokens together and shows which drafts the model agrees with.
