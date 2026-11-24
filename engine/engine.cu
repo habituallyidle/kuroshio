@@ -703,6 +703,108 @@ __device__ __forceinline__ bool slot_position(int slot, int p, int is_global, in
     int delta = ((p % RING) - slot + RING) % RING;          // the newest position stored in this ring slot is p - delta
     *dist = delta; return delta < EXT && p - delta >= 0;
 }
+// =====================================================================================================
+// Attention for groups of rows. A tensor-core operation takes 8 columns; one row's three query heads fill three of
+// them, and every row used to read all the keys (and values) of its conversation for itself: 128 rows of a prompt
+// step read the same 2.4 MB of ring 128 times per layer visit. Rows of one conversation see the same keys, so a
+// block now takes up to 8 consecutive rows: their 24 (row, query head) pairs are the columns of three operations
+// per key tile, and the keys are read once for all of them. Which row may see which slot is decided per element
+// afterwards, as before. Each score and each output value is produced by the same chain of operations over the
+// same operands as with one row per block, so results are the same bit for bit.
+// A step's rows are cut into groups at every 8th row and wherever a conversation's run begins (Grp); gb[k] is the
+// index of the first group at or after row 16 k, so that a launch over a sub-batch finds its groups.
+// =====================================================================================================
+struct Grp { int t0, n; };
+__global__ void k_attn_scores_g(const float* qc, const float* bias, const uint8_t* Kt, const Row* rows, const Grp* grp, const int* gb, int gi0, int gi1,
+                                int is_global, int ngroups, float* scratch, int smax, int t0, int kv8, size_t kvstride) {
+    __shared__ uint2 sq[3][8][32];                        // queries as tensor-core operands: [column set][slice][lane]
+    int gy = blockIdx.y / HKV, j = blockIdx.y % HKV, tid = threadIdx.x, lane = tid & 31, qq = lane & 3, g = lane >> 2;
+    int gbeg = gb[gi0]; if (gbeg + gy >= gb[gi1]) return;
+    const Grp gr = grp[gbeg + gy]; const int tf = gr.t0, n = gr.n, p0 = rows[tf].pos;
+    Kt += (size_t)rows[tf].seq * kvstride;
+    for (int e = tid; e < 3 * 8 * 32; e += 256) {
+        int cs = e >> 8, ds = (e >> 5) & 7, ln = e & 31, c = cs * 8 + (ln >> 2), ti = c / 3, hh = c - ti * 3; uint2 v = make_uint2(0, 0);
+        if (ti < n) { const float* x = qc + ((size_t)(tf + ti) * H + 3 * j + hh) * DH + ds * 16 + 2 * (ln & 3); v = make_uint2(pack_bf16(x[0], x[1]), pack_bf16(x[8], x[9])); }
+        sq[cs][ds][ln] = v;
+    }
+    __syncthreads();
+    int G = blockIdx.x * 8 + (tid >> 5);
+    if (G >= ngroups) return;
+    const bool dark = is_global && G * 16 > p0 + n - 1;  // keys past every row of the group: masked, and their memory may not be attached
+    uint4 w[8];
+    if (!dark) {
+        if (kv8) { const uint64_t* k8 = (const uint64_t*)(Kt + (((size_t)G * HKV + j) * 8) * 256 + lane * 8); for (int ds = 0; ds < 8; ds++) w[ds] = tile8_to_bf16(k8[(size_t)ds * 32]); }
+        else { const uint4* kt = (const uint4*)(Kt + (((size_t)G * HKV + j) * 8) * 512 + lane * 16); for (int ds = 0; ds < 8; ds++) w[ds] = kt[(size_t)ds * 32]; }
+    }
+    for (int cs = 0; cs < 3; cs++) {
+        if (cs * 8 >= n * 3) break;
+        float d[4] = {0, 0, 0, 0};
+        if (!dark) for (int ds = 0; ds < 8; ds++) { uint2 b = sq[cs][ds][lane]; mma_bf16(d, w[ds].x, w[ds].y, w[ds].z, w[ds].w, b.x, b.y); }
+        for (int i = 0; i < 4; i++) {                         // this lane holds keys g, g+8 and columns 2qq, 2qq+1 of the set
+            int c = cs * 8 + 2 * qq + (i & 1), ti = c / 3, hh = c - ti * 3; if (ti >= n) continue;
+            int t = tf + ti, p = p0 + ti, slot = G * 16 + g + (i >> 1) * 8, h = 3 * j + hh, dist;
+            bool ok = !(is_global && G * 16 > p) && slot_position(slot, p, is_global, &dist);
+            scratch[((size_t)(t - t0) * H + h) * smax + slot] = ok ? d[i] * 0.08838834764831845f + (dist < EXT ? bias[((size_t)t * H + h) * EXT + dist] : 0.0f) : -FLT_MAX;
+        }
+    }
+}
+// As k_attn_soft; also writes P as bf16 in the order the value kernel's operand takes it (pk: [row][slot'], 2 bytes
+// each): within a group of 16 slots, slot r sits at (r % 8) / 2 * 4 + r / 8 * 2 + (r & 1), so that one 8-byte load
+// is a thread's operand.
+__global__ void k_attn_soft_g(float* scratch, int smax, int nslots, float* lstat, int t0, uint16_t* pk) {
+    __shared__ float sm[32];
+    int t = t0 + blockIdx.x, h = blockIdx.y, tid = threadIdx.x; float* sc = scratch + ((size_t)blockIdx.x * H + h) * smax; uint16_t* pr = pk + ((size_t)blockIdx.x * H + h) * smax;
+    float mx = -FLT_MAX; for (int i = tid; i < nslots; i += 1024) mx = fmaxf(mx, sc[i]);
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    if ((tid & 31) == 0) sm[tid >> 5] = mx;
+    __syncthreads();
+    float m = sm[0]; for (int w = 1; w < 32; w++) m = fmaxf(m, sm[w]);
+    __syncthreads();
+    float l = 0;
+    for (int i = tid; i < nslots; i += 1024) {
+        float x = sc[i], P = x == -FLT_MAX ? 0.0f : expf(x - m); l += P;
+        int r = i & 15; pr[(i & ~15) + ((r & 7) >> 1) * 4 + (r >> 3) * 2 + (r & 1)] = (uint16_t)(__float_as_uint(bf16r(P)) >> 16);
+    }
+    l = wsum(l); if ((tid & 31) == 0) sm[tid >> 5] = l;
+    __syncthreads();
+    if (tid == 0) { float ls = 0; for (int w = 0; w < 32; w++) ls += sm[w]; lstat[((size_t)t * H + h) * 2] = ls; lstat[((size_t)t * H + h) * 2 + 1] = m + logf(ls); }
+}
+// As k_attn_pv, for a group of rows: one block per (group, KV head, 16 dims); the value tiles are read once for the
+// group's rows. A row for which a key group lies past its own position has P = 0 there: the operation adds zeros.
+template <int NW> __global__ void k_attn_pv_g(const uint16_t* PK, int smax, const uint8_t* Vt, int ngroups, const float* lstat, const float* proj, float* y, int strided, int t0, int kv8,
+                                              const Row* rows, size_t kvstride, const Grp* grp, const int* gb, int gi0, int gi1) {
+    __shared__ float sh[NW][32][4];
+    int dg = blockIdx.x, gy = blockIdx.y / HKV, j = blockIdx.y % HKV, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, qq = lane & 3, g = lane >> 2;
+    int gbeg = gb[gi0]; if (gbeg + gy >= gb[gi1]) return;
+    const Grp gr = grp[gbeg + gy]; const int tf = gr.t0, n = gr.n;
+    Vt += (size_t)rows[tf].seq * kvstride;
+    const int gmax = strided ? (rows[tf].pos + n - 1) / 16 : ngroups, ncs = (n * 3 + 7) / 8;      // column sets in use
+    int kseg = (ngroups + NW - 1) / NW, g0 = warp * kseg;
+    const uint2* pr[3];                                   // this thread's column in each set: (row, query head) -> its packed P
+    for (int cs = 0; cs < 3; cs++) { int c = cs * 8 + g, ti = c / 3, hh = c - ti * 3; pr[cs] = ti < n ? (const uint2*)(PK + ((size_t)(tf + ti - t0) * H + 3 * j + hh) * smax) : nullptr; }
+    float d[3][4]; for (int cs = 0; cs < 3; cs++) for (int i = 0; i < 4; i++) d[cs][i] = 0;
+    for (int it = 0; it < kseg; it++) {
+        int G = strided ? warp + NW * it : g0 + it; bool live = G < ngroups && G <= gmax;
+        uint4 w = !live ? make_uint4(0, 0, 0, 0) : kv8 ? tile8_to_bf16(*(const uint64_t*)(Vt + ((((size_t)G * HKV + j) * 8 + dg) * 256) + lane * 8))
+                                                       : *(const uint4*)(Vt + ((((size_t)G * HKV + j) * 8 + dg) * 512) + lane * 16);
+        for (int cs = 0; cs < ncs; cs++) {
+            uint2 b = live && pr[cs] ? pr[cs][G * 4 + qq] : make_uint2(0, 0);
+            mma_bf16(d[cs], w.x, w.y, w.z, w.w, b.x, b.y);
+        }
+    }
+    for (int cs = 0; cs < ncs; cs++) {
+        for (int i = 0; i < 4; i++) sh[warp][lane][i] = d[cs][i];
+        __syncthreads();
+        if (warp == 0) for (int i = 0; i < 4; i++) {          // this lane holds dims g, g+8 of the group and columns 2qq, 2qq+1 of the set
+            int c = cs * 8 + 2 * qq + (i & 1), ti = c / 3, hh = c - ti * 3; if (ti >= n) continue;
+            int t = tf + ti, dim = dg * 16 + g + (i >> 1) * 8, h = 3 * j + hh; const float* pj = proj + (size_t)t * QKVR;
+            float v = 0; for (int w2 = 0; w2 < NW; w2++) v += sh[w2][lane][i];
+            float ls = lstat[((size_t)t * H + h) * 2], lse = lstat[((size_t)t * H + h) * 2 + 1];
+            y[(size_t)t * (H * DH) + h * DH + dim] = bf16r((v / ls) * sigmoidf(pj[R_GATE + h * DH + dim]) * sigmoidf(lse - pj[R_SINK + h]));
+        }
+        __syncthreads();
+    }
+}
 // t0: first token handled by this launch; scratch rows are relative to it (the scratch holds one sub-batch).
 __global__ void k_attn_scores(const float* qc, const float* bias, const uint8_t* Kt, const Row* rows, int is_global, int ngroups, float* scratch, int smax, int t0, int kv8, size_t kvstride) {
     __shared__ float q[3][DH];
@@ -1589,6 +1691,7 @@ void gemm_fp8(const Fp8Mat& f, int C, int T, const uint8_t* xcode, const uint8_t
 // packing pays (INK_PACK_MIN to experiment; a large value turns it off).
 const int XPK_C = 4608;
 static uint2* g_xpk[3];
+static int g_attn_group = getenv("INK_ATTN_GROUP") ? atoi(getenv("INK_ATTN_GROUP")) : 16;   // rows from which attention runs in groups of 8 (at most GSUB)
 static int g_pack_min = getenv("INK_PACK_MIN") ? atoi(getenv("INK_PACK_MIN")) : 9;
 static int g_bulk_min = getenv("INK_BULK_MIN") ? atoi(getenv("INK_BULK_MIN")) : 9;    // from here on: k_gemm_bf16_bulk (a large value: the older packed kernel)
 void gemv_scratch() {
@@ -1745,6 +1848,7 @@ struct Engine {
     float *stack[5], *prelude_partial, *bank[2], *prelude_dests, *inputs, *msg, *xin, *proj, *dk, *dv, *qc, *bias, *att_sc, *att_l, *att_y,
           *attn_raw, *attn_out, *mixtmp, *pair, *hbuf, *gx, *mlp_in, *rlogit, *gamma, *xq, *xamax, *gu, *act, *aq, *aamax, *down, *moe_out, *y, *out, *logits;
     int *tok, *ids, *arg, *tasks, *ntasks; Row* rows;      // rows: per-row conversation and position of the current step
+    Grp* grp = nullptr; int* gb = nullptr;                 // the step's row groups for attention (see k_attn_scores_g)
     uint8_t* snap = nullptr; size_t snap_bytes = 0; bool vis_global[NVIS] = {}, snap_ok[MAXSEQ] = {}; int last_T = 0;   // prefix-cache snapshots: [conversations][snap_bytes]
     int* qrow = nullptr; float* rowz = nullptr; ResPart* rparts = nullptr;   // per row: index of the sampled draft it verifies (-1: none); normaliser of p; scratch
     VRange vK[NVIS][MAXSEQ], vV[NVIS][MAXSEQ], vdK[MAXSEQ], vdV[MAXSEQ], vsc;   // on-demand ranges: per global visit and conversation; drafter; score scratch
@@ -1770,7 +1874,7 @@ struct Engine {
     } dr;
     float* feats;                                        // DSpark taps of the last forward: [4 taps][TMAX][D]
     uint8_t *xcode, *xscale, *acode, *ascale, *xcode8, *acode8;
-    cudaGraphExec_t graph[TMAX + 1][24][3] = {};             // per batch size, context bucket (1024 << b), and output head: none / full / two-stage
+    cudaGraphExec_t graph[TMAX + 1][24][3][2] = {};             // per batch size, context bucket (1024 << b), and output head: none / full / two-stage
     // two-stage head: per token |u - u~| and |u|; per row bounds, approximate winners, thresholds; candidate blocks and their exact logits
     float *h_eu = nullptr, *h_un = nullptr, *h_hb = nullptr, *h_pv = nullptr, *h_thr = nullptr, *h_ex1 = nullptr, *h_ex2 = nullptr;
     int *h_pi = nullptr, *h_win = nullptr, *h_l1 = nullptr, *h_l2 = nullptr, *h_cnt = nullptr;
@@ -1968,7 +2072,7 @@ int ink_ensure(void* ep, int seq, int tokens) {
     if (tokens <= e->ctx_mapped[seq]) return 0;
     size_t kvt = (size_t)HKV * DH * (e->kv8 ? 1 : 2), dkt = (size_t)HKV * DH * 2;   // bytes per token: one cache of a full-attention visit; drafter
     int bucket = 1024; while (bucket < tokens) bucket *= 2;
-    size_t sc = vround(std::max((size_t)HMAX * H * RING, (size_t)GSUB * H * std::min(bucket, e->max_ctx)) * 4);
+    size_t sc = vround(std::max((size_t)HMAX * H * RING, (size_t)GSUB * H * std::min(bucket, e->max_ctx)) * 6);
     size_t add = sc > e->vsc.mapped ? sc - e->vsc.mapped : 0;
     for (int v = 0; v < NVIS; v++) if (e->vis_global[v]) add += 2 * ((size_t)tokens * kvt - std::min(e->vK[v][seq].mapped, (size_t)tokens * kvt));
     if (d.on) add += 2 * ((size_t)tokens * dkt - std::min(e->vdK[seq].mapped, (size_t)tokens * dkt));
@@ -2000,7 +2104,7 @@ void ink_trim(void* ep, int seq, int tokens) {
     if ((int)left < e->snap_tokens[seq]) e->snap_ok[seq] = false;          // the snapshot's prefix is gone
     int most = 0; for (int q = 0; q < e->nseq; q++) most = std::max(most, e->ctx_mapped[q]);
     int bucket = 1024; while (bucket < most) bucket *= 2;                  // the score scratch follows the longest conversation left
-    e->vsc.shrink(std::max((size_t)HMAX * H * RING, most ? (size_t)GSUB * H * std::min(bucket, e->max_ctx) : 0) * 4);
+    e->vsc.shrink(std::max((size_t)HMAX * H * RING, most ? (size_t)GSUB * H * std::min(bucket, e->max_ctx) : 0) * 6);
 }
 
 // Free memory on the GPU right now, in bytes (used to size the context before loading).
@@ -2240,8 +2344,10 @@ void ink_finalize(void* ep) {
     e->inputs = dalloc(T * 3 * D); e->msg = dalloc(T * 4 * D); e->xin = dalloc(T * 3 * D); e->proj = dalloc(T * QKVR);
     e->dk = dalloc(T * 32); e->dv = dalloc(T * 32); e->qc = dalloc(T * H * DH); e->bias = dalloc(T * H * EXT);
     // Score scratch: T x H x RING for the sliding-window layers; GSUB x H x (context bucket) for full attention, attached on demand.
-    e->vsc.reserved = vround(std::max((size_t)HMAX * H * RING, (size_t)GSUB * H * (size_t)e->max_ctx) * 4); e->vsc.base = vreserve(e->vsc.reserved);
-    if (!e->vsc.grow((size_t)HMAX * H * RING * 4)) { fprintf(stderr, "out of GPU memory for the score scratch\n"); abort(); }
+    // scores as fp32 and, behind them, the probabilities again as bf16 operands: 4 + 2 bytes per (row, head, slot)
+    e->vsc.reserved = vround(std::max((size_t)HMAX * H * RING, (size_t)GSUB * H * (size_t)e->max_ctx) * 6); e->vsc.base = vreserve(e->vsc.reserved);
+    if (!e->vsc.grow((size_t)HMAX * H * RING * 6)) { fprintf(stderr, "out of GPU memory for the score scratch\n"); abort(); }
+    CK(cudaMalloc(&e->grp, TMAX * sizeof(Grp))); CK(cudaMalloc(&e->gb, (TMAX / 16 + 2) * 4));
     e->att_sc = (float*)e->vsc.base; e->att_l = dalloc(T * H * 2); e->att_y = dalloc(T * H * DH); e->attn_raw = dalloc(T * D); e->attn_out = dalloc(T * D);
     e->mixtmp = dalloc(T * D); e->pair = dalloc(T * 3 * 2 * D); e->hbuf = dalloc(T * 192); e->gx = dalloc(T * 3 * D); e->mlp_in = dalloc(T * D); e->rlogit = dalloc(T * NE); e->gamma = dalloc(T * TOPK); e->xq = dalloc(T * D);
     e->xamax = dalloc(T); e->gu = dalloc(T * TOPK * D); e->act = dalloc(T * TOPK * I2); e->aq = dalloc(T * TOPK * I2); e->aamax = dalloc(T * TOPK);
@@ -2313,7 +2419,9 @@ static void head_two_stage(Engine* e, int T) {
 }
 
 // hm: the output head to run - 0 none, 1 full, 2 two-stage.
-static void forward_body(Engine* e, int T, int gchunks, int hm) {
+// cls: 0 if every run of the step begins at a row that is a multiple of 8 (then a sub-batch of n rows has exactly
+// ceil(n / 8) attention groups), 1 otherwise (up to n).
+static void forward_body(Engine* e, int T, int gchunks, int hm, int cls) {
     // Prefetch plan (fractions of each matrix), tunable for experiments: INK_PF_WO=f, INK_PF_Q=a,b,c,d (cumulative).
     static const size_t WO_BYTES = (size_t)(D / 16) * (H * DH / 16) * 512, QKVR_BYTES_BF16 = (size_t)(410 + 64 + 64) * (D / 16) * 512;
     static double pf_wo = getenv("INK_PF_WO") ? atof(getenv("INK_PF_WO")) : 0.0, pf_q[4] = {0.1, 0.2, 0.3, 0.4};
@@ -2382,15 +2490,33 @@ static void forward_body(Engine* e, int T, int gchunks, int hm) {
                                                                    e->ring[visit][1], L.kconv, L.vconv, e->dk, e->dv, e->Kc[visit], e->Vc[visit], e->kv8, kvs, h0);
                 prof("attn q/r/kv prep");
                 int ng = L.global ? gchunks * 2 : RING / 16, ns = ng * 16;      // scores, softmax, value sum on the tensor cores
-                if (!L.global) {
-                    k_attn_scores<<<dim3((ng + 7) / 8, hn * HKV), 256, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[visit], e->rows, 0, ng, e->att_sc, RING, h0, e->kv8, kvs);
-                    k_attn_soft<<<dim3(hn, H), 1024, 0, g_stream>>>(e->att_sc, RING, ns, e->att_l, h0);
-                    k_attn_pv<8><<<dim3(8, hn * HKV), 256, 0, g_stream>>>(e->att_sc, RING, (const uint8_t*)e->Vc[visit], ng, e->att_l, e->proj, e->att_y, 0, h0, e->kv8, e->rows, kvs);
-                } else for (int t0 = h0; t0 < h0 + hn; t0 += GSUB) {   // full-attention layers: GSUB tokens at a time, so the scratch stays small
-                    int tn = std::min(GSUB, h0 + hn - t0);
-                    k_attn_scores<<<dim3((ng + 7) / 8, tn * HKV), 256, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[visit], e->rows, 1, ng, e->att_sc, gchunks * 32, t0, e->kv8, kvs);
-                    k_attn_soft<<<dim3(tn, H), 1024, 0, g_stream>>>(e->att_sc, gchunks * 32, ns, e->att_l, t0);
-                    k_attn_pv<32><<<dim3(8, tn * HKV), 1024, 0, g_stream>>>(e->att_sc, gchunks * 32, (const uint8_t*)e->Vc[visit], ng, e->att_l, e->proj, e->att_y, 1, t0, e->kv8, e->rows, kvs);
+                if (T < g_attn_group && T <= GSUB) {     // few rows: one block per row keeps more of the GPU busy
+                    if (!L.global) {
+                        k_attn_scores<<<dim3((ng + 7) / 8, hn * HKV), 256, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[visit], e->rows, 0, ng, e->att_sc, RING, h0, e->kv8, kvs);
+                        k_attn_soft<<<dim3(hn, H), 1024, 0, g_stream>>>(e->att_sc, RING, ns, e->att_l, h0);
+                        k_attn_pv<8><<<dim3(8, hn * HKV), 256, 0, g_stream>>>(e->att_sc, RING, (const uint8_t*)e->Vc[visit], ng, e->att_l, e->proj, e->att_y, 0, h0, e->kv8, e->rows, kvs);
+                    } else {
+                        k_attn_scores<<<dim3((ng + 7) / 8, hn * HKV), 256, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[visit], e->rows, 1, ng, e->att_sc, gchunks * 32, h0, e->kv8, kvs);
+                        k_attn_soft<<<dim3(hn, H), 1024, 0, g_stream>>>(e->att_sc, gchunks * 32, ns, e->att_l, h0);
+                        k_attn_pv<32><<<dim3(8, hn * HKV), 1024, 0, g_stream>>>(e->att_sc, gchunks * 32, (const uint8_t*)e->Vc[visit], ng, e->att_l, e->proj, e->att_y, 1, h0, e->kv8, e->rows, kvs);
+                    }
+                } else {
+                    auto ngr = [&](int n) { return cls ? n : (n + 7) / 8; };          // most groups among n rows: the grid's height
+                    if (!L.global) {
+                        uint16_t* pk = (uint16_t*)(e->att_sc + (size_t)HMAX * H * RING);
+                        k_attn_scores_g<<<dim3((ng + 7) / 8, ngr(hn) * HKV), 256, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[visit], e->rows, e->grp, e->gb, h0 / 16, (h0 + hn + 15) / 16,
+                                                                                             0, ng, e->att_sc, RING, h0, e->kv8, kvs);
+                        k_attn_soft_g<<<dim3(hn, H), 1024, 0, g_stream>>>(e->att_sc, RING, ns, e->att_l, h0, pk);
+                        k_attn_pv_g<8><<<dim3(8, ngr(hn) * HKV), 256, 0, g_stream>>>(pk, RING, (const uint8_t*)e->Vc[visit], ng, e->att_l, e->proj, e->att_y, 0, h0, e->kv8, e->rows, kvs,
+                                                                                    e->grp, e->gb, h0 / 16, (h0 + hn + 15) / 16);
+                    } else for (int t0 = h0; t0 < h0 + hn; t0 += GSUB) {   // full-attention layers: GSUB tokens at a time, so the scratch stays small
+                        int tn = std::min(GSUB, h0 + hn - t0); uint16_t* pk = (uint16_t*)(e->att_sc + (size_t)GSUB * H * gchunks * 32);
+                        k_attn_scores_g<<<dim3((ng + 7) / 8, ngr(tn) * HKV), 256, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[visit], e->rows, e->grp, e->gb, t0 / 16, t0 / 16 + 1,
+                                                                                             1, ng, e->att_sc, gchunks * 32, t0, e->kv8, kvs);
+                        k_attn_soft_g<<<dim3(tn, H), 1024, 0, g_stream>>>(e->att_sc, gchunks * 32, ns, e->att_l, t0, pk);
+                        k_attn_pv_g<32><<<dim3(8, ngr(tn) * HKV), 1024, 0, g_stream>>>(pk, gchunks * 32, (const uint8_t*)e->Vc[visit], ng, e->att_l, e->proj, e->att_y, 1, t0, e->kv8, e->rows, kvs,
+                                                                                      e->grp, e->gb, t0 / 16, t0 / 16 + 1);
+                    }
                 }
                 prof("attn core");
             }
@@ -2503,6 +2629,16 @@ int ink_step(void* ep, int T, const int* tokens, const int* seqs, const int* pos
     }
     CK(cudaMemcpyAsync(e->tok, tokens, T * 4, cudaMemcpyHostToDevice, g_stream));
     CK(cudaMemcpyAsync(e->rows, rows.data(), T * sizeof(Row), cudaMemcpyHostToDevice, g_stream));
+    // Attention groups: up to 8 consecutive rows of one conversation, cut at every 8th row and at every run start.
+    Grp grp[TMAX]; int gb[TMAX / 16 + 2], ngrp = 0, cls = 0;
+    for (int t = 0; t < T; t++) {
+        if (t % 16 == 0) gb[t / 16] = ngrp;
+        if (t % 8 == 0 || rows[t].run0 == t) { grp[ngrp++] = Grp{t, 0}; if (t % 8) cls = 1; }
+        grp[ngrp - 1].n++;
+    }
+    for (int k = (T + 15) / 16; k < TMAX / 16 + 2; k++) gb[k] = ngrp;
+    CK(cudaMemcpyAsync(e->grp, grp, ngrp * sizeof(Grp), cudaMemcpyHostToDevice, g_stream));
+    CK(cudaMemcpyAsync(e->gb, gb, sizeof(gb), cudaMemcpyHostToDevice, g_stream));
     CK(cudaMemcpyAsync(e->excl, xq, (TMAX + T) * 4, cudaMemcpyHostToDevice, g_stream));
     float sp[2 * TMAX];
     for (int t = 0; t < T; t++) { float tp = temps ? temps[t] : e->def_temp; unsigned sd = seeds ? seeds[t] : e->def_seed; sp[2 * t] = tp > 0 ? 1.0f / tp : 0.0f; memcpy(&sp[2 * t + 1], &sd, 4); }
@@ -2515,8 +2651,8 @@ int ink_step(void* ep, int T, const int* tokens, const int* seqs, const int* pos
     bool head = want_head != 0 || logits_out != nullptr;
     // want_head 2: the caller only needs each row's argmax and sample, so the two-stage head will do.
     int hm = !head ? 0 : (want_head == 2 && !logits_out && e->head2 && T <= FAST_T) ? 2 : 1;
-    if (g_prof || e->trace || no_graph) forward_body(e, T, gchunks, hm);
-    else run_graphed(&e->graph[T][bkt][hm], [&] { forward_body(e, T, gchunks, hm); });
+    if (g_prof || e->trace || no_graph) forward_body(e, T, gchunks, hm, cls);
+    else run_graphed(&e->graph[T][bkt][hm][cls], [&] { forward_body(e, T, gchunks, hm, cls); });
     CK(cudaStreamSynchronize(g_stream));
     CK(cudaGetLastError());                              // a kernel that failed to launch must stop us, not hand back garbage
     prof("head+copy");
@@ -2728,9 +2864,16 @@ void ink_microbench(void* ep, int T) {
     if (e->fp8_head) mbench("  fp8: output head gemm", 461.0, [&](int) { gemm_fp8(e->f_head, D, T, e->tq, e->ts, e->logits, 0, V0); });
     mbench("attn prep (q/r/bias + kv conv)", 0, [&](int r) { int i = r % 5; Layer& L = e->L[i];
         k_attn_prep<<<dim3(T, H + HKV), 1024, 0, g_stream>>>(e->proj, L.qscale, L.rscale, L.rel, 0, e->rows, e->qc, e->bias, e->ring[i][0], e->ring[i][1], L.kconv, L.vconv, e->dk, e->dv, e->Kc[i], e->Vc[i], e->kv8, e->kv_local, 0); });
-    mbench("attn scores (local, tensor cores)", 0, [&](int r) { int i = r % 5; k_attn_scores<<<dim3(9, T * HKV), 256, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[i], e->rows, 0, RING / 16, e->att_sc, RING, 0, e->kv8, e->kv_local); });
-    mbench("attn softmax (local)", 0, [&](int) { k_attn_soft<<<dim3(T, H), 1024, 0, g_stream>>>(e->att_sc, RING, RING, e->att_l, 0); });
-    mbench("attn value sum + gate (local)", 0, [&](int r) { int i = r % 5; k_attn_pv<8><<<dim3(8, T * HKV), 256, 0, g_stream>>>(e->att_sc, RING, (const uint8_t*)e->Vc[i], RING / 16, e->att_l, e->proj, e->att_y, 0, 0, e->kv8, e->rows, e->kv_local); });
+    {   // the rows as one run: groups of 8
+        Grp grp[TMAX]; int gb[TMAX / 16 + 2], n = 0;
+        for (int t = 0; t < T; t++) { if (t % 16 == 0) gb[t / 16] = n; if (t % 8 == 0) grp[n++] = Grp{t, 0}; grp[n - 1].n++; }
+        for (int k = (T + 15) / 16; k < TMAX / 16 + 2; k++) gb[k] = n;
+        CK(cudaMemcpy(e->grp, grp, n * sizeof(Grp), cudaMemcpyHostToDevice)); CK(cudaMemcpy(e->gb, gb, sizeof(gb), cudaMemcpyHostToDevice));
+    }
+    uint16_t* mpk = (uint16_t*)(e->att_sc + (size_t)HMAX * H * RING);
+    mbench("attn scores (local, tensor cores)", 0, [&](int r) { int i = r % 5; k_attn_scores_g<<<dim3(9, (T + 7) / 8 * HKV), 256, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[i], e->rows, e->grp, e->gb, 0, (T + 15) / 16, 0, RING / 16, e->att_sc, RING, 0, e->kv8, e->kv_local); });
+    mbench("attn softmax (local)", 0, [&](int) { k_attn_soft_g<<<dim3(T, H), 1024, 0, g_stream>>>(e->att_sc, RING, RING, e->att_l, 0, mpk); });
+    mbench("attn value sum + gate (local)", 0, [&](int r) { int i = r % 5; k_attn_pv_g<8><<<dim3(8, (T + 7) / 8 * HKV), 256, 0, g_stream>>>(mpk, RING, (const uint8_t*)e->Vc[i], RING / 16, e->att_l, e->proj, e->att_y, 0, 0, e->kv8, e->rows, e->kv_local, e->grp, e->gb, 0, (T + 15) / 16); });
     if (!e->fp8_attn) mbench("wo gemm (2304x3072 bf16)", 14.2, [&](int r) { Layer& L = e->L[r % 24]; gemv(D, T, L.wo, H * DH, T, e->att_y, e->att_y, e->att_y, H * DH, D, D, e->attn_raw, D, 1); });
     mbench("post-attn (conv + mix)", 0, [&](int r) { int i = r % 24; Layer& L = e->L[i]; PostAttn pa{}; pa.attn_raw = e->attn_raw; pa.ring = e->ring[vis(i)][2]; pa.w = L.attn_sconv; pa.rows = e->rows;
         pa.attn_out = e->attn_out; pa.ns = 2; pa.src[0] = e->stack[0]; pa.src[1] = e->stack[1]; pa.partial = e->stack[2]; pa.q = e->mlp_q[i]; pa.norm = L.mlp_norm; pa.out = e->mlp_in; pa.pf = PF{nullptr, 0, T}; launch_post_attn(T, pa); });

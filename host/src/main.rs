@@ -175,7 +175,7 @@ fn vram_base(slots: usize) -> usize {
 /// key and a value of 8 x 128 numbers, plus the attention score scratch (which grows in powers of two).
 fn vram_per_token() -> usize {
     let on = |k: &str| std::env::var(k).is_ok();
-    (if on("INK_KV_FP8") { 16384 } else { 32768 }) + if on("INK_NO_DRAFT") { 0 } else { 4096 } + 3072
+    (if on("INK_KV_FP8") { 16384 } else { 32768 }) + if on("INK_NO_DRAFT") { 0 } else { 4096 } + 4608
 }
 
 fn weights_dir() -> Result<PathBuf> {
