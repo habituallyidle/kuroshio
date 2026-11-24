@@ -1105,15 +1105,15 @@ template <int W, int UNV> __global__ void k_attn_pv_l(const uint2* PL, const uin
 //   to e^FSLACK cost no precision in floating point). exp is the hardware's approximate instruction. The sum of a
 //   row's probabilities comes from the tensor cores too (a multiplication by ones).
 //   What a row gets depends on that row alone: keys are taken in chunks that start at fixed keys, each row moves its
-//   own reference, and masked keys add exact zeros. So prompt steps of any size give the same bits (as each other,
-//   not as the exact kernels).
-//   k_attn_fused_part  block = (16 rows, KV head, chunk of keys), one warp per head; writes per lane its two
+//   own reference, and masked keys add exact zeros. So prompt steps of one conversation give the same bits whatever
+//   their size (as each other, not as the exact kernels).
+//   k_attn_fused_part  a warp = (16 rows, head, chunk of keys), FW x 3 of them in a block; writes per lane its two
 //                      references, two sums and 64 partial outputs (FPW floats).
 //   k_attn_fused_fin   brings a (16 rows, head)'s chunks to one scale, adds them and writes the attention output.
 // Rows must be one conversation at consecutive positions (`one` in ink_step). A step here and the same rows in a
 // decode step agree to rounding, not to the bit.
 // =====================================================================================================
-const int FPW = 68;
+const int FPW = 68, FW = 2;                               // floats per lane of a partial result; blocks of 16 rows per kernel block
 const float FSLACK = 16.0f, FSCALE = 0.08838834764831845f, LOG2E = 1.4426950408889634f;
 __device__ __forceinline__ float fexp_scale(float m, float M) { return m > -FLT_MAX ? expf(m - M) : 0.0f; }
 // Two instructions of the newer tensor-core generations: 2^x in one approximate instruction, and two floats rounded
@@ -1124,7 +1124,11 @@ __device__ __forceinline__ uint32_t pack_bf16n(float lo, float hi) { uint32_t r;
 // same keys and values at the same time, and all but the first find them in the multiprocessor's cache. (One warp
 // per block and 8 blocks per multiprocessor measured slower than 6 warps that share: what limits these kernels is
 // bringing keys and values to the multiprocessor.) t0, tn: the sub-batch's rows; ngroups: key tiles; fch: key tiles per chunk.
-template <int AHEAD, int FW> __global__ void k_attn_fused_part(const float* qc, const float* bias, const uint8_t* Kt, const uint8_t* Vt, const Row* rows, int t0, int tn,
+// A warp alone runs slowly whatever it does (a multiprocessor is fast only with many warps), and these warps are heavy
+// (64 accumulators each, 168 registers: 12 warps per multiprocessor). So the loop is kept short: tiles far behind
+// every row (most of a long context) take a path without masks or position bias. Loading the next tile's keys
+// before computing this one's scores made a lone warp faster but cost registers, i.e. warps, and measured the same.
+__global__ void k_attn_fused_part(const float* qc, const float* bias, const uint8_t* Kt, const uint8_t* Vt, const Row* rows, int t0, int tn,
                                   int is_global, int ngroups, int fch, float* part, int kv8, size_t kvstride) {
     __shared__ uint4 sq[FW * 3][8][32];
     const int j = blockIdx.x % HKV, ch = blockIdx.y, lane = threadIdx.x & 31, w = threadIdx.x >> 5, rb = blockIdx.x / HKV * FW + w / 3, h = 3 * j + w % 3, qq = lane & 3, g = lane >> 2;
@@ -1150,26 +1154,11 @@ template <int AHEAD, int FW> __global__ void k_attn_fused_part(const float* qc, 
     float m[2] = {-FLT_MAX, -FLT_MAX}, m2[2] = {-FLT_MAX, -FLT_MAX}, thr[2] = {-FLT_MAX, -FLT_MAX}, l[4] = {0, 0, 0, 0}, o[16][4];
     #pragma unroll
     for (int k = 0; k < 16; k++) for (int i = 0; i < 4; i++) o[k][i] = 0;
-    #define FUSED_LOAD(dst, base, G_, u0, un) { const size_t kb_ = ((size_t)(G_) * HKV + j) * 8 + u0; \
-        for (int u = 0; u < un; u++) dst[u] = kv8 ? tile8_to_bf16(*(const uint64_t*)(base + (kb_ + u) * 256 + lane * 8)) : *(const uint4*)(base + (kb_ + u) * 512 + lane * 16); }
-    uint4 kt[8];
-    if (AHEAD) {
-        #pragma unroll
-        FUSED_LOAD(kt, Kt, G0, 0, 8)
-    }
     for (int G = G0; G < G1; G++) {
-        uint4 kn[8], vt[8];
-        if (AHEAD == 2) {
-            #pragma unroll
-            FUSED_LOAD(vt, Vt, G, 0, 8)
-        }
-        if (AHEAD) {
-            #pragma unroll
-            FUSED_LOAD(kn, Kt, min(G + 1, G1 - 1), 0, 8)
-        } else {
-            #pragma unroll
-            FUSED_LOAD(kt, Kt, G, 0, 8)
-        }
+        const size_t kb = ((size_t)G * HKV + j) * 8;
+        uint4 kt[8];
+        #pragma unroll
+        for (int u = 0; u < 8; u++) kt[u] = kv8 ? tile8_to_bf16(*(const uint64_t*)(Kt + (kb + u) * 256 + lane * 8)) : *(const uint4*)(Kt + (kb + u) * 512 + lane * 16);
         const bool far = is_global && G * 16 + 15 + EXT <= p0;      // every key visible to every row, and beyond the position bias
         float bv[8]; bool ok[8];
         if (!far) {
@@ -1221,24 +1210,15 @@ template <int AHEAD, int FW> __global__ void k_attn_fused_part(const float* qc, 
         // value sums use, so the rounding of a dominant key cancels in the division (the exact path gets this for free:
         // its largest probability is exactly 1), and every lane of the row holds the whole sum.
         mma_bf16(l, a0, a1, a2, a3, 0x3F803F80u, 0x3F803F80u);
-        if (AHEAD == 2) {
+        #pragma unroll
+        for (int h4 = 0; h4 < 2; h4++) {                  // values: four tiles of 16 dims at a time
+            uint4 vt[4];
             #pragma unroll
-            for (int u = 0; u < 8; u++) { mma_bf16(o[u * 2], a0, a1, a2, a3, vt[u].x, vt[u].z); mma_bf16(o[u * 2 + 1], a0, a1, a2, a3, vt[u].y, vt[u].w); }
-        } else {
+            for (int u = 0; u < 4; u++) vt[u] = kv8 ? tile8_to_bf16(*(const uint64_t*)(Vt + (kb + h4 * 4 + u) * 256 + lane * 8)) : *(const uint4*)(Vt + (kb + h4 * 4 + u) * 512 + lane * 16);
             #pragma unroll
-            for (int h4 = 0; h4 < 2; h4++) {
-                #pragma unroll
-                FUSED_LOAD(vt, Vt, G, h4 * 4, 4)
-                #pragma unroll
-                for (int u = 0; u < 4; u++) { mma_bf16(o[(h4 * 4 + u) * 2], a0, a1, a2, a3, vt[u].x, vt[u].z); mma_bf16(o[(h4 * 4 + u) * 2 + 1], a0, a1, a2, a3, vt[u].y, vt[u].w); }
-            }
-        }
-        if (AHEAD) {
-            #pragma unroll
-            for (int u = 0; u < 8; u++) kt[u] = kn[u];
+            for (int u = 0; u < 4; u++) { mma_bf16(o[(h4 * 4 + u) * 2], a0, a1, a2, a3, vt[u].x, vt[u].z); mma_bf16(o[(h4 * 4 + u) * 2 + 1], a0, a1, a2, a3, vt[u].y, vt[u].w); }
         }
     }
-    #undef FUSED_LOAD
     float* out = part + (((size_t)rb * H + h) * gridDim.y + ch) * (FPW * 32) + lane;
     out[0] = m[0]; out[32] = m[1]; out[64] = l[0]; out[96] = l[2];
     #pragma unroll
@@ -2222,17 +2202,12 @@ static inline int prep_threads(int n) { return n <= 4 ? 1024 : n <= 16 ? 512 : n
 // --exact-prompts / INK_EXACT_PROMPTS turns them off).
 static bool fast_allowed() { static const bool v = getenv("INK_EXACT_PROMPTS") == nullptr; return v; }   // read at the first step (the host sets it from --exact-prompts)
 static bool g_fast = false;
-const int FA = 0, FW = 2;
-static const bool g_fused = getenv("INK_NO_FUSED") == nullptr;   // experiment switch: the fused attention kernels of the fast path
-static const bool g_fgate = getenv("INK_NO_FGATE") == nullptr;   // experiment switch: the tensor-core gate of the fast path
 // Key tiles per chunk of the fused attention: 12 of the sliding window's 72, and 64 (1,024 keys) in full attention.
 // Fixed numbers, and chunks start at fixed keys, on purpose: together with the kernel's row-by-row arithmetic this
-// makes what the fast path computes for a row independent of the step the row is in.
-// (The partial results of a sub-batch, 8.7 KB per row block, head and chunk, fit the score scratch at every context.)
-static inline int fused_chunk(int is_global, int ng) {
-    static const int lc = getenv("INK_FUSED_LOCAL") ? std::max(1, atoi(getenv("INK_FUSED_LOCAL"))) : 12, gc = getenv("INK_FUSED_CHUNK") ? std::max(1, atoi(getenv("INK_FUSED_CHUNK"))) : 64;
-    return is_global ? gc : lc;
-}
+// makes what the fast path computes for a row independent of the step the row is in. The partial results of a
+// sub-batch (8.7 KB per block of 16 rows, head and chunk) fit the score scratch at every context with these sizes:
+// 10 MB of at least 40 for the sliding window, 1,632 bytes per key of at least 2,304 in full attention.
+static inline int fused_chunk(int is_global) { return is_global ? 64 : 12; }
 static int g_xwide = getenv("INK_XWIDE") ? atoi(getenv("INK_XWIDE")) : 48;          // rows from which experts run as wide tasks
 static int g_pack_min = getenv("INK_PACK_MIN") ? atoi(getenv("INK_PACK_MIN")) : 9;
 static int g_bulk_min = getenv("INK_BULK_MIN") ? atoi(getenv("INK_BULK_MIN")) : 9;    // from here on: k_gemm_bf16_bulk (a large value: the older packed kernel)
@@ -2571,19 +2546,27 @@ template <class F> void mbench(const char* name, double mb, F launch) {
 // the fallback below must work exactly when there is none left. (Runs before main; CUDA reads it at its first call.)
 static const int g_eager_loading = setenv("CUDA_MODULE_LOADING", "EAGER", 0);
 const int GRAPH_CAP = 48;
+const size_t GRAPH_BYTES = (size_t)260 << 20;            // recorded graphs are dropped, least recently used first, beyond this much GPU memory
+const size_t GRAPH_NODE_BYTES = 3500;                      // measured: 2.6-3.4 KB of GPU memory per launch in a recorded graph
+const int GRAPH_MAX_ROWS = 512;                           // bigger steps run their kernels directly: a graph of 1,024 rows takes 20 MiB and saves nothing measurable
 struct GraphCache {
-    struct Ent { cudaGraphExec_t* slot; uint64_t used; };
-    std::vector<Ent> ents; uint64_t tick = 0; bool warned = false;
+    struct Ent { cudaGraphExec_t* slot; uint64_t used; size_t bytes; };
+    std::vector<Ent> ents; uint64_t tick = 0; bool warned = false; size_t held = 0;
     void touch(cudaGraphExec_t* slot) { for (auto& x : ents) if (x.slot == slot) { x.used = ++tick; return; } }
     void evict(size_t keep) {
         while (ents.size() > keep) {
             size_t lru = 0; for (size_t i = 1; i < ents.size(); i++) if (ents[i].used < ents[lru].used) lru = i;
-            cudaGraphExecDestroy(*ents[lru].slot); *ents[lru].slot = nullptr; ents.erase(ents.begin() + lru);
+            cudaGraphExecDestroy(*ents[lru].slot); *ents[lru].slot = nullptr; held -= ents[lru].bytes; ents.erase(ents.begin() + lru);
         }
     }
     bool add(cudaGraphExec_t* slot, cudaGraph_t g) {
         static const int cap = getenv("INK_GRAPH_CAP") ? std::max(1, atoi(getenv("INK_GRAPH_CAP"))) : GRAPH_CAP;
         evict(cap - 1);
+        // A graph of a small step takes 3-5 MiB, one of a 512-row prompt step about 10: the cache is also bounded in
+        // bytes, so that it stays inside the room the host leaves it. A graph's size is estimated from its number of
+        // launches (the free memory an instantiation takes says nothing once CUDA reuses what evicted graphs held).
+        while (held > GRAPH_BYTES && !ents.empty()) evict(ents.size() - 1);
+        size_t nodes = 0; cudaGraphGetNodes(g, nullptr, &nodes);
         cudaError_t err = cudaGraphInstantiate(slot, g, 0);
         if (err != cudaSuccess) { cudaGetLastError(); evict(0); err = cudaGraphInstantiate(slot, g, 0); }
         if (err != cudaSuccess) {
@@ -2591,9 +2574,11 @@ struct GraphCache {
             if (!warned) { fprintf(stderr, "warning: no GPU memory left to record a step graph (%s); running without it. Lower --ctx to leave some room.\n", cudaGetErrorString(err)); warned = true; }
             return false;
         }
+        const size_t bytes = nodes * GRAPH_NODE_BYTES;
+        ents.push_back({slot, ++tick, bytes}); held += bytes;
         static const bool log = getenv("INK_GRAPH_LOG") != nullptr;   // debugging: how often are step graphs recorded?
-        if (log) fprintf(stderr, "graph: recorded (%zu held)\n", ents.size() + 1);
-        ents.push_back({slot, ++tick}); return true;
+        if (log) fprintf(stderr, "graph: recorded (%zu held, about %zu MiB; this one %zu launches)\n", ents.size(), held >> 20, nodes);
+        return true;
     }
 } g_graphs;
 // Run `body` (a sequence of kernel launches on g_stream) through its recorded graph, recording it on first use.
@@ -3025,7 +3010,7 @@ static void forward_body(Engine* e, int T, int gchunks, int hm, int cls, bool on
                 int ds = Q * D, doff = Q == 3 ? D : 0;
                 k_pair3<<<dim3(T, 3), NT, 0, g_stream>>>(e->inputs, ds, doff, e->msg, e->pair);
                 gemv(192, T, L.ctl3_down, 2 * D, T, e->pair, e->pair + 2 * D, e->pair + 4 * D, 6 * D, 64, 128, e->hbuf, 192, 1);
-                if (g_fast && g_fgate) k_gate3_fast<<<dim3(D / (8 * GCT), 3), 256, 0, g_stream>>>(e->hbuf, L.ctl3_gain, L.ctl3_forget, e->inputs, ds, doff, e->msg, e->gx, T);
+                if (g_fast) k_gate3_fast<<<dim3(D / (8 * GCT), 3), 256, 0, g_stream>>>(e->hbuf, L.ctl3_gain, L.ctl3_forget, e->inputs, ds, doff, e->msg, e->gx, T);
                 else if (T >= GATE_BIG) k_gate3_big<<<dim3(D / 8, 3), 256, 0, g_stream>>>(e->hbuf, L.ctl3_gain, L.ctl3_forget, e->inputs, ds, doff, e->msg, e->gx, T);
                 else k_gate3<<<dim3(D / 8, T * 3), 256, 0, g_stream>>>(e->hbuf, L.ctl3_gain, L.ctl3_forget, e->inputs, ds, doff, e->msg, e->gx);
                 k_rms3<<<dim3(T, 3), NT, 0, g_stream>>>(e->gx, L.in_norm, L.global ? D : 0, e->xin);
@@ -3061,9 +3046,9 @@ static void forward_body(Engine* e, int T, int gchunks, int hm, int cls, bool on
                                                                    e->ring[visit][1], L.kconv, L.vconv, e->dk, e->dv, e->Kc[visit], e->Vc[visit], e->kv8, kvs, h0);
                 prof("attn q/r/kv prep");
                 int ng = L.global ? gchunks * 2 : RING / 16, ns = ng * 16;      // scores, softmax, value sum on the tensor cores
-                if (g_fast && g_fused && one) {                  // prompt-only step of one conversation: fused attention, nothing written but the result
-                    const int nrb = (hn + 15) / 16, fch = fused_chunk(L.global, ng), nch = (ng + fch - 1) / fch;
-                    k_attn_fused_part<FA, FW><<<dim3((nrb + FW - 1) / FW * HKV, nch), FW * 96, 0, g_stream>>>(e->qc, bias, (const uint8_t*)e->Kc[visit], (const uint8_t*)e->Vc[visit], e->rows, h0, hn,
+                if (g_fast && one) {                  // prompt-only step of one conversation: fused attention, nothing written but the result
+                    const int nrb = (hn + 15) / 16, fch = fused_chunk(L.global), nch = (ng + fch - 1) / fch;
+                    k_attn_fused_part<<<dim3((nrb + FW - 1) / FW * HKV, nch), FW * 96, 0, g_stream>>>(e->qc, bias, (const uint8_t*)e->Kc[visit], (const uint8_t*)e->Vc[visit], e->rows, h0, hn,
                                                                                  L.global, ng, fch, e->att_sc, e->kv8, kvs);
                     k_attn_fused_fin<<<nrb * HKV, 768, 0, g_stream>>>(e->att_sc, nch, fch, e->proj, e->att_y, e->rows, h0, hn, L.global, ng);
                 } else
@@ -3247,8 +3232,8 @@ int ink_step(void* ep, int T, const int* tokens, const int* seqs, const int* pos
     g_fast = fast_allowed() && hm == 0;                  // a step nobody reads predictions from: the fast prompt kernels
     // one: the step is one conversation at consecutive positions (what the fused attention of the fast prompt path takes)
     const bool one = rows[0].run0 == 0 && rows[0].runlen >= T;
-    if (g_prof || e->trace || no_graph) forward_body(e, T, gchunks, hm, cls, one);
-    else run_graphed(&e->graph[T][bkt][hm][one ? 2 : cls], [&] { forward_body(e, T, gchunks, hm, cls, one); });
+    if (g_prof || e->trace || no_graph || T > GRAPH_MAX_ROWS) forward_body(e, T, gchunks, hm, cls, one);
+    else run_graphed(&e->graph[T][bkt][hm][g_fast && one ? 2 : cls], [&] { forward_body(e, T, gchunks, hm, cls, one); });
     g_fast = false;
     CK(cudaStreamSynchronize(g_stream));
     CK(cudaGetLastError());                              // a kernel that failed to launch must stop us, not hand back garbage
@@ -3477,9 +3462,9 @@ void ink_microbench(void* ep, int T) {
             double mx = 0, big = 0, sq = 0, sn = 0; for (size_t i = 0; i < ya.size(); i++) { mx = std::max(mx, (double)fabsf(ya[i] - yb[i])); big = std::max(big, (double)fabsf(ya[i])); sq += (double)(ya[i] - yb[i]) * (ya[i] - yb[i]); sn += (double)ya[i] * ya[i]; }
             printf("  %s: fused against exact: largest difference %.3g (largest value %.3g), relative error %.3g\n", what, mx, big, sqrt(sq / std::max(sn, 1e-30)));
         };
-        const int lfch = fused_chunk(0, RING / 16), lnch = (RING / 16 + lfch - 1) / lfch, nrb = (T + 15) / 16;
+        const int lfch = fused_chunk(0), lnch = (RING / 16 + lfch - 1) / lfch, nrb = (T + 15) / 16;
         auto fused_local = [&](int i) {
-            k_attn_fused_part<FA, FW><<<dim3((nrb + FW - 1) / FW * HKV, lnch), FW * 96, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[i], (const uint8_t*)e->Vc[i], e->rows, 0, T, 0, RING / 16, lfch, e->att_sc, e->kv8, e->kv_local);
+            k_attn_fused_part<<<dim3((nrb + FW - 1) / FW * HKV, lnch), FW * 96, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[i], (const uint8_t*)e->Vc[i], e->rows, 0, T, 0, RING / 16, lfch, e->att_sc, e->kv8, e->kv_local);
             k_attn_fused_fin<<<nrb * HKV, 768, 0, g_stream>>>(e->att_sc, lnch, lfch, e->proj, e->att_y, e->rows, 0, T, 0, RING / 16); };
         mbench("fused attention, sliding window", 0, [&](int r) { fused_local(r % 5); });
         local_attention(e, e->bias, 0, e->kv_local, 0, T, (T + 7) / 8, mpl, 0, (T + 15) / 16); CK(cudaStreamSynchronize(g_stream)); CK(cudaMemcpy(ya.data(), e->att_y, ya.size() * 4, cudaMemcpyDeviceToHost));
@@ -3497,9 +3482,9 @@ void ink_microbench(void* ep, int T) {
         mbench("full attention: values", 0, [&](int) { k_attn_pv_gl<32><<<dim3(8, 2 * HKV), 1024, 0, g_stream>>>((const uint2*)pk, gch * 32, (const uint8_t*)e->Vc[gv], ng, e->att_l, e->proj, e->att_y, 0, e->kv8, e->rows, e->kv_global, e->grp, e->gb, 0, 1); });
         std::vector<float> ya((size_t)16 * H * DH), yb(ya.size());
         CK(cudaStreamSynchronize(g_stream)); CK(cudaMemcpy(ya.data(), e->att_y, ya.size() * 4, cudaMemcpyDeviceToHost));
-        const int fch = fused_chunk(1, ng), nch = (ng + fch - 1) / fch; float* part = e->att_sc;     // (the exact kernels' scores are no longer needed)
+        const int fch = fused_chunk(1), nch = (ng + fch - 1) / fch; float* part = e->att_sc;     // (the exact kernels' scores are no longer needed)
         auto fused = [&](int rows16) {
-            k_attn_fused_part<FA, FW><<<dim3((rows16 / 16 + FW - 1) / FW * HKV, nch), FW * 96, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[gv], (const uint8_t*)e->Vc[gv], e->rows, 0, rows16, 1, ng, fch, part, e->kv8, e->kv_global);
+            k_attn_fused_part<<<dim3((rows16 / 16 + FW - 1) / FW * HKV, nch), FW * 96, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[gv], (const uint8_t*)e->Vc[gv], e->rows, 0, rows16, 1, ng, fch, part, e->kv8, e->kv_global);
             k_attn_fused_fin<<<rows16 / 16 * HKV, 768, 0, g_stream>>>(part, nch, fch, e->proj, e->att_y, e->rows, 0, rows16, 1, ng); };
         mbench("fused attention, full (16 rows)", 0, [&](int) { fused(16); });
         CK(cudaStreamSynchronize(g_stream)); CK(cudaMemcpy(yb.data(), e->att_y, yb.size() * 4, cudaMemcpyDeviceToHost));

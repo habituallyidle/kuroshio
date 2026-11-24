@@ -578,6 +578,18 @@ fn main() -> Result<()> {
                 }
                 println!("round {round}: host memory {:.0} MiB, GPU memory used by graphs {:.0} MiB", rss(), (f0 as f64 - engine::vram_free() as f64) / 1048576.0);
             }
+            // INK_GM_PROMPT=1: prompt-only steps of 12 sizes up to PMAX instead (their graphs are the biggest)
+            if std::env::var("INK_GM_PROMPT").is_ok() {
+                let toks: Vec<u32> = (0..engine::PMAX as u32).map(|i| 1000 + i).collect();
+                for k in 0..12 {
+                    let t = engine::PMAX - k * 61;
+                    eng.reset();
+                    let rows: Vec<(usize, usize, u32)> = (0..t).map(|i| (0, i, toks[i])).collect();
+                    eng.step_rows(&rows, None, false);
+                    println!("prompt step of {t} rows: graphs so far {:6.1} MiB", (f0 as f64 - engine::vram_free() as f64) / 1048576.0);
+                }
+                return Ok(());
+            }
             for t in 1..=engine::TMAX {
                 let first = run(&mut eng, t);
                 let second = run(&mut eng, t);

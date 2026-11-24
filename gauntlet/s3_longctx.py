@@ -16,6 +16,10 @@ CACHED_SHARE_MIN = 0.98
 # terms (README: "follow-up turns answer in milliseconds"; restoring the snapshot of a 100K-token document and
 # reading the new question is allowed some time).
 CACHED_TTFT_MAX_S = 1.5
+# A follow-up costs about 50 ms whatever the document (rendering and tokenising the prompt, restoring the snapshot, one
+# step for the new question). A 4K-token document is now read uncached in half a second, so a tenth of that is no
+# longer a meaningful bound: below this floor the answer counts as coming from the cache.
+CACHED_TTFT_FLOOR_S = 0.1
 CACHED_TTFT_MAX_RATIO = 0.1
 # Room for the answer: a six-digit code, plus the thinking the model does even at reasoning_effort "none".
 ANSWER_MAX_TOKENS = 800
@@ -76,7 +80,7 @@ def needles(st, ctx):
                          f"cached {c.cached_tokens} of {c.prompt_tokens}", repro(how, "cached_tokens near 0 for a new document", str(c.usage)))
             else:
                 share = (c.cached_tokens or 0) / c.prompt_tokens
-                lim = max(0.05, min(CACHED_TTFT_MAX_S, CACHED_TTFT_MAX_RATIO * (first.ttft if first and first.ttft else CACHED_TTFT_MAX_S)))
+                lim = max(CACHED_TTFT_FLOOR_S, min(CACHED_TTFT_MAX_S, CACHED_TTFT_MAX_RATIO * (first.ttft if first and first.ttft else CACHED_TTFT_MAX_S)))
                 if qi == 1:
                     st.num(f"{label}: time to first token, cached follow-up", round(c.ttft * 1000), "ms", head=(si == len(sizes) - 1))
                 st.check(f"{label}: follow-up question {qi + 1} is answered from the cache",
