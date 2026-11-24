@@ -340,16 +340,16 @@ impl Speculation {
     /// Step time in ms by number of rows, output head included, as measured on an RTX 5090 at short context
     /// (`INK_STEP_FAST=1 kuroshio steptime` with INK_STEP_T: steps as the server runs them, the two-stage head up to
     /// 32 rows; linear between the points). Not smooth: the matrix kernels work on
-    /// groups of 8 rows; the 9th row costs more than its neighbours (a second group, and inputs are packed from
-    /// there on), so do the 57th (7 and 8 groups run a slower loop) and the 65th (a second launch).
+    /// groups of 8 rows; the 9th, 17th, 33rd and 65th rows cost more than their neighbours (another group of columns,
+    /// other kernels, a second chunk of 64).
     fn rows_ms(rows: usize) -> f32 {
         const PTS: [(f32, f32); 47] = [
-            (1.0, 5.88), (2.0, 6.73), (3.0, 7.48), (4.0, 8.08), (5.0, 8.75), (6.0, 9.31), (7.0, 9.93), (8.0, 10.46),
-            (9.0, 11.25), (10.0, 11.80), (11.0, 12.28), (12.0, 12.65), (13.0, 12.98), (14.0, 13.49), (15.0, 13.91), (16.0, 14.45),
-            (17.0, 15.08), (18.0, 15.39), (19.0, 15.85), (20.0, 16.08), (21.0, 16.37), (22.0, 16.92), (23.0, 17.15), (24.0, 17.42),
-            (25.0, 18.21), (26.0, 18.41), (27.0, 18.90), (28.0, 19.17), (29.0, 19.61), (30.0, 19.93), (31.0, 20.35), (32.0, 20.66),
-            (33.0, 21.71), (34.0, 22.11), (40.0, 24.41), (41.0, 24.65), (48.0, 27.14), (49.0, 27.81), (56.0, 30.15), (57.0, 32.46),
-            (64.0, 34.92), (65.0, 36.84), (72.0, 39.58), (80.0, 42.16), (96.0, 47.91), (112.0, 52.36), (128.0, 60.22),
+            (1.0, 5.90), (2.0, 6.77), (3.0, 7.54), (4.0, 8.22), (5.0, 8.90), (6.0, 9.43), (7.0, 10.03), (8.0, 10.46),
+            (9.0, 11.18), (10.0, 11.69), (11.0, 12.11), (12.0, 12.46), (13.0, 12.81), (14.0, 13.50), (15.0, 13.90), (16.0, 14.29),
+            (17.0, 15.09), (18.0, 15.35), (19.0, 15.71), (20.0, 15.87), (21.0, 16.03), (22.0, 16.42), (23.0, 16.69), (24.0, 16.88),
+            (25.0, 17.05), (26.0, 17.26), (27.0, 17.54), (28.0, 17.69), (29.0, 18.00), (30.0, 18.10), (31.0, 18.37), (32.0, 18.39),
+            (33.0, 19.18), (34.0, 19.37), (40.0, 20.87), (41.0, 21.06), (48.0, 23.25), (49.0, 24.04), (56.0, 24.80), (57.0, 24.95),
+            (64.0, 25.71), (65.0, 27.64), (72.0, 29.02), (80.0, 30.28), (96.0, 32.55), (112.0, 34.63), (128.0, 36.11),
         ];
         let r = (rows.max(1) as f32).min(128.0);
         let i = PTS.iter().position(|p| p.0 >= r).unwrap_or(PTS.len() - 1).max(1);
@@ -397,8 +397,8 @@ impl Speculation {
             }
         }
         cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)); // stable: a conversation's drafts stay in order
-        // A prompt token counts for the time it would take alone, relative to an output token: 84 ms / 256 against 5.9 ms.
-        const PROMPT_TOKEN: f32 = 0.056;
+        // A prompt token counts for the time it would take alone, relative to an output token: 146 ms / 1,024 against 5.9 ms.
+        const PROMPT_TOKEN: f32 = 0.024;
         // Take the best n rows, for the n that gives the most tokens per millisecond. (Not "add rows while they pay":
         // step time jumps at tile boundaries, and the rows after a jump can be worth it together when the first is not.)
         let base = base_rows.max(1);
@@ -1613,9 +1613,9 @@ mod tests {
 
     #[test]
     fn step_time_table_is_monotonic() {
-        assert_eq!(Speculation::rows_ms(1), 5.88);
-        assert_eq!(Speculation::rows_ms(128), 60.22);
-        assert!((Speculation::rows_ms(36) - 22.877).abs() < 0.01); // between the points at 34 and 40
+        assert_eq!(Speculation::rows_ms(1), 5.90);
+        assert_eq!(Speculation::rows_ms(128), 36.11);
+        assert!((Speculation::rows_ms(36) - 19.87).abs() < 0.01); // between the points at 34 and 40
         assert!((2..=128).all(|r| Speculation::rows_ms(r) > Speculation::rows_ms(r - 1)));
     }
 }

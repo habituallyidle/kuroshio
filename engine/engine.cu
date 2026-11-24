@@ -28,7 +28,7 @@ cudaStream_t g_stream = nullptr;
 const int D = 2304, H = 24, HKV = 8, DH = 128, DR = 16, EXT = 1024, NE = 128, TOPK = 8, I2 = 1152;
 const int V0 = 200058, NVIS = 48, TMAX = 1024;              // TMAX: most rows of one step (a prompt batch)
 const int HMAX = 128;                                     // most rows of a step that uses the output head (decoding); also the size of an attention
-                                                          // sub-batch: a bigger step runs its attention in halves (see forward_body)
+                                                          // sub-batch: a bigger step runs its attention in several sub-batches (see forward_body)
 const int QKVR = 8600;                                   // rows of the fused q|r|gate|sink|k|v projection
 const int R_Q = 0, R_R = 3072, R_GATE = 3456, R_SINK = 6528, R_K = 6552, R_V = 7576;
 const int RING = 1152;                                   // local KV ring: window 1024 + batch headroom
@@ -38,7 +38,9 @@ const int GSUB = 16;                                      // rows per launch in 
 // At shorter context the same scratch holds more rows, and a step then needs fewer launches: 128 rows up to 4K tokens of
 // context, 64 at 8K, 32 at 16K, 16 beyond. ctx: the context bucket (a power of two, or the largest context).
 static inline int gsub_rows(size_t ctx) { int r = 128; while (r > GSUB && (size_t)r * ctx > (size_t)128 * 4096) r /= 2; return r; }
-static inline size_t gsub_bytes(size_t ctx) { return (size_t)gsub_rows(ctx) * 24 * ctx * 6; }
+// Scratch for contexts up to ctx. Not just gsub_rows(ctx) rows of ctx: a shorter conversation takes more rows at a
+// time, and between two powers of two the product dips (128 rows x 4,096 is more than 16 rows x 30,720).
+static inline size_t gsub_bytes(size_t ctx) { return std::max((size_t)gsub_rows(ctx) * ctx, (size_t)gsub_rows(std::min<size_t>(ctx, 4096)) * std::min<size_t>(ctx, 4096)) * 24 * 6; }
 const int CR = 40;                                        // conv-input history kept between calls, indexed by position mod CR. Lags inside a batch are
                                                           // read from the batch itself. Runs of up to CR - 3 tokens store every token in the kernel that
                                                           // computes it (no slot is read and written in one launch); longer runs store their last CR - 3
@@ -1088,6 +1090,187 @@ template <int W, int UNV> __global__ void k_attn_pv_l(const uint2* PL, const uin
         }
     }
 }
+// =====================================================================================================
+// Fused attention for prompt-only steps (the fast prompt path: not bit-identical to the kernels above, see g_fast).
+// The exact kernels write every score to memory, read it back twice for the softmax, write the probabilities and
+// read those back for the value sum: 16 bytes of traffic per (row, head, key), and three launches per sub-batch.
+// Here a warp takes 16 rows of one head through a run of keys with everything in registers.
+//   Scores: the queries are the tensor cores' A operand (16 rows x 16 dims) and a key tile, stored as [key][dim], serves
+//   as two B operands (keys 0-7 and 8-15) with the registers it already has. The results land as
+//   [row g, g+8][key 2q, 2q+1] and [row g, g+8][key 8+2q, 9+2q] in lane (g, q): exactly the registers an A operand
+//   [row][key] wants. So the probabilities go straight into the value multiplication (value tile [dim][key] as two B
+//   operands, dims 0-7 and 8-15): nothing is exchanged between lanes and nothing touches memory.
+//   Softmax: streaming. Probabilities are taken relative to a reference score per row, and what has been summed is
+//   scaled down when a score exceeds the reference by more than FSLACK (rare after the first tile, and probabilities up
+//   to e^FSLACK cost no precision in floating point). exp is the hardware's approximate instruction. The sum of a
+//   row's probabilities comes from the tensor cores too (a multiplication by ones).
+//   What a row gets depends on that row alone: keys are taken in chunks that start at fixed keys, each row moves its
+//   own reference, and masked keys add exact zeros. So prompt steps of any size give the same bits (as each other,
+//   not as the exact kernels).
+//   k_attn_fused_part  block = (16 rows, KV head, chunk of keys), one warp per head; writes per lane its two
+//                      references, two sums and 64 partial outputs (FPW floats).
+//   k_attn_fused_fin   brings a (16 rows, head)'s chunks to one scale, adds them and writes the attention output.
+// Rows must be one conversation at consecutive positions (`one` in ink_step). A step here and the same rows in a
+// decode step agree to rounding, not to the bit.
+// =====================================================================================================
+const int FPW = 68;
+const float FSLACK = 16.0f, FSCALE = 0.08838834764831845f, LOG2E = 1.4426950408889634f;
+__device__ __forceinline__ float fexp_scale(float m, float M) { return m > -FLT_MAX ? expf(m - M) : 0.0f; }
+// Two instructions of the newer tensor-core generations: 2^x in one approximate instruction, and two floats rounded
+// (to nearest even) and packed as bf16 in one.
+__device__ __forceinline__ float ex2f(float x) { float r; asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x)); return r; }
+__device__ __forceinline__ uint32_t pack_bf16n(float lo, float hi) { uint32_t r; asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo)); return r; }
+// Grid: (groups of FW blocks of 16 rows x HKV, chunks); a warp per (16 rows, head), so FW * 3 warps: they read the
+// same keys and values at the same time, and all but the first find them in the multiprocessor's cache. (One warp
+// per block and 8 blocks per multiprocessor measured slower than 6 warps that share: what limits these kernels is
+// bringing keys and values to the multiprocessor.) t0, tn: the sub-batch's rows; ngroups: key tiles; fch: key tiles per chunk.
+template <int AHEAD, int FW> __global__ void k_attn_fused_part(const float* qc, const float* bias, const uint8_t* Kt, const uint8_t* Vt, const Row* rows, int t0, int tn,
+                                  int is_global, int ngroups, int fch, float* part, int kv8, size_t kvstride) {
+    __shared__ uint4 sq[FW * 3][8][32];
+    const int j = blockIdx.x % HKV, ch = blockIdx.y, lane = threadIdx.x & 31, w = threadIdx.x >> 5, rb = blockIdx.x / HKV * FW + w / 3, h = 3 * j + w % 3, qq = lane & 3, g = lane >> 2;
+    const int tf = t0 + rb * 16; if (tf >= t0 + tn) return;
+    const int n = min(16, t0 + tn - tf), p0 = rows[tf].pos;
+    const int glast = is_global ? min(ngroups - 1, (p0 + n - 1) / 16) : ngroups - 1;       // last key tile any row of the block can see
+    const int G0 = ch * fch, G1 = min(G0 + fch, glast + 1);
+    if (G0 > glast) return;
+    Kt += (size_t)rows[tf].seq * kvstride; Vt += (size_t)rows[tf].seq * kvstride;
+    for (int ds = 0; ds < 8; ds++) {                      // the queries as A operands: [row g, g+8][dims 2q, 2q+1 and 8+2q, 9+2q] of each 16 dims
+        uint4 v = make_uint4(0, 0, 0, 0);
+        const float* x0 = qc + ((size_t)(tf + g) * H + h) * DH + ds * 16 + 2 * qq; const float* x1 = x0 + (size_t)8 * H * DH;
+        if (g < n) { v.x = pack_bf16(x0[0], x0[1]); v.z = pack_bf16(x0[8], x0[9]); }
+        if (g + 8 < n) { v.y = pack_bf16(x1[0], x1[1]); v.w = pack_bf16(x1[8], x1[9]); }
+        sq[w][ds][lane] = v;
+    }
+    // This lane's two rows: g and g + 8. A row beyond the step has zero queries: it runs along and is never written.
+    const bool okr[2] = {g < n, g + 8 < n}; const int pr[2] = {p0 + g, p0 + g + 8};
+    const int pm[2] = {(p0 + g) % RING, (p0 + g + 8) % RING};
+    const float* br[2] = {bias + ((size_t)(tf + g) * H + h) * EXT, bias + ((size_t)(tf + g + 8) * H + h) * EXT};
+    // m: the row's reference score; m2 = m * log2(e); thr = m + FSLACK: the score that moves the reference
+    // l: the row's sum of probabilities, as the tensor cores see them (rounded to bf16): l[0], l[1] for row g, l[2], l[3] for row g + 8
+    float m[2] = {-FLT_MAX, -FLT_MAX}, m2[2] = {-FLT_MAX, -FLT_MAX}, thr[2] = {-FLT_MAX, -FLT_MAX}, l[4] = {0, 0, 0, 0}, o[16][4];
+    #pragma unroll
+    for (int k = 0; k < 16; k++) for (int i = 0; i < 4; i++) o[k][i] = 0;
+    #define FUSED_LOAD(dst, base, G_, u0, un) { const size_t kb_ = ((size_t)(G_) * HKV + j) * 8 + u0; \
+        for (int u = 0; u < un; u++) dst[u] = kv8 ? tile8_to_bf16(*(const uint64_t*)(base + (kb_ + u) * 256 + lane * 8)) : *(const uint4*)(base + (kb_ + u) * 512 + lane * 16); }
+    uint4 kt[8];
+    if (AHEAD) {
+        #pragma unroll
+        FUSED_LOAD(kt, Kt, G0, 0, 8)
+    }
+    for (int G = G0; G < G1; G++) {
+        uint4 kn[8], vt[8];
+        if (AHEAD == 2) {
+            #pragma unroll
+            FUSED_LOAD(vt, Vt, G, 0, 8)
+        }
+        if (AHEAD) {
+            #pragma unroll
+            FUSED_LOAD(kn, Kt, min(G + 1, G1 - 1), 0, 8)
+        } else {
+            #pragma unroll
+            FUSED_LOAD(kt, Kt, G, 0, 8)
+        }
+        const bool far = is_global && G * 16 + 15 + EXT <= p0;      // every key visible to every row, and beyond the position bias
+        float bv[8]; bool ok[8];
+        if (!far) {
+            const int s0 = G * 16 + 2 * qq;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const int b = (i >> 1) & 1, slot = s0 + (i & 1) + (i >> 2) * 8; int dist;
+                if (is_global) { dist = pr[b] - slot; ok[i] = okr[b] && dist >= 0; }
+                else { dist = pm[b] - slot; if (dist < 0) dist += RING; ok[i] = okr[b] && dist < EXT && pr[b] - dist >= 0; }
+                bv[i] = ok[i] && dist < EXT ? br[b][dist] : 0.0f;
+            }
+        }
+        float d[8] = {0, 0, 0, 0, 0, 0, 0, 0};            // d[0..3]: keys 2q, 2q+1 for rows g, g+8; d[4..7]: keys 8+2q, 9+2q
+        #pragma unroll
+        for (int u = 0; u < 8; u++) {
+            const uint4 a = sq[w][u][lane];
+            mma_bf16(d, a.x, a.y, a.z, a.w, kt[u].x, kt[u].z); mma_bf16(d + 4, a.x, a.y, a.z, a.w, kt[u].y, kt[u].w);
+        }
+        float P[8], mx[2]; bool move;
+        if (far) {                                        // (the same arithmetic as below with every key visible and no bias: only shorter)
+            #pragma unroll
+            for (int i = 0; i < 8; i++) P[i] = d[i] * FSCALE;
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 8; i++) P[i] = ok[i] ? d[i] * FSCALE + bv[i] : -FLT_MAX;      // (scores for now)
+        }
+        mx[0] = fmaxf(fmaxf(P[0], P[1]), fmaxf(P[4], P[5])); mx[1] = fmaxf(fmaxf(P[2], P[3]), fmaxf(P[6], P[7]));
+        move = __any_sync(0xffffffffu, mx[0] > thr[0] || mx[1] > thr[1]);
+        if (move) {                                       // a score well above a row's reference: move the reference, scale what has been summed
+            #pragma unroll
+            for (int b = 0; b < 2; b++) {
+                mx[b] = fmaxf(mx[b], __shfl_xor_sync(0xffffffffu, mx[b], 1)); mx[b] = fmaxf(mx[b], __shfl_xor_sync(0xffffffffu, mx[b], 2));     // over the 4 lanes that share the row
+                if (mx[b] > m[b] + FSLACK) {              // (the row's own test: what a row computes must not depend on the rows beside it)
+                    const float f = fexp_scale(m[b], mx[b]); m[b] = mx[b]; m2[b] = mx[b] * LOG2E; thr[b] = mx[b] + FSLACK; l[2 * b] *= f; l[2 * b + 1] *= f;
+                    #pragma unroll
+                    for (int k = 0; k < 16; k++) { o[k][2 * b] *= f; o[k][2 * b + 1] *= f; }
+                }
+            }
+        }
+        if (far) {
+            #pragma unroll
+            for (int i = 0; i < 8; i++) P[i] = ex2f(fmaf(P[i], LOG2E, -m2[(i >> 1) & 1]));
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 8; i++) P[i] = P[i] > -FLT_MAX ? ex2f(fmaf(P[i], LOG2E, -m2[(i >> 1) & 1])) : 0.0f;
+        }
+        const uint32_t a0 = pack_bf16n(P[0], P[1]), a1 = pack_bf16n(P[2], P[3]), a2 = pack_bf16n(P[4], P[5]), a3 = pack_bf16n(P[6], P[7]);
+        // The sum of the row's probabilities: one more multiplication, by ones. It adds exactly the rounded values the
+        // value sums use, so the rounding of a dominant key cancels in the division (the exact path gets this for free:
+        // its largest probability is exactly 1), and every lane of the row holds the whole sum.
+        mma_bf16(l, a0, a1, a2, a3, 0x3F803F80u, 0x3F803F80u);
+        if (AHEAD == 2) {
+            #pragma unroll
+            for (int u = 0; u < 8; u++) { mma_bf16(o[u * 2], a0, a1, a2, a3, vt[u].x, vt[u].z); mma_bf16(o[u * 2 + 1], a0, a1, a2, a3, vt[u].y, vt[u].w); }
+        } else {
+            #pragma unroll
+            for (int h4 = 0; h4 < 2; h4++) {
+                #pragma unroll
+                FUSED_LOAD(vt, Vt, G, h4 * 4, 4)
+                #pragma unroll
+                for (int u = 0; u < 4; u++) { mma_bf16(o[(h4 * 4 + u) * 2], a0, a1, a2, a3, vt[u].x, vt[u].z); mma_bf16(o[(h4 * 4 + u) * 2 + 1], a0, a1, a2, a3, vt[u].y, vt[u].w); }
+            }
+        }
+        if (AHEAD) {
+            #pragma unroll
+            for (int u = 0; u < 8; u++) kt[u] = kn[u];
+        }
+    }
+    #undef FUSED_LOAD
+    float* out = part + (((size_t)rb * H + h) * gridDim.y + ch) * (FPW * 32) + lane;
+    out[0] = m[0]; out[32] = m[1]; out[64] = l[0]; out[96] = l[2];
+    #pragma unroll
+    for (int k = 0; k < 16; k++) for (int i = 0; i < 4; i++) out[(4 + k * 4 + i) * 32] = o[k][i];
+}
+// Grid: blocks of 16 rows x HKV, 768 threads: a warp per head and 16 output dims. nch: chunks per (16 rows, head) in `part`.
+__global__ void k_attn_fused_fin(const float* part, int nch, int fch, const float* proj, float* y, const Row* rows, int t0, int tn, int is_global, int ngroups) {
+    const int rb = blockIdx.x / HKV, j = blockIdx.x % HKV, lane = threadIdx.x & 31, w = threadIdx.x >> 5, hh = w >> 3, u = w & 7, qq = lane & 3, g = lane >> 2, h = 3 * j + hh;
+    const int tf = t0 + rb * 16; if (tf >= t0 + tn) return;
+    const int n = min(16, t0 + tn - tf);
+    const int glast = is_global ? min(ngroups - 1, (rows[tf].pos + n - 1) / 16) : ngroups - 1, live = glast / fch + 1;     // chunks that were written
+    const float* pin = part + ((((size_t)rb * HKV + j) * 3 + hh) * nch) * (FPW * 32) + lane;
+    float M[2] = {-FLT_MAX, -FLT_MAX}, ls[2] = {0, 0}, o[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int c = 0; c < live; c++) { M[0] = fmaxf(M[0], pin[(size_t)c * (FPW * 32)]); M[1] = fmaxf(M[1], pin[(size_t)c * (FPW * 32) + 32]); }
+    for (int c = 0; c < live; c++) {
+        const float* pc = pin + (size_t)c * (FPW * 32); const float f[2] = {fexp_scale(pc[0], M[0]), fexp_scale(pc[32], M[1])};
+        ls[0] += f[0] * pc[64]; ls[1] += f[1] * pc[96];
+        #pragma unroll
+        for (int k = 0; k < 8; k++) o[k] += f[(k >> 1) & 1] * pc[(4 + u * 8 + k) * 32];
+    }
+    #pragma unroll
+    for (int b = 0; b < 2; b++) {
+        const int r = g + 8 * b; if (r >= n) continue;
+        const float* pj = proj + (size_t)(tf + r) * QKVR; float* yr = y + (size_t)(tf + r) * (H * DH) + h * DH;
+        const float inv = 1.0f / ls[b], sink = sigmoidf(M[b] + logf(ls[b]) - pj[R_SINK + h]);
+        #pragma unroll
+        for (int kk = 0; kk < 4; kk++) {                  // this lane's 4 dims of the row within the warp's 16
+            const int dim = u * 16 + (kk >> 1) * 8 + 2 * qq + (kk & 1);
+            yr[dim] = bf16r(o[(kk >> 1) * 4 + 2 * b + (kk & 1)] * inv * sigmoidf(pj[R_GATE + h * DH + dim]) * sink);
+        }
+    }
+}
 // t0: first token handled by this launch; scratch rows are relative to it (the scratch holds one sub-batch).
 __global__ void k_attn_scores(const float* qc, const float* bias, const uint8_t* Kt, const Row* rows, int is_global, int ngroups, float* scratch, int smax, int t0, int kv8, size_t kvstride) {
     __shared__ float q[3][DH];
@@ -1981,18 +2164,28 @@ void gemm_fp8(const Fp8Mat& f, int C, int T, const uint8_t* xcode, const uint8_t
     }
 }
 
-// Scratch for packed activations (three inputs of up to 64 tokens x XPK_C values), and the batch size from which
+// Scratch for packed activations (three inputs of up to TMAX tokens x XPK_C values), and the batch size from which
 // packing pays (INK_PACK_MIN to experiment; a large value turns it off).
 const int XPK_C = 4608;
 static uint2* g_xpk[3];
-static int g_attn_group = getenv("INK_ATTN_GROUP") ? atoi(getenv("INK_ATTN_GROUP")) : 17;   // rows from which attention runs in groups of 8 (at most GSUB)
+static int g_attn_group = getenv("INK_ATTN_GROUP") ? std::min(std::max(atoi(getenv("INK_ATTN_GROUP")), 2), GSUB + 1) : GSUB + 1;   // rows from which attention runs in groups of 8 (at most GSUB)
 // Threads per block of k_attn_prep for n rows, as measured (us per launch with 1024 / 512 / 256 / 128 threads: 1 row
 // 2.6 / 2.9 / 3.1 / 5.9; 8 rows 6.1 / 4.6 / 5.3 / 6.1; 32 rows 15.9 / 7.5 / 5.7 / 6.7; 128 rows 44.5 / 19.8 / 14.6 / 12.9).
 static inline int prep_threads(int n) { return n <= 4 ? 1024 : n <= 16 ? 512 : n <= 48 ? 256 : 128; }
 // Prompt-only steps may use kernels that are not bit-identical to the decode kernels (set per step by ink_step;
 // --exact-prompts / INK_EXACT_PROMPTS turns them off).
-static const bool g_fast_allowed = getenv("INK_EXACT_PROMPTS") == nullptr;
+static bool fast_allowed() { static const bool v = getenv("INK_EXACT_PROMPTS") == nullptr; return v; }   // read at the first step (the host sets it from --exact-prompts)
 static bool g_fast = false;
+const int FA = 0, FW = 2;
+static const bool g_fused = getenv("INK_NO_FUSED") == nullptr;   // experiment switch: the fused attention kernels of the fast path
+// Key tiles per chunk of the fused attention: 12 of the sliding window's 72, and 64 (1,024 keys) in full attention.
+// Fixed numbers, and chunks start at fixed keys, on purpose: together with the kernel's row-by-row arithmetic this
+// makes what the fast path computes for a row independent of the step the row is in.
+// (The partial results of a sub-batch, 8.7 KB per row block, head and chunk, fit the score scratch at every context.)
+static inline int fused_chunk(int is_global, int ng) {
+    static const int lc = getenv("INK_FUSED_LOCAL") ? std::max(1, atoi(getenv("INK_FUSED_LOCAL"))) : 12, gc = getenv("INK_FUSED_CHUNK") ? std::max(1, atoi(getenv("INK_FUSED_CHUNK"))) : 64;
+    return is_global ? gc : lc;
+}
 static int g_xwide = getenv("INK_XWIDE") ? atoi(getenv("INK_XWIDE")) : 48;          // rows from which experts run as wide tasks
 static int g_pack_min = getenv("INK_PACK_MIN") ? atoi(getenv("INK_PACK_MIN")) : 9;
 static int g_bulk_min = getenv("INK_BULK_MIN") ? atoi(getenv("INK_BULK_MIN")) : 9;    // from here on: k_gemm_bf16_bulk (a large value: the older packed kernel)
@@ -2003,7 +2196,7 @@ void gemv_scratch() {
 // Dense bf16 matrix (stored as tiles) x T activation rows, on the tensor cores for every batch size.
 void gemv(int R, int T, const uint16_t* W, int C, int T2, const float* x0, const float* x1, const float* x2, int xstride, int r1, int r2, float* out, int R2, int round) {
     gemv_scratch();
-    static const int chunks = getenv("INK_GEMM_CHUNKS") ? atoi(getenv("INK_GEMM_CHUNKS")) : 8;   // most 64-token chunks per launch
+    static const int chunks = g_bulk_min > 64 ? 1 : getenv("INK_GEMM_CHUNKS") ? std::min(std::max(atoi(getenv("INK_GEMM_CHUNKS")), 1), 8) : 8;   // most 64-token chunks per launch (the older kernels: one)
     int ntc = 1;
     if (T > 64) {
         int nfull = std::min(T / 64, C <= XPK_C ? chunks : 1), most = nfull * 64;     // whole chunks of 64 tokens in one launch, the rest after it
@@ -2186,7 +2379,7 @@ struct Engine {
     } dr;
     float* feats;                                        // DSpark taps of the last forward: [4 taps][TMAX][D]
     uint8_t *xcode, *xscale, *acode, *ascale, *xcode8, *acode8;
-    cudaGraphExec_t graph[TMAX + 1][24][3][2] = {};             // per batch size, context bucket (1024 << b), and output head: none / full / two-stage
+    cudaGraphExec_t graph[TMAX + 1][24][3][3] = {};             // per batch size, context bucket (1024 << b), output head (none / full / two-stage), and kind of rows (see cls, one)
     // two-stage head: per token |u - u~| and |u|; per row bounds, approximate winners, thresholds; candidate blocks and their exact logits
     float *h_eu = nullptr, *h_un = nullptr, *h_hb = nullptr, *h_pv = nullptr, *h_thr = nullptr, *h_ex1 = nullptr, *h_ex2 = nullptr;
     int *h_pi = nullptr, *h_win = nullptr, *h_l1 = nullptr, *h_l2 = nullptr, *h_cnt = nullptr;
@@ -2750,7 +2943,7 @@ static void local_attention(Engine* e, const float* bias, int visit, size_t kvs,
 
 // cls: 0 if every run of the step begins at a row that is a multiple of 8 (then a sub-batch of n rows has exactly
 // ceil(n / 8) attention groups), 1 otherwise (up to n).
-static void forward_body(Engine* e, int T, int gchunks, int hm, int cls) {
+static void forward_body(Engine* e, int T, int gchunks, int hm, int cls, bool one) {
     // Prefetch plan (fractions of each matrix), tunable for experiments: INK_PF_WO=f, INK_PF_Q=a,b,c,d (cumulative).
     static const size_t WO_BYTES = (size_t)(D / 16) * (H * DH / 16) * 512, QKVR_BYTES_BF16 = (size_t)(410 + 64 + 64) * (D / 16) * 512;
     static double pf_wo = getenv("INK_PF_WO") ? atof(getenv("INK_PF_WO")) : 0.0, pf_q[4] = {0.1, 0.2, 0.3, 0.4};
@@ -2820,6 +3013,12 @@ static void forward_body(Engine* e, int T, int gchunks, int hm, int cls) {
                                                                    e->ring[visit][1], L.kconv, L.vconv, e->dk, e->dv, e->Kc[visit], e->Vc[visit], e->kv8, kvs, h0);
                 prof("attn q/r/kv prep");
                 int ng = L.global ? gchunks * 2 : RING / 16, ns = ng * 16;      // scores, softmax, value sum on the tensor cores
+                if (g_fast && g_fused && one) {                  // prompt-only step of one conversation: fused attention, nothing written but the result
+                    const int nrb = (hn + 15) / 16, fch = fused_chunk(L.global, ng), nch = (ng + fch - 1) / fch;
+                    k_attn_fused_part<FA, FW><<<dim3((nrb + FW - 1) / FW * HKV, nch), FW * 96, 0, g_stream>>>(e->qc, bias, (const uint8_t*)e->Kc[visit], (const uint8_t*)e->Vc[visit], e->rows, h0, hn,
+                                                                                 L.global, ng, fch, e->att_sc, e->kv8, kvs);
+                    k_attn_fused_fin<<<nrb * HKV, 768, 0, g_stream>>>(e->att_sc, nch, fch, e->proj, e->att_y, e->rows, h0, hn, L.global, ng);
+                } else
                 if (T < g_attn_group && T <= GSUB) {     // few rows: one block per row keeps more of the GPU busy
                     if (!L.global) {
                         k_attn_scores<<<dim3((ng + 7) / 8, hn * HKV), 256, 0, g_stream>>>(e->qc, bias, (const uint8_t*)e->Kc[visit], e->rows, 0, ng, e->att_sc, RING, h0, e->kv8, kvs);
@@ -2997,9 +3196,11 @@ int ink_step(void* ep, int T, const int* tokens, const int* seqs, const int* pos
     bool head = want_head != 0 || logits_out != nullptr;
     // want_head 2: the caller only needs each row's argmax and sample, so the two-stage head will do.
     int hm = !head ? 0 : (want_head == 2 && !logits_out && e->head2 && T <= FAST_T) ? 2 : 1;
-    g_fast = g_fast_allowed && hm == 0;                  // a step nobody reads predictions from: the fast prompt kernels
-    if (g_prof || e->trace || no_graph) forward_body(e, T, gchunks, hm, cls);
-    else run_graphed(&e->graph[T][bkt][hm][cls], [&] { forward_body(e, T, gchunks, hm, cls); });
+    g_fast = fast_allowed() && hm == 0;                  // a step nobody reads predictions from: the fast prompt kernels
+    // one: the step is one conversation at consecutive positions (what the fused attention of the fast prompt path takes)
+    const bool one = rows[0].run0 == 0 && rows[0].runlen >= T;
+    if (g_prof || e->trace || no_graph) forward_body(e, T, gchunks, hm, cls, one);
+    else run_graphed(&e->graph[T][bkt][hm][one ? 2 : cls], [&] { forward_body(e, T, gchunks, hm, cls, one); });
     g_fast = false;
     CK(cudaStreamSynchronize(g_stream));
     CK(cudaGetLastError());                              // a kernel that failed to launch must stop us, not hand back garbage
@@ -3200,7 +3401,6 @@ void ink_microbench(void* ep, int T) {
     auto* e = (Engine*)ep; int N = T * TOPK, NTK = max_tasks(N);
     auto vis = [](int i) { return i < 18 ? i : i + 24; };
     if (T < 1 || T > HMAX) { fprintf(stderr, "micro-benchmark: batch sizes 1..%d only\n", HMAX); return; }
-    g_fast = getenv("INK_MB_FAST") != nullptr;           // time the fast prompt kernels where they exist   // it runs the head and unsplit attention
     fprintf(stderr, "micro-benchmark, T=%d (time per launch)\n", T);
     mbench("empty kernel", 0, [&](int) { k_resid<<<1, 32, 0, g_stream>>>(nullptr, e->y, e->y, e->mixtmp, 1); });
     if (!e->fp8_attn) mbench("qkvr gemm (8600x2304 bf16)", 39.6, [&](int r) { Layer& L = e->L[r % 24]; gemv(QKVR, T, L.qkvr, D, T, e->inputs, e->inputs, e->inputs, D, R_K, R_V, e->proj, QKVR, 1); });
@@ -3223,6 +3423,21 @@ void ink_microbench(void* ep, int T) {
     }
     uint2* mpl = (uint2*)(e->att_sc + (size_t)HMAX * H * RING);
     mbench("attention, sliding window (scores + softmax + values)", 0, [&](int r) { int i = r % 5; local_attention(e, e->bias, i, e->kv_local, 0, T, (T + 7) / 8, mpl, 0, (T + 15) / 16); });
+    if (T >= 16) {                                       // the fast path's fused attention against the exact kernels: time, and the largest difference
+        std::vector<float> ya((size_t)T * H * DH), yb((size_t)T * H * DH);
+        auto differ = [&](const char* what) {
+            double mx = 0, big = 0, sq = 0, sn = 0; for (size_t i = 0; i < ya.size(); i++) { mx = std::max(mx, (double)fabsf(ya[i] - yb[i])); big = std::max(big, (double)fabsf(ya[i])); sq += (double)(ya[i] - yb[i]) * (ya[i] - yb[i]); sn += (double)ya[i] * ya[i]; }
+            printf("  %s: fused against exact: largest difference %.3g (largest value %.3g), relative error %.3g\n", what, mx, big, sqrt(sq / std::max(sn, 1e-30)));
+        };
+        const int lfch = fused_chunk(0, RING / 16), lnch = (RING / 16 + lfch - 1) / lfch, nrb = (T + 15) / 16;
+        auto fused_local = [&](int i) {
+            k_attn_fused_part<FA, FW><<<dim3((nrb + FW - 1) / FW * HKV, lnch), FW * 96, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[i], (const uint8_t*)e->Vc[i], e->rows, 0, T, 0, RING / 16, lfch, e->att_sc, e->kv8, e->kv_local);
+            k_attn_fused_fin<<<nrb * HKV, 768, 0, g_stream>>>(e->att_sc, lnch, lfch, e->proj, e->att_y, e->rows, 0, T, 0, RING / 16); };
+        mbench("fused attention, sliding window", 0, [&](int r) { fused_local(r % 5); });
+        local_attention(e, e->bias, 0, e->kv_local, 0, T, (T + 7) / 8, mpl, 0, (T + 15) / 16); CK(cudaStreamSynchronize(g_stream)); CK(cudaMemcpy(ya.data(), e->att_y, ya.size() * 4, cudaMemcpyDeviceToHost));
+        fused_local(0); CK(cudaStreamSynchronize(g_stream)); CK(cudaMemcpy(yb.data(), e->att_y, yb.size() * 4, cudaMemcpyDeviceToHost));
+        differ("sliding window");
+    }
     if (T >= 16) {                                       // full attention for one sub-batch of 16 rows at the current context
         int gv = 0; while (gv < NVIS && !e->vis_global[gv]) gv++;
         int pmax = 0; { std::vector<Row> rr(T); CK(cudaMemcpy(rr.data(), e->rows, T * sizeof(Row), cudaMemcpyDeviceToHost)); for (int t = 0; t < 16; t++) pmax = std::max(pmax, rr[t].pos); }
@@ -3232,6 +3447,19 @@ void ink_microbench(void* ep, int T) {
         mbench("full attention: scores", 0, [&](int) { k_attn_scores_g<SKG><<<dim3((ng + 8 * SKG - 1) / (8 * SKG), 2 * HKV), 256, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[gv], e->rows, e->grp, e->gb, 0, 1, 1, ng, e->att_sc, gch * 32, 0, e->kv8, e->kv_global); });
         mbench("full attention: softmax", 0, [&](int) { k_attn_soft_g<<<dim3(16, H), 1024, 0, g_stream>>>(e->att_sc, gch * 32, ng * 16, e->att_l, 0, pk, e->rows, 1, 1); });
         mbench("full attention: values", 0, [&](int) { k_attn_pv_gl<32><<<dim3(8, 2 * HKV), 1024, 0, g_stream>>>((const uint2*)pk, gch * 32, (const uint8_t*)e->Vc[gv], ng, e->att_l, e->proj, e->att_y, 0, e->kv8, e->rows, e->kv_global, e->grp, e->gb, 0, 1); });
+        std::vector<float> ya((size_t)16 * H * DH), yb(ya.size());
+        CK(cudaStreamSynchronize(g_stream)); CK(cudaMemcpy(ya.data(), e->att_y, ya.size() * 4, cudaMemcpyDeviceToHost));
+        const int fch = fused_chunk(1, ng), nch = (ng + fch - 1) / fch; float* part = e->att_sc;     // (the exact kernels' scores are no longer needed)
+        auto fused = [&](int rows16) {
+            k_attn_fused_part<FA, FW><<<dim3((rows16 / 16 + FW - 1) / FW * HKV, nch), FW * 96, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[gv], (const uint8_t*)e->Vc[gv], e->rows, 0, rows16, 1, ng, fch, part, e->kv8, e->kv_global);
+            k_attn_fused_fin<<<rows16 / 16 * HKV, 768, 0, g_stream>>>(part, nch, fch, e->proj, e->att_y, e->rows, 0, rows16, 1, ng); };
+        mbench("fused attention, full (16 rows)", 0, [&](int) { fused(16); });
+        CK(cudaStreamSynchronize(g_stream)); CK(cudaMemcpy(yb.data(), e->att_y, yb.size() * 4, cudaMemcpyDeviceToHost));
+        double mx = 0, big = 0, sq = 0, sn = 0; for (size_t i = 0; i < ya.size(); i++) { mx = std::max(mx, (double)fabsf(ya[i] - yb[i])); big = std::max(big, (double)fabsf(ya[i])); sq += (double)(ya[i] - yb[i]) * (ya[i] - yb[i]); sn += (double)ya[i] * ya[i]; }
+        printf("  full attention: fused against exact: largest difference %.3g (largest value %.3g), relative error %.3g\n", mx, big, sqrt(sq / std::max(sn, 1e-30)));
+        if (T >= 128) {                                  // a whole sub-batch
+            mbench("fused attention, full (128 rows)", 0, [&](int) { fused(128); });
+        }
     }
     if (!e->fp8_attn) mbench("wo gemm (2304x3072 bf16)", 14.2, [&](int r) { Layer& L = e->L[r % 24]; gemv(D, T, L.wo, H * DH, T, e->att_y, e->att_y, e->att_y, H * DH, D, D, e->attn_raw, D, 1); });
     mbench("post-attn (conv + mix)", 0, [&](int r) { int i = r % 24; Layer& L = e->L[i]; PostAttn pa{}; pa.attn_raw = e->attn_raw; pa.ring = e->ring[vis(i)][2]; pa.w = L.attn_sconv; pa.rows = e->rows;

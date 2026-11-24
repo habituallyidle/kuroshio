@@ -46,6 +46,10 @@ SERVE OPTIONS
   --sampled-drafts       when sampling (temperature >= 0.3), draw drafts from the drafter's
                          distribution instead of taking its top token (experimental: exact,
                          but measured no faster)
+  --exact-prompts        read prompts with the same arithmetic as generation: about a quarter slower on
+                         long prompts, and the answer to a request then never depends on what was
+                         cached or what else was running (by default prompts are read by faster
+                         kernels whose results differ in the last bits)
   --no-draft             do not load the drafter (saves 1.1 GiB; no speculation)
   --no-prefix-cache      always re-read the whole prompt (saves 0.2 GiB per slot)
   --no-tool-fix          let the model write the fixed start of a tool call itself
@@ -57,7 +61,7 @@ RUN OPTIONS
   --max-tokens N                                                            [512]
   --temp X               sampling temperature; 0 = greedy                   [0]
   --seed N                                                                  [1]
-  plus --spec, --tau, --kv, --dense, --no-draft, --model as above
+  plus --spec, --tau, --kv, --dense, --no-draft, --exact-prompts, --model as above
 
 Developer commands (see docs/): check, argmaxes, headcheck, interleave, draftcheck, samptest, nll, topk, steptime,
 microbench, graphmem, gen, render, inspect.
@@ -70,7 +74,7 @@ struct Flags {
 }
 
 impl Flags {
-    const SWITCHES: [&'static str; 4] = ["no-draft", "no-prefix-cache", "no-tool-fix", "sampled-drafts"];
+    const SWITCHES: [&'static str; 5] = ["no-draft", "no-prefix-cache", "no-tool-fix", "sampled-drafts", "exact-prompts"];
 
     fn parse(args: &[String]) -> Result<Self> {
         let (mut named, mut pos, mut i) = (std::collections::HashMap::new(), Vec::new(), 0);
@@ -133,6 +137,9 @@ impl Flags {
         if self.has("sampled-drafts") {
             std::env::set_var("INK_SAMPLED_DRAFTS", "1");
         }
+        if self.has("exact-prompts") {
+            std::env::set_var("INK_EXACT_PROMPTS", "1");
+        }
         Ok(())
     }
 }
@@ -166,7 +173,7 @@ const GRAPH_ROOM_MIB: usize = 320;
 fn vram_base(slots: usize) -> usize {
     let on = |k: &str| std::env::var(k).is_ok();
     let (kv8, dense8, draft) = (on("INK_KV_FP8"), on("INK_FP8"), !on("INK_NO_DRAFT"));
-    let fixed = 20120 * MIB - if dense8 { 800 * MIB } else { 0 } - if draft { 0 } else { 1100 * MIB };
+    let fixed = 20460 * MIB - if dense8 { 800 * MIB } else { 0 } - if draft { 0 } else { 1100 * MIB };
     let per_slot = if kv8 { 141 } else { 246 } * MIB + if on("INK_NO_PREFIX_CACHE") { 0 } else if kv8 { 136 } else { 231 } * MIB;
     fixed + slots * per_slot
 }
@@ -241,7 +248,7 @@ fn main() -> Result<()> {
         // OpenAI-compatible server. Older positional form still works: kuroshio serve [addr] [ctx] [slots]
         Some("serve") => {
             let f = Flags::parse(&args[2..])?;
-            f.check_known(&["host", "port", "slots", "ctx", "reserve", "idle-release", "kv", "dense", "spec", "tau", "prefill-share", "cors", "no-draft", "no-prefix-cache", "no-tool-fix", "sampled-drafts", "copy", "model", "name"])?;
+            f.check_known(&["host", "port", "slots", "ctx", "reserve", "idle-release", "kv", "dense", "spec", "tau", "prefill-share", "cors", "no-draft", "no-prefix-cache", "no-tool-fix", "sampled-drafts", "exact-prompts", "copy", "model", "name"])?;
             f.apply_engine_options()?;
             let addr = match f.pos.first() {
                 Some(a) => a.clone(),
@@ -301,7 +308,7 @@ fn main() -> Result<()> {
         // (kuroshio gen [text] [effort] [max]; INK_SPEC / INK_TAU / INK_TEMP / INK_SEED).
         Some(cmd @ ("gen" | "run")) => {
             let f = Flags::parse(&args[2..])?;
-            f.check_known(&["effort", "max-tokens", "temp", "seed", "spec", "tau", "kv", "dense", "no-draft", "sampled-drafts", "model"])?;
+            f.check_known(&["effort", "max-tokens", "temp", "seed", "spec", "tau", "kv", "dense", "no-draft", "sampled-drafts", "exact-prompts", "model"])?;
             f.apply_engine_options()?;
             let run = cmd == "run";
             let text = f.pos.first().cloned().unwrap_or_else(|| "Hello!".into());
@@ -512,7 +519,7 @@ fn main() -> Result<()> {
             }
         }
         // Quality metric on real text: mean negative log-likelihood (nats/token) and top-1 accuracy, teacher forced.
-        // inkling nll [tokens] [file]
+        // kuroshio nll [tokens] [file]   (INK_CTX: context size; INK_PRE: see below)
         Some("nll") => {
             let n: usize = args.get(2).map(|s| s.parse()).transpose()?.unwrap_or(4000);
             let file = args.get(3).cloned().unwrap_or_else(|| "docs/ARCHITECTURE.md".into());
@@ -520,11 +527,22 @@ fn main() -> Result<()> {
             let chat = chat::Chat::load(&dir)?;
             let ids = chat.encode(&std::fs::read_to_string(&file)?)?;
             let n = n.min(ids.len() - 1);
-            let mut eng = engine::Engine::load(&dir, 8192)?;
+            let mut eng = engine::Engine::load(&dir, std::env::var("INK_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(8192))?;
             eng.set_sampling(1.0, 1); // log-probabilities are reported at temperature 1
             let targets: Vec<i32> = ids[1..=n].iter().map(|&t| t as i32).collect();
-            let rows = eng.forward_full(&ids[..n], Some(&targets), None);
-            let skip = 32; // the first tokens have no context; leave them out
+            // INK_PRE=tokens,rows: read that many tokens first as prompt-only steps of `rows` rows (as the server reads a
+            // prompt), and measure on the tokens after them.
+            let pre: Vec<usize> = std::env::var("INK_PRE").ok().map_or(vec![], |v| v.split(',').filter_map(|x| x.parse().ok()).collect());
+            let read = if pre.len() == 2 { pre[0].min(n.saturating_sub(64)) } else { 0 };
+            let per = pre.get(1).copied().unwrap_or(1).clamp(1, engine::PMAX);
+            for (i, c) in ids[..read].chunks(per).enumerate() {
+                let rows: Vec<(usize, usize, u32)> = c.iter().enumerate().map(|(j, &t)| (0, i * per + j, t)).collect();
+                eng.step_rows(&rows, None, false);
+            }
+            eng.set_pos(read);
+            let rows = eng.forward_full(&ids[read..n], Some(&targets[read..]), None);
+            let skip = if read > 0 { 0 } else { 32 }; // the first tokens have no context; leave them out
+            let (n, ids) = (n - read, &ids[read..]);
             let nll: f64 = rows[skip..].iter().map(|r| -(r.logp_excl as f64)).sum::<f64>() / (n - skip) as f64;
             let acc = rows[skip..].iter().zip(&ids[skip + 1..=n]).filter(|(r, t)| r.greedy == **t).count() as f64 / (n - skip) as f64;
             println!("{file}: {} tokens  NLL {nll:.4} nats/token  perplexity {:.3}  top-1 accuracy {:.2}%", n - skip, nll.exp(), 100.0 * acc);

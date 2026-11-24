@@ -14,20 +14,35 @@ $BIN argmaxes 1500 > "$TMP/b16.txt" 2>/dev/null; INK_CHUNK=1 $BIN argmaxes 1500 
 cmp -s "$TMP/b16.txt" "$TMP/b1.txt" || { echo "FAIL: batch-16 and batch-1 greedy tokens differ"; exit 1; }
 # prompt-only steps of up to 1,024 rows (attention in sub-batches of 128, experts once) must leave the same state as 16-row steps:
 # what follows them must come out the same. The sliding-window caches are rings of 1,152 positions, so the steps have
-# to go past position 1,152 to prove anything.
+# to go past position 1,152 to prove anything. (With --exact-prompts; the default prompt path has its own checks below.)
 $BIN argmaxes 2600 > "$TMP/p16.txt" 2>/dev/null
-for pre in 2048,1024 2560,512 2304,256 2400,200 1408,129; do INK_PRE=$pre $BIN argmaxes 2600 > "$TMP/bx.txt" 2>/dev/null; n=${pre%%,*}
+for pre in 2048,1024 2560,512 2304,256 2400,200 1408,129; do INK_EXACT_PROMPTS=1 INK_PRE=$pre $BIN argmaxes 2600 > "$TMP/bx.txt" 2>/dev/null; n=${pre%%,*}
   cmp -s <(cut -d' ' -f$((n + 1))- "$TMP/p16.txt") <(cut -d' ' -f$((n + 1))- "$TMP/bx.txt") || { echo "FAIL: after prompt steps of ${pre##*,} rows the tokens differ"; exit 1; }; done
 # the matrix kernel that packs its inputs first (batches of 9+) must agree with the plain one
-INK_PACK_MIN=999 INK_CHUNK=100 $BIN argmaxes 1500 > "$TMP/bx.txt" 2>/dev/null; cmp -s "$TMP/b16.txt" "$TMP/bx.txt" || { echo "FAIL: plain and packed-input matrix kernels differ"; exit 1; }; echo "ok"
+for knobs in "INK_BULK_MIN=999" "INK_BULK_MIN=999 INK_PACK_MIN=999"; do    # the older packed-input kernel, then the plain one, against the bulk kernel
+  env $knobs INK_CHUNK=100 $BIN argmaxes 1500 > "$TMP/bx.txt" 2>/dev/null; cmp -s "$TMP/b16.txt" "$TMP/bx.txt" || { echo "FAIL: the matrix kernels differ ($knobs)"; exit 1; }
+done; echo "ok"
 echo "== the two-stage output head must pick what the full head picks (argmax and samples; error bound never exceeded)"
 $BIN headcheck 1200 2>/dev/null | tail -1 | grep -q IDENTICAL || { echo "FAIL: two-stage head differs from the full head"; $BIN headcheck 1200 2>/dev/null | tail -3; exit 1; }; echo "ok"
 echo "== conversations advanced together must match separate runs"
 $BIN interleave 3 1300 2>/dev/null | tail -1 | grep -q IDENTICAL || { echo "FAIL: interleaved conversations differ from separate runs"; exit 1; }; echo "ok"
 # several prompts read together in steps of up to 256 rows, then the same comparison
-INK_IL_PRE=1250 $BIN interleave 3 1300 2>/dev/null | tail -1 | grep -q IDENTICAL || { echo "FAIL: after prompt steps shared by several conversations the tokens differ"; exit 1; }; echo "ok"
+INK_EXACT_PROMPTS=1 INK_IL_PRE=1250 $BIN interleave 3 1300 2>/dev/null | tail -1 | grep -q IDENTICAL || { echo "FAIL: after prompt steps shared by several conversations the tokens differ"; exit 1; }; echo "ok"
 # the same when the two-stage head always gives up and the full head runs after it (its overflow path)
 INK_HEAD_FALLBACK=1 $BIN interleave 3 500 2>/dev/null | tail -1 | grep -q IDENTICAL || { echo "FAIL: the output head's fall-back path gives different tokens"; exit 1; }; echo "ok"
+echo "== the fast prompt path (the default): the same result whatever the step size, and close to the exact path"
+# What it computes for a row depends on that row alone, so prompt steps of any size must leave the same state.
+for rows in 1024 512 200 129 37 5; do INK_PRE=2400,$rows $BIN argmaxes 2900 > "$TMP/f$rows.txt" 2>/dev/null
+  cmp -s "$TMP/f1024.txt" "$TMP/f$rows.txt" || { echo "FAIL: fast prompt steps of $rows rows and of 1,024 rows leave different states"; exit 1; }; done
+INK_EXACT_PROMPTS=1 INK_PRE=2400,1024 $BIN argmaxes 2900 > "$TMP/fe.txt" 2>/dev/null
+same=$(paste -d' ' <(tr ' ' '\n' < "$TMP/fe.txt" | tail -n 500) <(tr ' ' '\n' < "$TMP/f1024.txt" | tail -n 500) | awk '$1 == $2' | wc -l)
+[ "$same" -ge 450 ] || { echo "FAIL: after a fast-read prompt only $same of 500 greedy tokens agree with the exact path (about 485 expected)"; exit 1; }
+# the fused attention kernels against the exact ones on the same inputs: the difference must stay at rounding level
+INK_MB_T=128 $BIN microbench 2>/dev/null | grep "fused against exact" > "$TMP/fused.txt"; cat "$TMP/fused.txt"
+[ "$(wc -l < "$TMP/fused.txt")" -eq 2 ] && awk '{ if ($NF + 0 > 0.002 || $NF + 0 <= 0) bad = 1 } END { exit bad }' "$TMP/fused.txt" || { echo "FAIL: the fused attention is further from the exact kernels than rounding explains"; exit 1; }
+NE=$(INK_EXACT_PROMPTS=1 INK_PRE=3072,1024 $BIN nll 4000 2>/dev/null | tail -1 | sed -E 's/.*NLL ([0-9.]+).*/\1/'); NF_=$(INK_PRE=3072,1024 $BIN nll 4000 2>/dev/null | tail -1 | sed -E 's/.*NLL ([0-9.]+).*/\1/')
+echo "NLL of the text after a 3,072-token prompt: $NE read exactly, $NF_ read fast ($same of 500 greedy tokens agree)"
+awk -v a="$NE" -v b="$NF_" 'BEGIN { d = a - b; if (d < 0) d = -d; exit !(a > 0 && b > 0 && d < 0.03) }' || { echo "FAIL: quality after a fast-read prompt differs from the exact path by more than noise"; exit 1; }; echo "ok"
 echo "== drafts computed for several conversations at once must match one at a time"
 $BIN draftcheck 42 2>/dev/null | tail -1 | grep -q IDENTICAL || { echo "FAIL: batched drafts differ"; exit 1; }; echo "ok"
 echo "== with a seed, sampling must give the same text with and without speculation"
