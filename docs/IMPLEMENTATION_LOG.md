@@ -4202,6 +4202,247 @@ The columns are the same: the arena limit costs nothing. The rows differ as they
 
 ---
 
+## Step 68 — Measured against vLLM and Strata: a metric that flattered, a claim withdrawn, and a final review (2026-11-24)
+
+**What we did**
+
+**The starting point.** Before the engine was published under its name, Kuroshio, the README opened with three claims: 26% faster than vLLM on one stream, 5.6× faster at reading prompts, and 24 of 24 well-formed tool calls where vLLM managed 9. They came from Step 58 and the re-measurements after it: one other engine, and a median of 3 runs. A claim that goes out with a release should survive someone else measuring it. So this step measured again, with a second engine in the comparison, and with more care than any scoreboard before it. Two of the results were not what we expected. One of our own claims was wrong, and the comparison would have contained a figure that was not real. The step ends with a review of everything changed since the last full review, and the full test suite (Step 63).
+
+**The three engines.**
+
+| Engine | Configuration |
+|---|---|
+| Kuroshio (this engine) | Its defaults: lossless 16-bit cache, DSpark drafter, two-stage head (Step 67) |
+| vLLM | The official `vllm/vllm-openai:inkling-2-mini` image, 8-bit (fp8) KV cache, up to 16 sequences, `--tool-call-parser inkling --reasoning-parser inkling`; run with its DSpark drafter and without it |
+| Strata 0.2.19 | Its own quantised format (`inkling-2-mini-sq-20`), DSpark drafting, 32K context; restarted for each stream count with `--parallel` set to that count |
+
+**How the comparison was run.** Four rules, each of them learnt in an earlier step:
+
+- *Same card, same hour.* A machine's speed drifts. Step 67 found the whole machine about 1.5% slower in one hour than in the hour before. So all three engines were measured in one session, one after the other, and no figure was carried over from an earlier day.
+- *Same harness.* The benchmark harness of Step 6 (`bench.py`, temperature 0.6, 512-token completions), with the same prompts for every engine. A small script (`final_bench.py`) runs it again and again per stream count and keeps every sample.
+- *10 runs per cell, and the median.* The median ignores a single bad run, which a mean does not (Step 29).
+- *Every sample kept.* The range of the 10 runs is reported with the median.
+
+The ranges are the reason for the 10 runs. A single run of the harness can land anywhere in them:
+
+| Streams | vLLM + DSpark, range of 10 runs | Kuroshio, range of 10 runs |
+|---|---|---|
+| 1 | 190–209 | 234–258 |
+| 2 | 306–364 | 376–416 |
+| 4 | 427–485 | 491–523 |
+| 8 | 576–770 | 693–716 |
+| 16 | 840–1,230 | 943–966 |
+
+(The Kuroshio range at 1 stream is over whole requests, the metric introduced below; the vLLM range is by the harness's usual metric.) With vLLM at 16 streams, one run could have given 840 and another 1,230. A comparison from one run each, or from three, could have put either engine ahead at 8 streams. Single-stream runs of a drafting engine move with the text being generated, because the share of drafts that the model accepts depends on the text (Step 58). Kuroshio's README now says so: about ±5%, 236–259 over ten runs.
+
+**The decode table.** Tokens per second in total over all streams, median of 10 runs:
+
+| Streams | Kuroshio | vLLM + DSpark | vLLM, no drafter | Strata |
+|---|---|---|---|---|
+| 1 | **248** | 196 | 170 | 119 |
+| 2 | **389** | 336 | 239 | 181 |
+| 4 | **502** | 458 | 397 | 273 |
+| 8 † | 704 | **742** | 664 | 392 |
+| 16 † | 949 | **1,220** | 1,068 | 562 |
+
+† Kuroshio supports 4 slots by design: the card's memory, not its speed, is what conversations compete for. For these rows a benchmark-only switch, `INK_UNSUPPORTED_SLOTS=1`, lifts the limit to the engine's 16. The context left for each conversation is then small: 162K tokens in total at 8 slots, 61K at 16, under 4K per conversation.
+
+Kuroshio leads at 1, 2 and 4 streams by 27%, 16% and 10% over vLLM with its drafter, and by 2.1×, 2.1× and 1.8× over Strata. vLLM leads by 5% at 8 streams and by 29% at 16. Two of the cells needed more than the harness to get right, and they are the next two parts.
+
+**A figure that flattered one engine: Strata's 274 tokens/s.** By the harness's usual metric, Strata decoded one stream at 274 tokens/s, ahead of both other engines. The figure was not real.
+
+The harness computes single-stream speed as the completion tokens that the server reports in its usage figures, divided by the time from the first visible token to the end. It starts the clock at the first visible token so that time to first token (TTFT), mostly prompt processing, does not count as decode time. That is reasonable if every counted token is produced after the clock starts. Strata generates the model's thinking without streaming it, counts those tokens in its usage figure, and only then begins to stream the answer:
+
+| One request to Strata | |
+|---|---|
+| Tokens in the usage figure | 469 |
+| Tokens visible in the stream | 239 |
+| First visible token after | 1.9–2.4 s |
+
+About half of the counted tokens were produced before the clock started. They were counted, and their time was not.
+
+Two things gave it away. The first was a check of the count itself: the streamed text was tokenised again and its tokens counted, and that gave 239 where the usage figure said 469. The second was how steady the figure was. A drafting engine's speed moves with the text from run to run, and Strata's did not: over the whole request, the slowest and the fastest of its 10 runs were both 119 tokens/s.
+
+The metric used instead is tokens divided by the time of the whole request, from sending it to the last byte (`walltps.py`). Hidden work then counts against the engine that does it, and nothing is excluded that a client waits for. For all three engines, on the same prompts:
+
+| One stream | Tokens / whole request time | Harness metric (from the first visible token) | First visible token after |
+|---|---|---|---|
+| Kuroshio | **248.0** (234–258) | 250 | 32 ms |
+| vLLM + DSpark | 196.1 (155–212) | 199 | 43 ms |
+| Strata | 119.1 (119–119) | 274 | 1.9–2.4 s |
+
+For Kuroshio and vLLM the two metrics differ by less than 2%, because their first token arrives within tens of milliseconds. For Strata they differ by more than 2×. The README's single-stream row uses the whole-request figure for all three engines, and a note under the table gives the 274 and explains it.
+
+**A claim of our own that was wrong: "5.6× faster at reading prompts".** This was the README's second headline, from Step 58: 3,250 tokens/s against vLLM's 580 for a 4K prompt. It was withdrawn.
+
+The harness measures prompt processing on a "cold" prompt, one the server has not just read. It builds that prompt from one fixed document and changes a short header at its start for each sample. For this engine the header is enough: the prefix cache (Step 54) matches from the first token, and a new first token means nothing matches. For vLLM it was not. Three experiments:
+
+| Prompt sent to vLLM (4.7K tokens) | Time to first token |
+|---|---|
+| The same document with a new header | 282 ms |
+| New text, of a length vLLM has not seen before | 1.9 s |
+| New text, of a length it has seen before | Fast again |
+
+vLLM is fast on any prompt whose length it has seen before, whatever the text. What it does once per new length was not examined; the measurements show only that the length, not the content, decides. The harness's prompts all had the same length, so the harness measured vLLM at about 16,500 tokens/s once warm, and at 580 to 1,080 on the first call. The 580 in Step 58 and in the README was a first call. A comparison of 3,250 with 580 set this engine's cold figure against vLLM's worst moment, and the "5.6×" was the ratio of those two.
+
+*Measured properly.* `coldprefill.py` sends prompts in which every sample is new random words from the first token, so no length or content repeats, and it times each request to its first token. 10 samples per size:
+
+| New prompt tokens | Kuroshio | vLLM | Strata |
+|---|---|---|---|
+| 4.7K | 3,328 | 2,478 | **7,282** |
+| 18.8K | 2,850 | **6,800** | 6,517 |
+| 33.5K (Strata: 27.8K, its limit is 32K) | 2,465 | **8,714** | 5,835 |
+
+| Time to the first token | Kuroshio | vLLM |
+|---|---|---|
+| 4.7K tokens | 1.4 s | 1.9 s |
+| 18.8K tokens | 6.6 s | 2.8 s |
+| 33.5K tokens | 13.6 s | 3.9 s |
+
+vLLM's times fit about 1.7 s of fixed cost per new prompt and then about 14K tokens/s. That fixed cost is why it is slower than this engine on a short new prompt: Kuroshio is 34% ahead of it at 4.7K. From there on vLLM pulls ahead, 2.4× at 19K and 3.5× at 34K. Strata is ahead of Kuroshio at every size, 2.2× at 4.7K. On longer prompts this engine falls further: the test suite measured about 3,100 / 2,780 / 1,840 / 900 tokens/s at 4K / 16K / 48K / 100K.
+
+The honest summary: Kuroshio reads a short new prompt faster than vLLM, and nothing else in this table. vLLM and Strata read long prompts faster.
+
+*Why, in terms of Steps 65 and 66.* This engine reads a prompt in steps of 256 rows. Two parts of such a step do not get cheaper per token as the prompt grows:
+
+- *The dense matrices.* Their kernels take at most 64 rows per launch, and Step 65 found them compute-bound at that size: their time goes into the multiplies, not into reading weights. A bigger step gives them nothing (Step 66). They run at an effective 31–45 TFLOP/s. Step 3 measured cuBLAS at 404–483 TFLOPS on large matrices; small multiplies do not reach the card's peak.
+- *The full attention.* Every row of a step attends to every earlier position in the 8 full-attention visits, so a step deep into a long prompt does more attention work than the same step near its start (Steps 15 and 66).
+
+vLLM processes the whole prompt in one pass. Its matrix multiplies then have thousands of rows, the sizes at which Step 3 measured the card near its peak. This engine's kernels were designed for decoding, where a step has a few rows and reading the weights is what matters (Step 3). A separate path for large prompt batches, with kernels shaped for thousands of rows, is the largest lever left. What this engine has instead is the prefix cache: in an agent loop a follow-up turn skips what the server has already read, and its first token typically comes after 30–50 ms.
+
+**Beyond four streams.** The hope was to show that vLLM does not scale better than this engine when more conversations run at once. The data say it does.
+
+With the benchmark switch, Kuroshio gave 677–686 tokens/s at 8 slots and 905–922 at 16 in a first series. The first suspect was speculation: perhaps drafting stops paying when many conversations share a step. With speculation off:
+
+| Streams | Kuroshio, no speculation | Kuroshio, defaults |
+|---|---|---|
+| 4 | 414 | 502 |
+| 8 | 603 | 704 |
+| 16 | 864 | 949 |
+
+Drafting pays at every stream count. Verifying at most 2 drafts per step (`--spec 2`) at 16 streams gave 928–938, a little more than the 905–922 of the same series: with 16 conversations a shorter draft is slightly better, but that is not the gap.
+
+The gap is the time of one step. Without a drafter every step produces exactly one token per conversation, so the step time is the number of conversations divided by the total tokens/s. 16 conversations at 1,068 tokens/s is one step every 15.0 ms. Both series:
+
+| Conversations | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| vLLM step, ms | 5.9 | 8.4 | 10.1 | 12.0 | 15.0 |
+| Kuroshio step, ms | 6.0 | ~7.0 | 9.7 | 13.3 | 18.5 |
+
+Up to 4 conversations the two are level, or this engine is faster. From 8 on vLLM's grow more slowly. A Kuroshio step of 16 rows from one conversation takes 14.6 ms; 16 rows from 16 conversations take 18.5 ms. The difference has two parts. Rows of one conversation share many of their experts (the count in Step 66), and rows of different conversations share fewer, so a step reads more distinct experts. And the host does work per conversation in every step. vLLM scales better beyond 4 streams. The README says so in those words, under the table.
+
+**The tool calls: the model, the parser, or the chat template?** Step 55 found that the model often writes a broken tool call, `{"name":"read_file"args":…` without the comma, on this engine and on vLLM. This engine fixed it by writing the one legal opening itself. vLLM scored 9 of 24 there. Before publishing "24 of 24, where vLLM manages 15", one question had to be answered: was vLLM's low score really the model? It could have been vLLM's parser (the code that turns the model's raw text into the API's `tool_calls` field) or its chat template (the recipe that turns messages into tokens). If it was either, the comparison would be with a misconfigured vLLM.
+
+The investigation (`vllmtool.py`) took the causes apart one at a time:
+
+1. *The configuration.* vLLM was started with its Inkling tool-call and reasoning parsers. Its token ids for the prompt, from its own tokenize endpoint, were equal to this engine's: 148 of 148. The template is not the difference.
+2. *Without the parser.* The same token ids were sent to vLLM's raw completion endpoint, with control tokens left visible, so that no parser touches the output. The raw text contained the same malformed body, `{"name":"read_file"args":…`, in 9 of the 24 prompts. When the chat request and the raw request were run back to back, their outcomes agreed on 24 of 24 prompts, and the same request sent twice gave the same text. The parser is not the difference.
+3. *vLLM's own probabilities.* At the token after `{"name":"read_file"` on the failing prompts, vLLM itself gave `args`, the token that skips the comma, 0.92, 0.96, 0.997 and 0.94.
+4. *The position is numerically unstable.* The same token ids give different distributions depending on how they are computed:
+
+| The same token ids, computed by | First prompt | Second prompt |
+|---|---|---|
+| vLLM, while generating | `,` 0.951 | `args` 0.919 |
+| vLLM, the ids fed back as a prompt | `args` 0.608 | `,` 0.095, the rest spread over junk tokens |
+| Kuroshio | `,` 0.973 | `args` 0.647 |
+
+On the first prompt, vLLM's two computations disagree on the winner, and this engine agrees with one of them. A faulty engine would be wrong in a consistent direction. Here the decision itself sits on a knife edge: two tokens are close, and differences in the order of the arithmetic, which are harmless almost everywhere (Steps 38 and 43), flip it. The token after `{"name":"read_file"` is such a position, on every engine. The README gives one of these pairs: 0.95 on the comma while generating, 0.27 when the same ids are re-read.
+5. *The score over passes.* The test is 24 variants of one agent prompt at temperature 0. Repeated:
+
+| Engine | Well-formed, of 24, per pass | Median |
+|---|---|---|
+| Kuroshio | 24 in each of 10 passes | 24 |
+| vLLM + DSpark | 11 in the first pass, 15 in the nine after it (9 in Step 55) | 15 |
+| vLLM, no drafter | 8 in the first pass, 13 in the four after it | 13 |
+| Strata | 2 in each of 10 passes | 2 |
+
+vLLM has no grammar for this model: its log says "No Inkling structural-tag grammar is wired up yet". Nothing corrects the model there. This engine's fix stands, and the README's figure for vLLM became the median with its range.
+
+*A probe that looked at the wrong token.* The first version of the probability probe in point 3 took the wrong position in the raw completion. It printed, with each result, the tail of text in front of the probed token. That tail should have ended in `{"name":"read_file"`. It was words of the model's thinking. The probabilities it printed were real, but they belonged to a token in the middle of the thinking and said nothing about the comma. The corrected probe adds up the completion's tokens as text until the text ends in `{"name":"read_file"`, and reads the alternatives for the next token there. The printed tail cost a few characters per line, and it was the only thing that showed the mistake.
+
+Also seen on the way: with only an `edit_file` tool declared and a high reasoning effort, vLLM's model calls a tool named `Read` that was never declared. One of the test suite's two remaining warnings is about the same behaviour on this engine, so that warning belongs to the model too.
+
+**A harness mistake.** The first series with more than 4 slots measured nothing it claimed to. The launcher started the server in the background and recorded its process id (PID), but the PID it recorded was that of a subshell, a copy of the shell that the script had started to run the command, not the server's. "Stop the server" stopped the subshell. The one-slot server kept running and kept the port. The 4-, 8- and 16-slot servers then failed to start, and the benchmark talked to the one-slot server throughout. "2, 4, 8 and 16 streams" all measured one slot with a queue in front of it: about 245 tokens/s each. The launcher now stops if the server process has died, and checks the slot count that the server itself reports at `/v1/models` before any measurement. A benchmark script is a program, and it needs checks of the conditions it assumes, as any program does.
+
+**How the results were presented.** The README's opening line no longer says "faster than vLLM". It says "at the highest single-stream speed measured for it". The headline has three tables, decode, prompt processing on new text and tool calls, each with the medians of this step. The best figure in each row is in bold, whichever engine it belongs to. The bullet list under the opening line has a fifth item: "Not the fastest at everything: vLLM and Strata read long prompts faster, and vLLM is ahead beyond 4 streams." The notes under the tables explain the single-stream metric, Strata's 274, the 1.7 s and the one-pass reading, and the tool-call investigation. The speed stage of the test suite (Step 63) checks against the new figures: 248, 389 and 502 tokens/s, and 3,330 for prompt processing.
+
+**The final review.** The changes since the seeded-sampling fix, Steps 63 to 67, had each been reviewed on their own. An independent review then read them all at once, with the server as a whole: how the changes interact, what is left over, and what a client can do. It found no exactness defect, and no reachable panic, hang or slot leak in the scheduler or the engine. It checked the interactions one by one: copied drafts with the two-stage head, 256-row prompt steps with the prefix cache, the convolution history ring of 40 slots (`CR`, Step 64) against every rewind margin, the two row limits `TMAX` and `PMAX`, a stop sequence together with a cancel, and the defusing of control tokens together with the forced tool-call text. All hold.
+
+It found five faults. None of them is in one change. Each lies between two parts, or in a path that only an unusual client or an unusual failure reaches:
+
+| Fault | How it fails | Fix |
+|---|---|---|
+| The time limit on reading a request restarted with every byte. A socket's read timeout (15 s) bounds the wait for the next byte, not for the whole request. The 60 s limit on the headers was checked only between header lines, and the body had no limit of its own. | A client sends one byte every few seconds. Each read succeeds before its timeout, and a header line may be 8 KiB long, so the request takes hours and holds a connection thread all that time. The server allows 256 connections (`MAX_CONNECTIONS`); 256 such clients shut everyone else out. This is a known attack, called slowloris. | One deadline for all header lines together (60 s) and one for the body (30 s plus about a second per 256 KiB). Before each read, the socket's timeout is set to the time left, at most 15 s (`read_line`, `read_request`). |
+| The count of open connections was decreased after the connection's handler returned. | A panic in a connection thread ends the thread without reaching that line. Its place is never given back. After 256 panics the server refuses every connection, although it is otherwise healthy. | A guard object (`Place`) holds the place and gives it back when it is dropped. Rust drops it however the thread ends, during a panic too. |
+| A step can return a token id outside the vocabulary: both output heads return such a marker when every logit of a row is NaN (Step 67). It was fed back to the model as the next token. | The engine refuses that token, the scheduler asserts on the refusal, and the whole server stops: one request's numerical failure ends every conversation. | The scheduler checks the step's tokens. An impossible one ends that request with a 500 error, "the model produced no valid token (a numerical failure); the request was stopped" (`NO_TOKEN`), and the others carry on. |
+| The forced tool-call text (Step 55) was fed only if all of it fitted into the rows left in the step, and was dropped otherwise. | Two conversations open tool calls with long names in the same step. The second's opening does not fit, it is thrown away, and the model writes the opening itself, which is the broken text the fix exists to prevent. | The text is fed as far as the step has room, and the rest goes into the next step. When text is left over, the next token is its next supplied token, not the model's choice at the last fed row. |
+| The check for a closed connection (`client_gone`, Step 57) peeked at one byte: no byte and end of stream means closed, a byte means open. | A client sends some bytes after its request and then closes. The peek finds those bytes every time, and the close behind them is never seen. The request is not cancelled and its slot generates for nobody. | The check reads and discards what is waiting, up to 64 reads of 4 KiB. Every reply closes the connection, so nothing more will be read from it anyway. Then the close is visible. |
+
+No test had shown any of these, and none was in the scope of a per-change review: each lies in a path that no single change was about.
+
+**Two checks that can now fail.** `scripts/verify.sh` gained two lines.
+
+- *Several prompts in shared 256-row steps.* Step 66 tested 256-row prompt steps with one conversation. The server mixes several. `INK_IL_PRE=n` makes the interleaving test (Step 51) read the first n tokens of every conversation in prompt-only steps of up to 256 rows, each conversation adding a run of 1 to 200 tokens per step in an irregular pattern. Runs therefore straddle the boundary between the two attention halves of a step (Step 66). What the conversations generate after that must equal their separate runs. `INK_IL_PRE=1250 kuroshio interleave 3 1300` is the new line.
+- *The NLL as a fingerprint.* Since Step 35 the script has printed the model's NLL (negative log-likelihood) on `docs/ARCHITECTURE.md` in both modes. Every change that was meant to be bit-identical has left it unchanged to the last digit: 0.9007 for the lossless mode, 0.9068 for the 8-bit mode. But a line that only prints cannot fail. The script exited successfully whatever the number was, and noticing a change depended on someone reading it. Now any other value fails the script, with a message that says the arithmetic changed, or the file did. A different value is not necessarily wrong. It must be intended, and then the number in the script is updated with it.
+
+**The step-time table, re-measured.** The scheduler decides how many rows to put into a step from a table of step times by number of rows (`rows_ms`, Step 64). It had been measured with `kuroshio steptime`, which runs steps through the whole-text entry point and so always uses the full output head. Since Step 67 the server's own steps use the two-stage head up to 32 rows. With `INK_STEP_FAST=1` the command now times steps as the server runs them (`step_rows`, with the head). In ms:
+
+| Rows | 1 | 8 | 16 | 32 | 33 | 64 | 128 |
+|---|---|---|---|---|---|---|---|
+| Before (Step 65) | 6.10 | 10.60 | 14.63 | 20.84 | 21.83 | 35.68 | 62.65 |
+| Now | 5.88 | 10.46 | 14.45 | 20.66 | 21.71 | 34.92 | 60.22 |
+
+Above 32 rows both measurements use the full head, and those points moved too. The table was last measured in Step 65, before the smaller expert grid of Step 66, which applies from 17 rows on; that fits the change at 64 and 128 rows.
+
+**The gauntlet before the release.** The full test suite (Step 63) ran on the build with the two-stage head: no failures. API 80 of 80, robustness 26 of 26 including the 15-minute soak (host memory flat with the arena limit of Step 67), throughput, memory, quality 56 of 56, the pi coding agent 6 of 6 tasks, and the repository's scripts. Two known warnings remain: the model calls an undeclared tool, and a shared document followed by a different last question gets no reuse from the prefix cache. After the review's fixes, `verify.sh` and the API, determinism and robustness stages were run again and pass.
+
+**Quirks we hit**
+
+- **The error in the prompt comparison was in measuring the other engine.** This engine's figure held: 3,250 tokens/s at 4K with the harness, 3,328 at 4.7K on new text. vLLM's was wrong in both directions: far too low on a first call (580), far too high once warm (about 16,500). A benchmark that works for one engine can be wrong for another, because "cold" depends on what each engine caches.
+- **vLLM's first tool-call pass scored differently from the ones after it**: 11 then 15, and 8 then 13 without the drafter, at temperature 0. Why the first pass differs was not examined. It is one more reason to run several passes.
+- **The prompt-token weight in the scheduler kept its value.** Its comment now reads 84 ms per 256 rows against 5.9 ms per output token (it was 44 ms per 128 rows against 6.1 ms). The ratio, 0.056, did not change.
+- **Copied drafts (Step 64) are now collected only when speculation is on**: `--spec` above 0 and the drafter loaded. The README's option table says so.
+- **The help text's list of developer commands was out of date.** It lacked `argmaxes`, `headcheck`, `graphmem` and `gen`, and now has them.
+- **Strata's context limit is 32K**, so its largest prompt-processing cell is 27.8K tokens, not 33.5K. The table says so rather than leaving the cell empty or comparing different sizes without a note.
+
+**Why you should care**
+
+- Compare engines on the same card, in the same hour, with the same harness, and report the median and the range of many runs. With vLLM's 16-stream range of 840–1,230, three runs prove little.
+- Check what a metric counts and what it times, for every engine it is applied to. "Tokens from the first visible token" is fair only if no counted token is produced before that token. When a figure is too good, count again from the raw output.
+- A figure that does not move from run to run, where the others do, is a clue in itself.
+- Prefer a metric that counts everything a client waits for. Tokens over the whole request cannot be flattered by hidden work.
+- "Cold" means different things to different engines. Find out what each one caches, here content for one and prompt length for the other, and make every sample new in every respect.
+- Check the claims you like as hard as the ones you do not. "5.6×" was ours, and it was wrong.
+- Before explaining a scaling gap by policy, turn the policy off and measure. Here speculation paid at every stream count, and the gap was the step time.
+- Derive the quantity that explains a result from the measurements you have. Without drafting a step yields one token per conversation, so throughput gives step time directly.
+- To find which part of a stack causes a failure, remove the parts one at a time while keeping the inputs identical: the same token ids, then without the parser, then the model's own probabilities.
+- When the same input gives different answers on the same engine, the input sits at an unstable point, and "which engine is right" has no answer there. The fix is to stop asking the model for that token.
+- Print the context with every probe result. A probe aimed at the wrong place gives real numbers about the wrong thing.
+- A review of a whole range of changes finds what per-change reviews do not: faults between the parts, and paths that only a hostile client or a numerical failure reaches.
+- A per-read timeout is not a deadline. Bound the whole request.
+- Give back a shared resource in a guard that runs however the code exits, a panic included.
+- One request's failure must end that request, not the server.
+- A check that only prints cannot fail. Turn a number you watch into a comparison that fails the script.
+- Benchmark scripts need assertions too. Check that the server you are measuring is the one you think you started, with the configuration you think it has. A flat line across stream counts was the symptom here.
+- Publish where you lose, in the same table as where you win.
+
+**Jargon**
+
+- **Assertion (in a script)**: a check that stops a program, or a benchmark script, when a condition it relies on does not hold, such as "the server reports 8 slots"; without it a script measures whatever happens to be running.
+- **Confounding factor (confound)**: something other than the thing being compared that differs between the measurements and affects them, such as the hour of day, or a prompt that is cached for one engine and not for another.
+- **Drop guard**: an object whose only job is to undo something when it goes out of scope, such as giving back a connection place; the language runs its clean-up however the scope is left, a panic included.
+- **Fingerprint (of a computation)**: a number, such as the NLL on a fixed text, that changes whenever the arithmetic changes in any way; a script that compares it exactly turns "bit-identical" from a promise into a check.
+- **Like-for-like comparison**: a comparison in which the engines run on the same hardware, at the same time, with the same inputs, settings and metric, so that the only difference is the engines.
+- **Numerically unstable position**: a point in a text where two candidate tokens are so close that differences in the order of the arithmetic, harmless elsewhere, decide between them; the same token ids can then give different winners on different engines, or on one engine computed two ways.
+- **Parser (tool-call / reasoning)**: the part of a server that turns the model's raw text into the API's structured fields, such as `tool_calls` and `reasoning_content`.
+- **Range (of repeated runs)**: the lowest and the highest result of a series of runs; reported with the median, it shows how far a single run can be trusted.
+- **Raw completion**: generating from given token ids with the output returned as plain text, control tokens included, without the chat template's formatting or a parser; it shows what the model itself produced.
+- **Reasoning tokens (thinking)**: the tokens a model generates to work through a problem before its answer; a server may stream them, return them separately, or hide them, and it usually counts them in the usage figures either way.
+- **Slowloris**: an attack, or a broken client, that keeps server connections busy by sending a request very slowly, a byte at a time, so that each read succeeds just before its timeout; the defence is a deadline for the whole request.
+- **Whole-request throughput**: generated tokens divided by the time from sending the request to the end of the reply; unlike throughput from the first visible token, it includes work the server does before streaming, such as hidden thinking.
+
+---
+
 ## Glossary
 
 Alphabetical. Later entries extend this list.
@@ -4215,6 +4456,7 @@ Alphabetical. Later entries extend this list.
 - **Allocator arena (malloc arena)**: a pool of memory that the C library's allocator manages under one lock; glibc spreads threads over several arenas so that they do not wait for each other, and memory freed into an arena stays there for reuse instead of going back to the operating system.
 - **Anchor token**: the last token the main model produced, which the drafter takes as the starting point for its guesses.
 - **Argmax**: the position of the largest value in a list; here, the ID of the highest-scoring token.
+- **Assertion (in a script)**: a check that stops a program, or a benchmark script, when a condition it relies on does not hold, such as "the server reports 8 slots"; without it a script measures whatever happens to be running.
 - **Associativity (floating point)**: the property that (a × b) × c equals a × (b × c); it holds for real numbers but not for floating-point arithmetic, where each operation rounds.
 - **Asynchronous launch / synchronise**: starting a kernel returns to the CPU before the GPU has done the work; to synchronise is to wait explicitly until the GPU has finished.
 - **Atomic operation**: an operation on a shared memory word that runs as one indivisible step, so that two threads changing the same word cannot overwrite each other's change; `atomicOr` sets bits this way.
@@ -4249,6 +4491,7 @@ Alphabetical. Later entries extend this list.
 - **Compute-bound vs memory-bound**: a kernel is compute-bound when the instructions it must execute limit its speed and memory-bound (the same as bandwidth-bound) when the arrival of bytes from memory does.
 - **Compute capability**: version number identifying which NVIDIA GPU generation code is compiled for (`sm_120` for the RTX 5090; the `sm_120a` variant enables its 4-bit tensor-core instruction).
 - **compute-sanitizer**: NVIDIA's checking tool that runs a CUDA program and reports invalid memory accesses by its kernels, such as reads or writes outside an allocation.
+- **Confounding factor (confound)**: something other than the thing being compared that differs between the measurements and affects them, such as the hour of day, or a prompt that is cached for one engine and not for another.
 - **Constrained decoding / forced tokens**: restricting what the model may produce at a position to what the output format allows; when the format allows a single token, it is supplied (forced) instead of sampled.
 - **Context**: the tokens the model can see when it produces the next one: the prompt plus everything generated so far.
 - **Context bucket**: a range of context lengths (up to 1,024, up to 2,048, ...) that shares one captured CUDA graph, because a graph's grid sizes cannot change; full-attention layers size their work by the bucket of the batch's last token.
@@ -4272,6 +4515,7 @@ Alphabetical. Later entries extend this list.
 - **Draft confidence threshold**: the minimum draft confidence a guess needs in order to be verified; verification stops at the first guess below it (`INK_TAU`).
 - **Draft network**: the cheap model that guesses tokens in speculative decoding.
 - **Driver**: the system software that talks to the GPU.
+- **Drop guard**: an object whose only job is to undo something when it goes out of scope, such as giving back a connection place; the language runs its clean-up however the scope is left, a panic included.
 - **DSpark**: the 3-layer draft network shipped with Inkling 2 Mini.
 - **E2M1**: a 4-bit floating-point format with 1 sign bit, 2 exponent bits and 1 mantissa bit; its values are 0, 0.5, 1, 1.5, 2, 3, 4 and 6, positive or negative.
 - **E4M3**: an 8-bit floating-point format with 1 sign bit, 4 exponent bits and 3 mantissa bits; the value format of MXFP8.
@@ -4281,6 +4525,7 @@ Alphabetical. Later entries extend this list.
 - **Expert**: one of the alternative MLPs in a mixture-of-experts layer.
 - **Fall-back path**: the slower, simpler way a program takes when its fast way cannot handle a case, here the full head after the candidate list has overflowed; normal inputs rarely reach it, so it needs a test that forces it.
 - **FFI (foreign function interface) / bindings**: the declarations that let one language (here Rust) call functions compiled from another (here CUDA C++).
+- **Fingerprint (of a computation)**: a number, such as the NLL on a fixed text, that changes whenever the arithmetic changes in any way; a script that compares it exactly turns "bit-identical" from a promise into a check.
 - **FLOPS / TFLOPS**: floating-point operations per second; TFLOPS is 10¹² of them.
 - **FMA / fused multiply-add and contraction**: an FMA computes a × b + c in one instruction with a single rounding; contraction is the compiler replacing a separate multiply and add by an FMA, which can change the last bit of the result.
 - **Forward pass**: one run of the model's arithmetic from input tokens to output scores.
@@ -4319,6 +4564,7 @@ Alphabetical. Later entries extend this list.
 - **Layer**: one repeated block of the network.
 - **Layer visit**: one execution of a stored layer for a token; with the loop there are 48 visits of 24 stored layers.
 - **Lazy loading (of GPU kernels)**: CUDA's default of loading a kernel's code onto the GPU at its first launch instead of at start-up; that first launch needs GPU memory and can fail.
+- **Like-for-like comparison**: a comparison in which the engines run on the same hardware, at the same time, with the same inputs, settings and metric, so that the only difference is the engines.
 - **Load chain / memory-level parallelism**: a load chain is the memory loads one thread performs one after another, waiting for each; memory-level parallelism is having several independent loads in flight at once so that their waits overlap.
 - **Load-time peak**: the highest memory use a program reaches while it starts up, which can exceed what it uses afterwards because temporary buffers exist next to the final ones.
 - **Logits**: the raw scores the output head gives each vocabulary entry, before they are turned into probabilities.
@@ -4349,6 +4595,7 @@ Alphabetical. Later entries extend this list.
 - **Norm (of a vector)**: its length, the square root of the sum of the squares of its elements; written |x| here.
 - **Nucleus sampling (`top_p`)**: sampling only among the most likely tokens, the smallest set whose probabilities add up to p.
 - **Numerically chaotic**: tiny differences in arithmetic grow into visibly different outputs.
+- **Numerically unstable position**: a point in a text where two candidate tokens are so close that differences in the order of the arithmetic, harmless elsewhere, decide between them; the same token ids can then give different winners on different engines, or on one engine computed two ways.
 - **nvcc**: the CUDA compiler.
 - **NVFP4**: NVIDIA's 4-bit floating-point weight format with one shared scale per small block.
 - **Open weights**: trained parameters published for download.
@@ -4359,6 +4606,7 @@ Alphabetical. Later entries extend this list.
 - **Packed activations (operand layout)**: activations rewritten once into the bit pattern and byte order in which the tensor-core instruction takes its operand, so that the matrix kernel loads them ready for use instead of converting them in every thread at every use.
 - **Page cache**: the operating system's in-RAM copy of recently read file data.
 - **Parameters / weights**: the numbers a model learned in training.
+- **Parser (tool-call / reasoning)**: the part of a server that turns the model's raw text into the API's structured fields, such as `tool_calls` and `reasoning_content`.
 - **Perplexity / NLL**: NLL (negative log-likelihood) is the average, over the tokens of a text, of minus the log-probability the model gave to the actual next token, in nats per token; perplexity is e to the power of the NLL; lower is better for both.
 - **Per-token context cost**: the bytes of VRAM the engine reserves for each token of context capacity; here mostly the keys and values of the full-attention layer visits.
 - **pip wheel**: a pre-built Python package.
@@ -4376,6 +4624,9 @@ Alphabetical. Later entries extend this list.
 - **PyTorch**: the standard Python library for neural-network arithmetic.
 - **Quadratic-time bug**: code that repeats work on everything produced so far at every step, so the total work grows with the square of the output length.
 - **Quantisation**: storing numbers in fewer bits to save memory; normally applied to weights ahead of time, and in this model also to activations at run time (see W4A4).
+- **Range (of repeated runs)**: the lowest and the highest result of a series of runs; reported with the median, it shows how far a single run can be trusted.
+- **Raw completion**: generating from given token ids with the output returned as plain text, control tokens included, without the chat template's formatting or a parser; it shows what the model itself produced.
+- **Reasoning tokens (thinking)**: the tokens a model generates to work through a problem before its answer; a server may stream them, return them separately, or hide them, and it usually counts them in the usage figures either way.
 - **Reduction**: combining many values into one, such as a sum or a maximum.
 - **Reduction tree (order of a sum)**: adding many values pairwise in rounds, halving their number each time, instead of one after another; in floating point the result depends on which values are paired, so two kernels must use the same tree to give the same bits.
 - **Reference implementation**: an existing program that runs the model and is taken as the definition of correct behaviour.
@@ -4406,6 +4657,7 @@ Alphabetical. Later entries extend this list.
 - **Single-stream**: serving one request at a time.
 - **Sliding-window attention**: attention limited to a fixed number of recent tokens (1024 here).
 - **Slot (conversation slot)**: one of a fixed number of places for a conversation in the engine, each with its own caches and histories; a request occupies one from its first prompt token to its last output token.
+- **Slowloris**: an attack, or a broken client, that keeps server connections busy by sending a request very slowly, a byte at a time, so that each read succeeds just before its timeout; the defence is a deadline for the whole request.
 - **Snapshot (of ring buffers)**: a copy of a slot's ring buffers taken at a known position, so the slot can later be put back to that position.
 - **Soak test**: a long run under realistic, varied load, meant to find problems that build up over time, such as memory that is never released.
 - **Soft cap (of logits)**: the function 30 × tanh(x / 30), applied to every logit before tokens are compared; it changes small values little and keeps every value below 30 in size.
@@ -4457,6 +4709,7 @@ Alphabetical. Later entries extend this list.
 - **W4A4**: 4-bit weights and 4-bit activations; the experts' inputs are quantised at run time as well as their stored weights.
 - **Warp**: 32 GPU threads of a block that execute the same instruction at the same time; the smallest unit the GPU schedules.
 - **Warp shuffle**: an instruction that lets a thread read a register value from another thread of its warp directly, without going through memory.
+- **Whole-request throughput**: generated tokens divided by the time from sending the request to the end of the reply; unlike throughput from the first visible token, it includes work the server does before streaming, such as hidden thinking.
 - **Worst-case bound (of a grid)**: the largest number of work items that any input can produce, used to size something that must be fixed in advance, such as a kernel's grid in a recorded CUDA graph; the looser the bound, the more blocks are launched that find nothing to do.
 - **Zero-copy**: using data where it already lies instead of first copying it into another buffer.
 - **Zero-initialisation**: filling newly allocated memory with zeros before first use, so that every element holds a known, finite value.

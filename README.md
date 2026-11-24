@@ -41,7 +41,7 @@ at its defaults (lossless 16-bit cache).
 
 | Tool calls | Kuroshio | vLLM + DSpark | vLLM, no drafter | Strata |
 |---|---:|---:|---:|---:|
-| Well-formed, of 24 (median of 10 passes; range) | **24** (24-24) | 15 (11-15) | 13 (8-13) | 2 (2-2) |
+| Well-formed, of 24 (median of 10 passes, 5 without drafter; range) | **24** (24-24) | 15 (11-15) | 13 (8-13) | 2 (2-2) |
 
 † Kuroshio supports 4 slots; these rows use a benchmark-only override. At 8 slots its conversations share 160K
 tokens of context, at 16 slots 61K (under 4K each). Beyond 4 streams vLLM scales better: its step time grows more
