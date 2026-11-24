@@ -26,7 +26,7 @@
 namespace {
 cudaStream_t g_stream = nullptr;
 const int D = 2304, H = 24, HKV = 8, DH = 128, DR = 16, EXT = 1024, NE = 128, TOPK = 8, I2 = 1152;
-const int V0 = 200058, NVIS = 48, TMAX = 512;               // TMAX: most rows of one step (a prompt batch)
+const int V0 = 200058, NVIS = 48, TMAX = 1024;              // TMAX: most rows of one step (a prompt batch)
 const int HMAX = 128;                                     // most rows of a step that uses the output head (decoding); also the size of an attention
                                                           // sub-batch: a bigger step runs its attention in halves (see forward_body)
 const int QKVR = 8600;                                   // rows of the fused q|r|gate|sink|k|v projection
@@ -34,7 +34,11 @@ const int R_Q = 0, R_R = 3072, R_GATE = 3456, R_SINK = 6528, R_K = 6552, R_V = 7
 const int RING = 1152;                                   // local KV ring: window 1024 + batch headroom
 const int DBATCH = 4;                                     // conversations the drafter handles in one pass
 const int MAXSEQ = 16;                                    // most conversations (slots) one engine can hold
-const int GSUB = 16;                                      // tokens per launch in full-attention layers (bounds the scratch: GSUB * 24 * max_ctx floats)
+const int GSUB = 16;                                      // rows per launch in full-attention layers at long context (bounds the scratch: GSUB * 24 * context * 6 bytes)
+// At shorter context the same scratch holds more rows, and a step then needs fewer launches: 128 rows up to 4K tokens of
+// context, 64 at 8K, 32 at 16K, 16 beyond. ctx: the context bucket (a power of two, or the largest context).
+static inline int gsub_rows(size_t ctx) { int r = 128; while (r > GSUB && (size_t)r * ctx > (size_t)128 * 4096) r /= 2; return r; }
+static inline size_t gsub_bytes(size_t ctx) { return (size_t)gsub_rows(ctx) * 24 * ctx * 6; }
 const int CR = 40;                                        // conv-input history kept between calls, indexed by position mod CR. Lags inside a batch are
                                                           // read from the batch itself. Runs of up to CR - 3 tokens store every token in the kernel that
                                                           // computes it (no slot is read and written in one launch); longer runs store their last CR - 3
@@ -2154,7 +2158,7 @@ struct Engine {
     uint16_t *Kc[NVIS], *Vc[NVIS]; float *ring[NVIS][4];  // rings: K, V, ATTN, MLP conv inputs
     // scratch
     float *stack[5], *prelude_partial, *bank[2], *prelude_dests, *inputs, *msg, *xin, *proj, *dk, *dv, *qc, *bias, *att_sc, *att_l, *att_y,
-          *attn_raw, *attn_out, *mixtmp, *pair, *hbuf, *gx, *mlp_in, *rlogit, *gamma, *xq, *xamax, *gu, *act, *aq, *aamax, *down, *moe_out, *y, *out, *logits;
+          *attn_raw, *attn_out, *mixtmp, *pair, *hbuf, *gx, *mlp_in, *rlogit, *gamma, *xamax, *gu, *aamax, *down, *moe_out, *y, *out, *logits;
     int *tok, *ids, *arg, *tasks, *ntasks, *tasksw = nullptr; uint4* xb = nullptr; Row* rows;   // tasksw, xb: wide expert tasks and their gathered activations      // rows: per-row conversation and position of the current step
     Grp* grp = nullptr; int *gb = nullptr, *rowg = nullptr, *cso = nullptr;   // the step's row groups for attention (see k_attn_scores_g, k_attn_scores_l)
     uint8_t* snap = nullptr; size_t snap_bytes = 0; bool vis_global[NVIS] = {}, snap_ok[MAXSEQ] = {}; int last_T = 0;   // prefix-cache snapshots: [conversations][snap_bytes]
@@ -2380,7 +2384,7 @@ int ink_ensure(void* ep, int seq, int tokens) {
     if (tokens <= e->ctx_mapped[seq]) return 0;
     size_t kvt = (size_t)HKV * DH * (e->kv8 ? 1 : 2), dkt = (size_t)HKV * DH * 2;   // bytes per token: one cache of a full-attention visit; drafter
     int bucket = 1024; while (bucket < tokens) bucket *= 2;
-    size_t sc = vround(std::max(LOCAL_SC, (size_t)GSUB * H * std::min(bucket, e->max_ctx) * 6));
+    size_t sc = vround(std::max(LOCAL_SC, gsub_bytes(std::min(bucket, e->max_ctx))));
     size_t add = sc > e->vsc.mapped ? sc - e->vsc.mapped : 0;
     for (int v = 0; v < NVIS; v++) if (e->vis_global[v]) add += 2 * ((size_t)tokens * kvt - std::min(e->vK[v][seq].mapped, (size_t)tokens * kvt));
     if (d.on) add += 2 * ((size_t)tokens * dkt - std::min(e->vdK[seq].mapped, (size_t)tokens * dkt));
@@ -2412,7 +2416,7 @@ void ink_trim(void* ep, int seq, int tokens) {
     if ((int)left < e->snap_tokens[seq]) e->snap_ok[seq] = false;          // the snapshot's prefix is gone
     int most = 0; for (int q = 0; q < e->nseq; q++) most = std::max(most, e->ctx_mapped[q]);
     int bucket = 1024; while (bucket < most) bucket *= 2;                  // the score scratch follows the longest conversation left
-    e->vsc.shrink(std::max(LOCAL_SC, (most ? (size_t)GSUB * H * std::min(bucket, e->max_ctx) : 0) * 6));
+    e->vsc.shrink(std::max(LOCAL_SC, most ? gsub_bytes(std::min(bucket, e->max_ctx)) : gsub_bytes(1024)));
 }
 
 // Free memory on the GPU right now, in bytes (used to size the context before loading).
@@ -2652,15 +2656,15 @@ void ink_finalize(void* ep) {
     for (auto& s : e->stack) s = dalloc(T * D);
     e->prelude_partial = dalloc(T * D); e->bank[0] = dalloc(T * D); e->bank[1] = dalloc(T * D); e->prelude_dests = dalloc(T * D);
     e->inputs = dalloc(T * 3 * D); e->msg = dalloc(T * 4 * D); e->xin = dalloc(T * 3 * D); e->proj = dalloc(T * QKVR);
-    e->dk = dalloc(T * 32); e->dv = dalloc(T * 32); e->qc = dalloc(T * H * DH); e->bias = dalloc(T * H * EXT);
+    e->dk = dalloc(T * 32); e->dv = dalloc(T * 32); e->qc = dalloc(T * H * DH); e->bias = dalloc(HMAX * H * EXT);   // bias: one attention sub-batch at a time (see `bias` in forward_body)
     // Score scratch: T x H x RING for the sliding-window layers; GSUB x H x (context bucket) for full attention, attached on demand.
     // scores as fp32 and, behind them, the probabilities again as bf16 operands: 4 + 2 bytes per (row, head, slot)
-    e->vsc.reserved = vround(std::max(LOCAL_SC, (size_t)GSUB * H * (size_t)e->max_ctx * 6)); e->vsc.base = vreserve(e->vsc.reserved);
-    if (!e->vsc.grow(LOCAL_SC)) { fprintf(stderr, "out of GPU memory for the score scratch\n"); abort(); }
+    e->vsc.reserved = vround(std::max({LOCAL_SC, gsub_bytes(4096), gsub_bytes((size_t)e->max_ctx)})); e->vsc.base = vreserve(e->vsc.reserved);
+    if (!e->vsc.grow(std::max(LOCAL_SC, gsub_bytes(1024)))) { fprintf(stderr, "out of GPU memory for the score scratch\n"); abort(); }
     CK(cudaMalloc(&e->grp, TMAX * sizeof(Grp))); CK(cudaMalloc(&e->gb, (TMAX / 16 + 2) * 4)); CK(cudaMalloc(&e->rowg, TMAX * 4)); CK(cudaMalloc(&e->cso, (TMAX + 1) * 4));
     e->att_sc = (float*)e->vsc.base; e->att_l = dalloc(T * H * 2); e->att_y = dalloc(T * H * DH); e->attn_raw = dalloc(T * D); e->attn_out = dalloc(T * D);
-    e->mixtmp = dalloc(T * D); e->pair = dalloc(T * 3 * 2 * D); e->hbuf = dalloc(T * 192); e->gx = dalloc(T * 3 * D); e->mlp_in = dalloc(T * D); e->rlogit = dalloc(T * NE); e->gamma = dalloc(T * TOPK); e->xq = dalloc(T * D);
-    e->xamax = dalloc(T); e->gu = dalloc(T * TOPK * D); e->act = dalloc(T * TOPK * I2); e->aq = dalloc(T * TOPK * I2); e->aamax = dalloc(T * TOPK);
+    e->mixtmp = dalloc(T * D); e->pair = dalloc(T * 3 * 2 * D); e->hbuf = dalloc(T * 192); e->gx = dalloc(T * 3 * D); e->mlp_in = dalloc(T * D); e->rlogit = dalloc(T * NE); e->gamma = dalloc(T * TOPK);
+    e->xamax = dalloc(T); e->gu = dalloc(T * TOPK * D); e->aamax = dalloc(T * TOPK);
     e->down = dalloc(T * TOPK * D); e->moe_out = dalloc(T * D); e->y = dalloc(T * D); e->out = dalloc(T * D); e->logits = dalloc(HMAX * (size_t)V0);
     CK(cudaMalloc(&e->tok, T * 4)); CK(cudaMalloc(&e->ids, T * TOPK * 4)); CK(cudaMalloc(&e->arg, T * 4)); CK(cudaMalloc(&e->rows, T * sizeof(Row))); e->feats = dalloc(4 * T * D); e->head_v = dalloc(T * HEAD_PARTS); e->rowmax = dalloc(T); CK(cudaMalloc(&e->head_i, T * HEAD_PARTS * 4));
     CK(cudaMalloc(&e->sparts, T * HEAD_PARTS * sizeof(SampPart))); e->sparam = dalloc(2 * T); CK(cudaMalloc(&e->excl, 2 * TMAX * 4)); e->qrow = e->excl + TMAX; e->rowz = dalloc(T); CK(cudaMalloc(&e->rparts, (size_t)T * HEAD_PARTS * sizeof(ResPart))); CK(cudaMalloc(&e->sres, T * 16 + 8));
@@ -2737,9 +2741,9 @@ static void head_two_stage(Engine* e, int T) {
 // Shapes as measured at 128 rows: scores 28.8 us with 8 warps per block, 22.2 with 12, 17.9 with 18 (24 do not fit a
 // block's registers); softmax 12.7 us with 1 warp per (row, head), 10.7 with 2, no better with more; values 23 us
 // with one warp per 16 dims and three key groups loaded ahead (33 loading one at a time; more warps are slower).
-static void local_attention(Engine* e, int visit, size_t kvs, int h0, int hn, int ng, uint2* pl, int g0i, int g1i) {
+static void local_attention(Engine* e, const float* bias, int visit, size_t kvs, int h0, int hn, int ng, uint2* pl, int g0i, int g1i) {
     static const char* only = getenv("INK_LA_ONLY");     // timing: run one of the three (s, p, v)
-    if (!only || *only == 's') k_attn_scores_l<18><<<ng * HKV, 18 * 32, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[visit], e->rows, e->grp, e->gb, g0i, g1i, e->att_sc, h0, e->kv8, kvs);
+    if (!only || *only == 's') k_attn_scores_l<18><<<ng * HKV, 18 * 32, 0, g_stream>>>(e->qc, bias, (const uint8_t*)e->Kc[visit], e->rows, e->grp, e->gb, g0i, g1i, e->att_sc, h0, e->kv8, kvs);
     if (!only || *only == 'p') k_attn_soft_l<2><<<dim3(hn, H), 2 * 32, 0, g_stream>>>(e->att_sc, e->att_l, h0, pl, e->rowg, e->grp, e->cso, e->gb, g0i);
     if (!only || *only == 'v') k_attn_pv_l<1, 3><<<dim3(8, ng * HKV), 32, 0, g_stream>>>(pl, (const uint8_t*)e->Vc[visit], e->att_l, e->proj, e->att_y, e->kv8, e->rows, kvs, e->grp, e->cso, e->gb, g0i, g1i);
 }
@@ -2811,17 +2815,18 @@ static void forward_body(Engine* e, int T, int gchunks, int hm, int cls) {
             const bool big = T > CR - 3;                    // only then can a run be too long to store its conv history in-kernel
             for (int h0 = 0; h0 < T; h0 += HMAX) {
                 int hn = std::min(HMAX, T - h0);
-                k_attn_prep<<<dim3(hn, H + HKV), prep_threads(hn), 0, g_stream>>>(e->proj, L.qscale, L.rscale, L.rel, L.global, e->rows, e->qc, e->bias, e->ring[visit][0],
+                const float* bias_c = e->bias - (size_t)h0 * H * EXT; float* bias = (float*)bias_c;   // the buffer holds this sub-batch; kernels index it by row of the step
+                k_attn_prep<<<dim3(hn, H + HKV), prep_threads(hn), 0, g_stream>>>(e->proj, L.qscale, L.rscale, L.rel, L.global, e->rows, e->qc, bias, e->ring[visit][0],
                                                                    e->ring[visit][1], L.kconv, L.vconv, e->dk, e->dv, e->Kc[visit], e->Vc[visit], e->kv8, kvs, h0);
                 prof("attn q/r/kv prep");
                 int ng = L.global ? gchunks * 2 : RING / 16, ns = ng * 16;      // scores, softmax, value sum on the tensor cores
                 if (T < g_attn_group && T <= GSUB) {     // few rows: one block per row keeps more of the GPU busy
                     if (!L.global) {
-                        k_attn_scores<<<dim3((ng + 7) / 8, hn * HKV), 256, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[visit], e->rows, 0, ng, e->att_sc, RING, h0, e->kv8, kvs);
+                        k_attn_scores<<<dim3((ng + 7) / 8, hn * HKV), 256, 0, g_stream>>>(e->qc, bias, (const uint8_t*)e->Kc[visit], e->rows, 0, ng, e->att_sc, RING, h0, e->kv8, kvs);
                         k_attn_soft<<<dim3(hn, H), 1024, 0, g_stream>>>(e->att_sc, RING, ns, e->att_l, h0, e->rows, 0);
                         k_attn_pv<8><<<dim3(8, hn * HKV), 256, 0, g_stream>>>(e->att_sc, RING, (const uint8_t*)e->Vc[visit], ng, e->att_l, e->proj, e->att_y, 0, h0, e->kv8, e->rows, kvs);
                     } else {
-                        k_attn_scores<<<dim3((ng + 7) / 8, hn * HKV), 256, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[visit], e->rows, 1, ng, e->att_sc, gchunks * 32, h0, e->kv8, kvs);
+                        k_attn_scores<<<dim3((ng + 7) / 8, hn * HKV), 256, 0, g_stream>>>(e->qc, bias, (const uint8_t*)e->Kc[visit], e->rows, 1, ng, e->att_sc, gchunks * 32, h0, e->kv8, kvs);
                         k_attn_soft<<<dim3(hn, H), 1024, 0, g_stream>>>(e->att_sc, gchunks * 32, ns, e->att_l, h0, e->rows, 1);
                         k_attn_pv<32><<<dim3(8, hn * HKV), 1024, 0, g_stream>>>(e->att_sc, gchunks * 32, (const uint8_t*)e->Vc[visit], ng, e->att_l, e->proj, e->att_y, 1, h0, e->kv8, e->rows, kvs);
                     }
@@ -2829,18 +2834,18 @@ static void forward_body(Engine* e, int T, int gchunks, int hm, int cls) {
                     auto ngr = [&](int n) { return cls ? n : (n + 7) / 8; };          // most groups among n rows: the grid's height
                     if (!L.global) {
                         uint2* pl = (uint2*)(e->att_sc + (size_t)HMAX * H * RING); const int g0i = h0 / 16, g1i = (h0 + hn + 15) / 16;
-                        local_attention(e, visit, kvs, h0, hn, ngr(hn), pl, g0i, g1i);
-                    } else for (int t0 = h0; t0 < h0 + hn; t0 += GSUB) {   // full-attention layers: GSUB tokens at a time, so the scratch stays small
-                        int tn = std::min(GSUB, h0 + hn - t0); uint16_t* pk = (uint16_t*)(e->att_sc + (size_t)GSUB * H * gchunks * 32);
-                        k_attn_scores_g<SKG><<<dim3((ng + 8 * SKG - 1) / (8 * SKG), ngr(tn) * HKV), 256, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[visit], e->rows, e->grp, e->gb, t0 / 16, t0 / 16 + 1,
+                        local_attention(e, bias, visit, kvs, h0, hn, ngr(hn), pl, g0i, g1i);
+                    } else for (int t0 = h0, GS = gsub_rows((size_t)gchunks * 32); t0 < h0 + hn; t0 += GS) {   // full-attention layers: as many rows at a time as the scratch holds
+                        int tn = std::min(GS, h0 + hn - t0); uint16_t* pk = (uint16_t*)(e->att_sc + (size_t)GS * H * gchunks * 32);
+                        k_attn_scores_g<SKG><<<dim3((ng + 8 * SKG - 1) / (8 * SKG), ngr(tn) * HKV), 256, 0, g_stream>>>(e->qc, bias, (const uint8_t*)e->Kc[visit], e->rows, e->grp, e->gb, t0 / 16, (t0 + tn + 15) / 16,
                                                                                              1, ng, e->att_sc, gchunks * 32, t0, e->kv8, kvs);
                         prof("full attn: scores");
                         k_attn_soft_g<<<dim3(tn, H), 1024, 0, g_stream>>>(e->att_sc, gchunks * 32, ns, e->att_l, t0, pk, e->rows, 1, cls == 0);
                         prof("full attn: softmax");
                         if (cls == 0) k_attn_pv_gl<32><<<dim3(8, ngr(tn) * HKV), 1024, 0, g_stream>>>((const uint2*)pk, gchunks * 32, (const uint8_t*)e->Vc[visit], ng, e->att_l, e->proj, e->att_y, t0, e->kv8, e->rows, kvs,
-                                                                                                    e->grp, e->gb, t0 / 16, t0 / 16 + 1);
+                                                                                                    e->grp, e->gb, t0 / 16, (t0 + tn + 15) / 16);
                         else k_attn_pv_g<32><<<dim3(8, ngr(tn) * HKV), 1024, 0, g_stream>>>(pk, gchunks * 32, (const uint8_t*)e->Vc[visit], ng, e->att_l, e->proj, e->att_y, 1, t0, e->kv8, e->rows, kvs,
-                                                                                           e->grp, e->gb, t0 / 16, t0 / 16 + 1);
+                                                                                           e->grp, e->gb, t0 / 16, (t0 + tn + 15) / 16);
                         prof("full attn: values");
                     }
                 }
@@ -3217,7 +3222,7 @@ void ink_microbench(void* ep, int T) {
         CK(cudaMemcpy(e->rowg, rowg, T * 4, cudaMemcpyHostToDevice)); CK(cudaMemcpy(e->cso, cso, (n + 1) * 4, cudaMemcpyHostToDevice));
     }
     uint2* mpl = (uint2*)(e->att_sc + (size_t)HMAX * H * RING);
-    mbench("attention, sliding window (scores + softmax + values)", 0, [&](int r) { int i = r % 5; local_attention(e, i, e->kv_local, 0, T, (T + 7) / 8, mpl, 0, (T + 15) / 16); });
+    mbench("attention, sliding window (scores + softmax + values)", 0, [&](int r) { int i = r % 5; local_attention(e, e->bias, i, e->kv_local, 0, T, (T + 7) / 8, mpl, 0, (T + 15) / 16); });
     if (T >= 16) {                                       // full attention for one sub-batch of 16 rows at the current context
         int gv = 0; while (gv < NVIS && !e->vis_global[gv]) gv++;
         int pmax = 0; { std::vector<Row> rr(T); CK(cudaMemcpy(rr.data(), e->rows, T * sizeof(Row), cudaMemcpyDeviceToHost)); for (int t = 0; t < 16; t++) pmax = std::max(pmax, rr[t].pos); }

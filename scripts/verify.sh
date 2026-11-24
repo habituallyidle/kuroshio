@@ -12,11 +12,11 @@ echo "== batch size must not change results"
 $BIN argmaxes 1500 > "$TMP/b16.txt" 2>/dev/null; INK_CHUNK=1 $BIN argmaxes 1500 > "$TMP/b1.txt" 2>/dev/null; for c in 128 100 56 48 38 37 30 24 9 8; do INK_CHUNK=$c $BIN argmaxes 1500 > "$TMP/bx.txt" 2>/dev/null
   cmp -s "$TMP/b16.txt" "$TMP/bx.txt" || { echo "FAIL: batch-$c and batch-16 greedy tokens differ"; exit 1; }; done   # 100 and 48 straddle the 1,024-token bucket boundary; 37/38 the conv-history limit; 8/9, 24, 30, 56 the kernels' row groups
 cmp -s "$TMP/b16.txt" "$TMP/b1.txt" || { echo "FAIL: batch-16 and batch-1 greedy tokens differ"; exit 1; }
-# prompt-only steps of up to 512 rows (attention in sub-batches of 128, experts once) must leave the same state as 16-row steps:
+# prompt-only steps of up to 1,024 rows (attention in sub-batches of 128, experts once) must leave the same state as 16-row steps:
 # what follows them must come out the same. The sliding-window caches are rings of 1,152 positions, so the steps have
 # to go past position 1,152 to prove anything.
 $BIN argmaxes 2600 > "$TMP/p16.txt" 2>/dev/null
-for pre in 2560,512 2304,256 2400,200 1408,129; do INK_PRE=$pre $BIN argmaxes 2600 > "$TMP/bx.txt" 2>/dev/null; n=${pre%%,*}
+for pre in 2048,1024 2560,512 2304,256 2400,200 1408,129; do INK_PRE=$pre $BIN argmaxes 2600 > "$TMP/bx.txt" 2>/dev/null; n=${pre%%,*}
   cmp -s <(cut -d' ' -f$((n + 1))- "$TMP/p16.txt") <(cut -d' ' -f$((n + 1))- "$TMP/bx.txt") || { echo "FAIL: after prompt steps of ${pre##*,} rows the tokens differ"; exit 1; }; done
 # the matrix kernel that packs its inputs first (batches of 9+) must agree with the plain one
 INK_PACK_MIN=999 INK_CHUNK=100 $BIN argmaxes 1500 > "$TMP/bx.txt" 2>/dev/null; cmp -s "$TMP/b16.txt" "$TMP/bx.txt" || { echo "FAIL: plain and packed-input matrix kernels differ"; exit 1; }; echo "ok"
