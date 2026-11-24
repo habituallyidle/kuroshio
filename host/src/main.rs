@@ -706,8 +706,8 @@ fn main() -> Result<()> {
             let n: usize = args.get(2).map(|s| s.parse()).transpose()?.unwrap_or(1500);
             let dir = weights_dir()?;
             let chat = chat::Chat::load(&dir)?;
-            let ids = chat.encode(&std::fs::read_to_string("docs/ARCHITECTURE.md")?)?;
-            let mut eng = engine::Engine::load(&dir, 8192)?;
+            let ids = chat.encode(&std::fs::read_to_string(std::env::var("INK_TEXT").unwrap_or_else(|_| "docs/ARCHITECTURE.md".into()))?)?;
+            let mut eng = engine::Engine::load(&dir, std::env::var("INK_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(8192))?;
             let chunk: usize = std::env::var("INK_CHUNK").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
             let mut out = Vec::new();
             // INK_PRE=tokens,rows: read that many tokens first as prompt-only steps of `rows` rows (no output head, up to
