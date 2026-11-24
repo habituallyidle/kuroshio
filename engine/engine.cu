@@ -815,6 +815,9 @@ __device__ __forceinline__ bool slot_position(int slot, int p, int is_global, in
 // index of the first group at or after row 16 k, so that a launch over a sub-batch finds its groups.
 // =====================================================================================================
 struct Grp { int t0, n; };
+// Score scratch of the sliding-window layers: fp32 scores of HMAX rows, then their probabilities as operands: at most
+// 3/8 column sets per row plus one per group.
+const size_t LOCAL_SC = (size_t)HMAX * H * RING * 4 + (size_t)(HMAX * 3 / 8 + HMAX) * HKV * (RING / 16) * 256;
 __global__ void k_attn_scores_g(const float* qc, const float* bias, const uint8_t* Kt, const Row* rows, const Grp* grp, const int* gb, int gi0, int gi1,
                                 int is_global, int ngroups, float* scratch, int smax, int t0, int kv8, size_t kvstride) {
     __shared__ uint2 sq[3][8][32];                        // queries as tensor-core operands: [column set][slice][lane]
@@ -912,6 +915,130 @@ template <int NW> __global__ void k_attn_pv_g(const uint16_t* PK, int smax, cons
             y[(size_t)t * (H * DH) + h * DH + dim] = bf16r((v / ls) * sigmoidf(pj[R_GATE + h * DH + dim]) * sigmoidf(lse - pj[R_SINK + h]));
         }
         __syncthreads();
+    }
+}
+// =====================================================================================================
+// Sliding-window attention for groups of rows, in blocks that do enough work to be worth starting. The grouped
+// kernels above keep the shape of the one-row kernels: a block per 8 key groups (scores) or per 16 dims with its
+// 8 warps taking 9 key groups each (values), about 25 operations per warp, and then synchronisation, an exchange
+// through shared memory and the stores. The tensor cores do an operation in 2.9 ns per core; these kernels spent
+// 14 and 26. Here a block is a (group of rows, KV head): 8 warps that each do 216 operations with nothing shared.
+//   k_attn_scores_l  the queries are staged once per block; warp w takes key groups 9 w .. 9 w + 8.
+//   k_attn_soft_l    one warp per (row, head), which goes through the 1,024-thread kernel's work in its order:
+//                    thread i of that kernel has slots i and i + 1024, its warp adds its 32 threads by wsum, and
+//                    warp totals are added in order. Writes P as the value kernel's operands: PL[(column set) *
+//                    72 + key group][lane], 8 bytes each, one coalesced load per operation.
+//   k_attn_pv_l      warp = 16 dims; it runs the 8 chains of 9 key groups one after the other and adds the partial
+//                    sums in chain order, which is what the 8 warps of k_attn_pv and their exchange compute.
+// Same operations on the same operands in the same order as the kernels they replace: same results bit for bit.
+// cso[g]: the first column set of group g (a group of n rows has ceil(3 n / 8)); rowg[t]: the group of row t.
+// =====================================================================================================
+template <int NWS> __global__ void k_attn_scores_l(const float* qc, const float* bias, const uint8_t* Kt, const Row* rows, const Grp* grp, const int* gb, int gi0, int gi1,
+                                float* scratch, int t0, int kv8, size_t kvstride) {
+    __shared__ uint2 sq[3][8][32];
+    int gy = blockIdx.x / HKV, j = blockIdx.x % HKV, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, qq = lane & 3, g = lane >> 2;
+    int gbeg = gb[gi0]; if (gbeg + gy >= gb[gi1]) return;
+    const Grp gr = grp[gbeg + gy]; const int tf = gr.t0, n = gr.n, p0 = rows[tf].pos, ncs = (n * 3 + 7) / 8;
+    Kt += (size_t)rows[tf].seq * kvstride;
+    for (int e = tid; e < 3 * 8 * 32; e += NWS * 32) {
+        int cs = e >> 8, ds = (e >> 5) & 7, ln = e & 31, c = cs * 8 + (ln >> 2), ti = c / 3, hh = c - ti * 3; uint2 v = make_uint2(0, 0);
+        if (ti < n) { const float* x = qc + ((size_t)(tf + ti) * H + 3 * j + hh) * DH + ds * 16 + 2 * (ln & 3); v = make_uint2(pack_bf16(x[0], x[1]), pack_bf16(x[8], x[9])); }
+        sq[cs][ds][ln] = v;
+    }
+    __syncthreads();
+    const int KG = RING / 16 / NWS, pm0 = p0 % RING;      // key groups per warp
+    for (int G = warp * KG; G < warp * KG + KG; G++) {
+        uint4 w[8];
+        if (kv8) { const uint64_t* k8 = (const uint64_t*)(Kt + (((size_t)G * HKV + j) * 8) * 256 + lane * 8); for (int ds = 0; ds < 8; ds++) w[ds] = tile8_to_bf16(k8[(size_t)ds * 32]); }
+        else { const uint4* kt = (const uint4*)(Kt + (((size_t)G * HKV + j) * 8) * 512 + lane * 16); for (int ds = 0; ds < 8; ds++) w[ds] = kt[(size_t)ds * 32]; }
+        #pragma unroll
+        for (int cs = 0; cs < 3; cs++) {
+            if (cs >= ncs) break;
+            float d[4] = {0, 0, 0, 0};
+            for (int ds = 0; ds < 8; ds++) { uint2 b = sq[cs][ds][lane]; mma_bf16(d, w[ds].x, w[ds].y, w[ds].z, w[ds].w, b.x, b.y); }
+            for (int i = 0; i < 4; i++) {
+                int c = cs * 8 + 2 * qq + (i & 1), ti = c / 3, hh = c - ti * 3; if (ti >= n) continue;
+                int t = tf + ti, p = p0 + ti, slot = G * 16 + g + (i >> 1) * 8, h = 3 * j + hh;
+                int pm = pm0 + ti; if (pm >= RING) pm -= RING;                   // p % RING (slot_position without its divisions)
+                int dist = pm - slot; if (dist < 0) dist += RING;
+                bool ok = dist < EXT && p - dist >= 0;
+                scratch[((size_t)(t - t0) * H + h) * RING + slot] = ok ? d[i] * 0.08838834764831845f + bias[((size_t)t * H + h) * EXT + dist] : -FLT_MAX;
+            }
+        }
+    }
+}
+template <int NP> __global__ void k_attn_soft_l(const float* scratch, float* lstat, int t0, uint2* PL, const int* rowg, const Grp* grp, const int* cso, const int* gb, int gi0) {
+    __shared__ float sm[32];
+    int t = t0 + blockIdx.x, h = blockIdx.y, lane = threadIdx.x & 31, pw = threadIdx.x >> 5; const float* sc = scratch + ((size_t)blockIdx.x * H + h) * RING;
+    const int gi = rowg[t], c = (t - grp[gi].t0) * 3 + h % 3, j = h / 3;
+    uint16_t* pl = (uint16_t*)(PL + ((size_t)((cso[gi] - cso[gb[gi0]]) + c / 8) * HKV + j) * (RING / 16) * 32) + (c % 8) * 16;   // + key group * 128 + qq * 4 + half * 2 + odd
+    float mx = -FLT_MAX; for (int i = threadIdx.x; i < RING; i += NP * 32) mx = fmaxf(mx, sc[i]);
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    if (NP > 1) {
+        if (lane == 0) sm[pw] = mx;
+        __syncthreads();
+        mx = sm[0]; for (int w = 1; w < NP; w++) mx = fmaxf(mx, sm[w]);
+        __syncthreads();
+    }
+    float ls = 0;
+    for (int w = pw; w < 32; w += NP) {                   // warp w of the 1,024-thread kernel: its thread 32 w + lane has slots i and i + 1024
+        float l = 0;
+        for (int i = 32 * w + lane; i < RING; i += 1024) {
+            float x = sc[i], P = x == -FLT_MAX ? 0.0f : expf(x - mx); l += P;
+            int r = i & 15; pl[(i >> 4) * 128 + ((r & 7) >> 1) * 4 + (r >> 3) * 2 + (r & 1)] = (uint16_t)(__float_as_uint(bf16r(P)) >> 16);
+        }
+        l = wsum(l);
+        if (NP == 1) ls += l; else if (lane == 0) sm[w] = l;
+    }
+    if (NP > 1) { __syncthreads(); if (threadIdx.x == 0) for (int w = 0; w < 32; w++) ls += sm[w]; }
+    if (threadIdx.x == 0) { lstat[((size_t)t * H + h) * 2] = ls; lstat[((size_t)t * H + h) * 2 + 1] = mx + logf(ls); }
+}
+// Block = (group, KV head, 16 dims); its W warps take 8 / W of the 8 chains each, one after the other; the chains'
+// partial sums meet in shared memory and are added in chain order.
+template <int W, int UNV> __global__ void k_attn_pv_l(const uint2* PL, const uint8_t* Vt, const float* lstat, const float* proj, float* y, int kv8, const Row* rows, size_t kvstride,
+                            const Grp* grp, const int* cso, const int* gb, int gi0, int gi1) {
+    __shared__ float sh[8][32][12];
+    int dg = blockIdx.x, gy = blockIdx.y / HKV, j = blockIdx.y % HKV, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, qq = lane & 3, g = lane >> 2;
+    int gbeg = gb[gi0]; if (gbeg + gy >= gb[gi1]) return;
+    const Grp gr = grp[gbeg + gy]; const int tf = gr.t0, n = gr.n, ncs = (n * 3 + 7) / 8;
+    Vt += (size_t)rows[tf].seq * kvstride;
+    const uint2* pl = PL + ((size_t)(cso[gbeg + gy] - cso[gbeg]) * HKV + j) * (RING / 16) * 32 + lane;      // column set cs: + cs * HKV * 72 * 32
+    float tot[3][4]; for (int cs = 0; cs < 3; cs++) for (int i = 0; i < 4; i++) tot[cs][i] = 0;
+    for (int ch = warp * (8 / W); ch < (warp + 1) * (8 / W); ch++) {
+        float d[3][4]; for (int cs = 0; cs < 3; cs++) for (int i = 0; i < 4; i++) d[cs][i] = 0;
+        for (int G0 = ch * 9; G0 < ch * 9 + 9; G0 += UNV) {   // UNV key groups: their loads first (the waits overlap), then the operations
+            uint4 w[UNV]; uint2 b[UNV][3];
+            #pragma unroll
+            for (int u = 0; u < UNV; u++) {
+                int G = G0 + u;
+                w[u] = kv8 ? tile8_to_bf16(*(const uint64_t*)(Vt + ((((size_t)G * HKV + j) * 8 + dg) * 256) + lane * 8))
+                           : *(const uint4*)(Vt + ((((size_t)G * HKV + j) * 8 + dg) * 512) + lane * 16);
+                #pragma unroll
+                for (int cs = 0; cs < 3; cs++) b[u][cs] = cs < ncs ? pl[((size_t)cs * HKV * (RING / 16) + G) * 32] : make_uint2(0, 0);
+            }
+            #pragma unroll
+            for (int u = 0; u < UNV; u++) {
+                #pragma unroll
+                for (int cs = 0; cs < 3; cs++) if (cs < ncs) mma_bf16(d[cs], w[u].x, w[u].y, w[u].z, w[u].w, b[u][cs].x, b[u][cs].y);
+            }
+        }
+        if (W == 1) { for (int cs = 0; cs < 3; cs++) for (int i = 0; i < 4; i++) tot[cs][i] += d[cs][i]; }
+        else for (int cs = 0; cs < 3; cs++) for (int i = 0; i < 4; i++) sh[ch][lane][cs * 4 + i] = d[cs][i];
+    }
+    if (W > 1) {
+        __syncthreads();
+        if (warp) return;
+        for (int ch = 0; ch < 8; ch++) for (int cs = 0; cs < 3; cs++) for (int i = 0; i < 4; i++) tot[cs][i] += sh[ch][lane][cs * 4 + i];
+    }
+    #pragma unroll
+    for (int cs = 0; cs < 3; cs++) {
+        if (cs >= ncs) break;
+        for (int i = 0; i < 4; i++) {                         // this lane holds dims g, g+8 of the group and columns 2qq, 2qq+1 of the set
+            int c = cs * 8 + 2 * qq + (i & 1), ti = c / 3, hh = c - ti * 3; if (ti >= n) continue;
+            int t = tf + ti, dim = dg * 16 + g + (i >> 1) * 8, h = 3 * j + hh; const float* pj = proj + (size_t)t * QKVR;
+            float ls = lstat[((size_t)t * H + h) * 2], lse = lstat[((size_t)t * H + h) * 2 + 1];
+            y[(size_t)t * (H * DH) + h * DH + dim] = bf16r((tot[cs][i] / ls) * sigmoidf(pj[R_GATE + h * DH + dim]) * sigmoidf(lse - pj[R_SINK + h]));
+        }
     }
 }
 // t0: first token handled by this launch; scratch rows are relative to it (the scratch holds one sub-batch).
@@ -1963,7 +2090,7 @@ struct Engine {
     float *stack[5], *prelude_partial, *bank[2], *prelude_dests, *inputs, *msg, *xin, *proj, *dk, *dv, *qc, *bias, *att_sc, *att_l, *att_y,
           *attn_raw, *attn_out, *mixtmp, *pair, *hbuf, *gx, *mlp_in, *rlogit, *gamma, *xq, *xamax, *gu, *act, *aq, *aamax, *down, *moe_out, *y, *out, *logits;
     int *tok, *ids, *arg, *tasks, *ntasks, *tasksw = nullptr; uint4* xb = nullptr; Row* rows;   // tasksw, xb: wide expert tasks and their gathered activations      // rows: per-row conversation and position of the current step
-    Grp* grp = nullptr; int* gb = nullptr;                 // the step's row groups for attention (see k_attn_scores_g)
+    Grp* grp = nullptr; int *gb = nullptr, *rowg = nullptr, *cso = nullptr;   // the step's row groups for attention (see k_attn_scores_g, k_attn_scores_l)
     uint8_t* snap = nullptr; size_t snap_bytes = 0; bool vis_global[NVIS] = {}, snap_ok[MAXSEQ] = {}; int last_T = 0;   // prefix-cache snapshots: [conversations][snap_bytes]
     int* qrow = nullptr; float* rowz = nullptr; ResPart* rparts = nullptr;   // per row: index of the sampled draft it verifies (-1: none); normaliser of p; scratch
     VRange vK[NVIS][MAXSEQ], vV[NVIS][MAXSEQ], vdK[MAXSEQ], vdV[MAXSEQ], vsc;   // on-demand ranges: per global visit and conversation; drafter; score scratch
@@ -2187,7 +2314,7 @@ int ink_ensure(void* ep, int seq, int tokens) {
     if (tokens <= e->ctx_mapped[seq]) return 0;
     size_t kvt = (size_t)HKV * DH * (e->kv8 ? 1 : 2), dkt = (size_t)HKV * DH * 2;   // bytes per token: one cache of a full-attention visit; drafter
     int bucket = 1024; while (bucket < tokens) bucket *= 2;
-    size_t sc = vround(std::max((size_t)HMAX * H * RING, (size_t)GSUB * H * std::min(bucket, e->max_ctx)) * 6);
+    size_t sc = vround(std::max(LOCAL_SC, (size_t)GSUB * H * std::min(bucket, e->max_ctx) * 6));
     size_t add = sc > e->vsc.mapped ? sc - e->vsc.mapped : 0;
     for (int v = 0; v < NVIS; v++) if (e->vis_global[v]) add += 2 * ((size_t)tokens * kvt - std::min(e->vK[v][seq].mapped, (size_t)tokens * kvt));
     if (d.on) add += 2 * ((size_t)tokens * dkt - std::min(e->vdK[seq].mapped, (size_t)tokens * dkt));
@@ -2219,7 +2346,7 @@ void ink_trim(void* ep, int seq, int tokens) {
     if ((int)left < e->snap_tokens[seq]) e->snap_ok[seq] = false;          // the snapshot's prefix is gone
     int most = 0; for (int q = 0; q < e->nseq; q++) most = std::max(most, e->ctx_mapped[q]);
     int bucket = 1024; while (bucket < most) bucket *= 2;                  // the score scratch follows the longest conversation left
-    e->vsc.shrink(std::max((size_t)HMAX * H * RING, most ? (size_t)GSUB * H * std::min(bucket, e->max_ctx) : 0) * 6);
+    e->vsc.shrink(std::max(LOCAL_SC, (most ? (size_t)GSUB * H * std::min(bucket, e->max_ctx) : 0) * 6));
 }
 
 // Free memory on the GPU right now, in bytes (used to size the context before loading).
@@ -2462,9 +2589,9 @@ void ink_finalize(void* ep) {
     e->dk = dalloc(T * 32); e->dv = dalloc(T * 32); e->qc = dalloc(T * H * DH); e->bias = dalloc(T * H * EXT);
     // Score scratch: T x H x RING for the sliding-window layers; GSUB x H x (context bucket) for full attention, attached on demand.
     // scores as fp32 and, behind them, the probabilities again as bf16 operands: 4 + 2 bytes per (row, head, slot)
-    e->vsc.reserved = vround(std::max((size_t)HMAX * H * RING, (size_t)GSUB * H * (size_t)e->max_ctx) * 6); e->vsc.base = vreserve(e->vsc.reserved);
-    if (!e->vsc.grow((size_t)HMAX * H * RING * 6)) { fprintf(stderr, "out of GPU memory for the score scratch\n"); abort(); }
-    CK(cudaMalloc(&e->grp, TMAX * sizeof(Grp))); CK(cudaMalloc(&e->gb, (TMAX / 16 + 2) * 4));
+    e->vsc.reserved = vround(std::max(LOCAL_SC, (size_t)GSUB * H * (size_t)e->max_ctx * 6)); e->vsc.base = vreserve(e->vsc.reserved);
+    if (!e->vsc.grow(LOCAL_SC)) { fprintf(stderr, "out of GPU memory for the score scratch\n"); abort(); }
+    CK(cudaMalloc(&e->grp, TMAX * sizeof(Grp))); CK(cudaMalloc(&e->gb, (TMAX / 16 + 2) * 4)); CK(cudaMalloc(&e->rowg, TMAX * 4)); CK(cudaMalloc(&e->cso, (TMAX + 1) * 4));
     e->att_sc = (float*)e->vsc.base; e->att_l = dalloc(T * H * 2); e->att_y = dalloc(T * H * DH); e->attn_raw = dalloc(T * D); e->attn_out = dalloc(T * D);
     e->mixtmp = dalloc(T * D); e->pair = dalloc(T * 3 * 2 * D); e->hbuf = dalloc(T * 192); e->gx = dalloc(T * 3 * D); e->mlp_in = dalloc(T * D); e->rlogit = dalloc(T * NE); e->gamma = dalloc(T * TOPK); e->xq = dalloc(T * D);
     e->xamax = dalloc(T); e->gu = dalloc(T * TOPK * D); e->act = dalloc(T * TOPK * I2); e->aq = dalloc(T * TOPK * I2); e->aamax = dalloc(T * TOPK);
@@ -2537,6 +2664,17 @@ static void head_two_stage(Engine* e, int T) {
 }
 
 // hm: the output head to run - 0 none, 1 full, 2 two-stage.
+// Sliding-window attention of rows [h0, h0 + hn): scores, softmax, value sum (k_attn_*_l). ng: the grid's groups.
+// Shapes as measured at 128 rows: scores 28.8 us with 8 warps per block, 22.2 with 12, 17.9 with 18 (24 do not fit a
+// block's registers); softmax 12.7 us with 1 warp per (row, head), 10.7 with 2, no better with more; values 23 us
+// with one warp per 16 dims and three key groups loaded ahead (33 loading one at a time; more warps are slower).
+static void local_attention(Engine* e, int visit, size_t kvs, int h0, int hn, int ng, uint2* pl, int g0i, int g1i) {
+    static const char* only = getenv("INK_LA_ONLY");     // timing: run one of the three (s, p, v)
+    if (!only || *only == 's') k_attn_scores_l<18><<<ng * HKV, 18 * 32, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[visit], e->rows, e->grp, e->gb, g0i, g1i, e->att_sc, h0, e->kv8, kvs);
+    if (!only || *only == 'p') k_attn_soft_l<2><<<dim3(hn, H), 2 * 32, 0, g_stream>>>(e->att_sc, e->att_l, h0, pl, e->rowg, e->grp, e->cso, e->gb, g0i);
+    if (!only || *only == 'v') k_attn_pv_l<1, 3><<<dim3(8, ng * HKV), 32, 0, g_stream>>>(pl, (const uint8_t*)e->Vc[visit], e->att_l, e->proj, e->att_y, e->kv8, e->rows, kvs, e->grp, e->cso, e->gb, g0i, g1i);
+}
+
 // cls: 0 if every run of the step begins at a row that is a multiple of 8 (then a sub-batch of n rows has exactly
 // ceil(n / 8) attention groups), 1 otherwise (up to n).
 static void forward_body(Engine* e, int T, int gchunks, int hm, int cls) {
@@ -2621,12 +2759,8 @@ static void forward_body(Engine* e, int T, int gchunks, int hm, int cls) {
                 } else {
                     auto ngr = [&](int n) { return cls ? n : (n + 7) / 8; };          // most groups among n rows: the grid's height
                     if (!L.global) {
-                        uint16_t* pk = (uint16_t*)(e->att_sc + (size_t)HMAX * H * RING);
-                        k_attn_scores_g<<<dim3((ng + 7) / 8, ngr(hn) * HKV), 256, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[visit], e->rows, e->grp, e->gb, h0 / 16, (h0 + hn + 15) / 16,
-                                                                                             0, ng, e->att_sc, RING, h0, e->kv8, kvs);
-                        k_attn_soft_g<<<dim3(hn, H), 1024, 0, g_stream>>>(e->att_sc, RING, ns, e->att_l, h0, pk, e->rows, 0);
-                        k_attn_pv_g<8><<<dim3(8, ngr(hn) * HKV), 256, 0, g_stream>>>(pk, RING, (const uint8_t*)e->Vc[visit], ng, e->att_l, e->proj, e->att_y, 0, h0, e->kv8, e->rows, kvs,
-                                                                                    e->grp, e->gb, h0 / 16, (h0 + hn + 15) / 16);
+                        uint2* pl = (uint2*)(e->att_sc + (size_t)HMAX * H * RING); const int g0i = h0 / 16, g1i = (h0 + hn + 15) / 16;
+                        local_attention(e, visit, kvs, h0, hn, ngr(hn), pl, g0i, g1i);
                     } else for (int t0 = h0; t0 < h0 + hn; t0 += GSUB) {   // full-attention layers: GSUB tokens at a time, so the scratch stays small
                         int tn = std::min(GSUB, h0 + hn - t0); uint16_t* pk = (uint16_t*)(e->att_sc + (size_t)GSUB * H * gchunks * 32);
                         k_attn_scores_g<<<dim3((ng + 7) / 8, ngr(tn) * HKV), 256, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[visit], e->rows, e->grp, e->gb, t0 / 16, t0 / 16 + 1,
@@ -2761,14 +2895,18 @@ int ink_step(void* ep, int T, const int* tokens, const int* seqs, const int* pos
     CK(cudaMemcpyAsync(e->rows, rows.data(), T * sizeof(Row), cudaMemcpyHostToDevice, g_stream));
     // Attention groups: up to 8 consecutive rows of one conversation, cut at every 8th row and at every run start.
     Grp grp[TMAX]; int gb[TMAX / 16 + 2], ngrp = 0, cls = 0;
+    int rowg[TMAX], cso[TMAX + 1];
     for (int t = 0; t < T; t++) {
         if (t % 16 == 0) gb[t / 16] = ngrp;
         if (t % 8 == 0 || rows[t].run0 == t) { grp[ngrp++] = Grp{t, 0}; if (t % 8) cls = 1; }
-        grp[ngrp - 1].n++;
+        grp[ngrp - 1].n++; rowg[t] = ngrp - 1;
     }
     for (int k = (T + 15) / 16; k < TMAX / 16 + 2; k++) gb[k] = ngrp;
+    cso[0] = 0; for (int k = 0; k < ngrp; k++) cso[k + 1] = cso[k] + (grp[k].n * 3 + 7) / 8;
     CK(cudaMemcpyAsync(e->grp, grp, ngrp * sizeof(Grp), cudaMemcpyHostToDevice, g_stream));
     CK(cudaMemcpyAsync(e->gb, gb, sizeof(gb), cudaMemcpyHostToDevice, g_stream));
+    CK(cudaMemcpyAsync(e->rowg, rowg, T * 4, cudaMemcpyHostToDevice, g_stream));
+    CK(cudaMemcpyAsync(e->cso, cso, (ngrp + 1) * 4, cudaMemcpyHostToDevice, g_stream));
     CK(cudaMemcpyAsync(e->excl, xq, (TMAX + T) * 4, cudaMemcpyHostToDevice, g_stream));
     float sp[2 * TMAX];
     for (int t = 0; t < T; t++) { float tp = temps ? temps[t] : e->def_temp; unsigned sd = seeds ? seeds[t] : e->def_seed; sp[2 * t] = tp > 0 ? 1.0f / tp : 0.0f; memcpy(&sp[2 * t + 1], &sd, 4); }
@@ -2995,15 +3133,15 @@ void ink_microbench(void* ep, int T) {
     mbench("attn prep (q/r/bias + kv conv)", 0, [&](int r) { int i = r % 5; Layer& L = e->L[i];
         k_attn_prep<<<dim3(T, H + HKV), 1024, 0, g_stream>>>(e->proj, L.qscale, L.rscale, L.rel, 0, e->rows, e->qc, e->bias, e->ring[i][0], e->ring[i][1], L.kconv, L.vconv, e->dk, e->dv, e->Kc[i], e->Vc[i], e->kv8, e->kv_local, 0); });
     {   // the rows as one run: groups of 8
-        Grp grp[TMAX]; int gb[TMAX / 16 + 2], n = 0;
-        for (int t = 0; t < T; t++) { if (t % 16 == 0) gb[t / 16] = n; if (t % 8 == 0) grp[n++] = Grp{t, 0}; grp[n - 1].n++; }
+        Grp grp[TMAX]; int gb[TMAX / 16 + 2], rowg[TMAX], cso[TMAX + 1], n = 0;
+        for (int t = 0; t < T; t++) { if (t % 16 == 0) gb[t / 16] = n; if (t % 8 == 0) grp[n++] = Grp{t, 0}; grp[n - 1].n++; rowg[t] = n - 1; }
         for (int k = (T + 15) / 16; k < TMAX / 16 + 2; k++) gb[k] = n;
+        cso[0] = 0; for (int k = 0; k < n; k++) cso[k + 1] = cso[k] + (grp[k].n * 3 + 7) / 8;
         CK(cudaMemcpy(e->grp, grp, n * sizeof(Grp), cudaMemcpyHostToDevice)); CK(cudaMemcpy(e->gb, gb, sizeof(gb), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(e->rowg, rowg, T * 4, cudaMemcpyHostToDevice)); CK(cudaMemcpy(e->cso, cso, (n + 1) * 4, cudaMemcpyHostToDevice));
     }
-    uint16_t* mpk = (uint16_t*)(e->att_sc + (size_t)HMAX * H * RING);
-    mbench("attn scores (local, tensor cores)", 0, [&](int r) { int i = r % 5; k_attn_scores_g<<<dim3(9, (T + 7) / 8 * HKV), 256, 0, g_stream>>>(e->qc, e->bias, (const uint8_t*)e->Kc[i], e->rows, e->grp, e->gb, 0, (T + 15) / 16, 0, RING / 16, e->att_sc, RING, 0, e->kv8, e->kv_local); });
-    mbench("attn softmax (local)", 0, [&](int) { k_attn_soft_g<<<dim3(T, H), 1024, 0, g_stream>>>(e->att_sc, RING, RING, e->att_l, 0, mpk, e->rows, 0); });
-    mbench("attn value sum + gate (local)", 0, [&](int r) { int i = r % 5; k_attn_pv_g<8><<<dim3(8, (T + 7) / 8 * HKV), 256, 0, g_stream>>>(mpk, RING, (const uint8_t*)e->Vc[i], RING / 16, e->att_l, e->proj, e->att_y, 0, 0, e->kv8, e->rows, e->kv_local, e->grp, e->gb, 0, (T + 15) / 16); });
+    uint2* mpl = (uint2*)(e->att_sc + (size_t)HMAX * H * RING);
+    mbench("attention, sliding window (scores + softmax + values)", 0, [&](int r) { int i = r % 5; local_attention(e, i, e->kv_local, 0, T, (T + 7) / 8, mpl, 0, (T + 15) / 16); });
     if (!e->fp8_attn) mbench("wo gemm (2304x3072 bf16)", 14.2, [&](int r) { Layer& L = e->L[r % 24]; gemv(D, T, L.wo, H * DH, T, e->att_y, e->att_y, e->att_y, H * DH, D, D, e->attn_raw, D, 1); });
     mbench("post-attn (conv + mix)", 0, [&](int r) { int i = r % 24; Layer& L = e->L[i]; PostAttn pa{}; pa.attn_raw = e->attn_raw; pa.ring = e->ring[vis(i)][2]; pa.w = L.attn_sconv; pa.rows = e->rows;
         pa.attn_out = e->attn_out; pa.ns = 2; pa.src[0] = e->stack[0]; pa.src[1] = e->stack[1]; pa.partial = e->stack[2]; pa.q = e->mlp_q[i]; pa.norm = L.mlp_norm; pa.out = e->mlp_in; pa.pf = PF{nullptr, 0, T}; launch_post_attn(T, pa); });
