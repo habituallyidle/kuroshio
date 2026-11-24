@@ -1,6 +1,7 @@
 """Stage 5 - throughput and latency, measured from the client, compared with the figures in README.md.
 
-How things are measured (all with stream=true, reasoning_effort "none"):
+How things are measured (all with stream=true; the throughput requests set reasoning_effort "high" explicitly, as
+the README's benchmarks do: left unset or at "none" every engine falls back to a default of its own):
   decode tok/s   = (usage.completion_tokens - 1) / (arrival of the last chunk - arrival of the first chunk that
                    carries text). The first token is excluded: its latency is prompt processing.
   TTFT           = arrival of the first text chunk - moment the request was sent.
@@ -23,15 +24,16 @@ KEY, TITLE = "perf", "Throughput and latency"
 WARN_FRAC, FAIL_FRAC = 0.15, 0.35
 
 # Figures claimed in README.md ("Headline" table and the bullets under it).
-CLAIM_DECODE_1 = 248.0        # "Decode, 1 stream (tok/s)", temperature 0.6, 512-token completions
-CLAIM_DECODE_2_TOTAL = 389.0  # "Decode, 2 streams, total"
-CLAIM_DECODE_4_TOTAL = 502.0  # "Decode, 4 streams, total"
-CLAIM_PREFILL_4K = 3330.0     # "Prompt processing (tok/s, 4K prompt)"
-CLAIM_SPEC0 = 166.0           # "Without speculative decoding ... 158 tok/s (--spec 0)"
-CLAIM_8BIT_DECODE = 260.0     # "With --kv 8 --dense 8: ... about 260 tok/s"
-CLAIM_8BIT_PREFILL = 3500.0   # "... 3,500 tok/s prompt processing"
+CLAIM_DECODE_1 = 250.0        # "Decode, 1 stream (tok/s)", temperature 0.6, 512-token completions, effort high
+CLAIM_DECODE_2_TOTAL = 419.0  # "Decode, 2 streams, total"
+CLAIM_DECODE_4_TOTAL = 559.0  # "Decode, 4 streams, total"
+CLAIM_PREFILL_4K = 8440.0     # "Prompt processing (tok/s, 4.7K prompt)"
+CLAIM_SPEC0 = 161.0           # "Without speculative decoding: 161 tok/s (--spec 0)"
+CLAIM_8BIT_DECODE = 265.0     # "With --kv 8 --dense 8: ... about 265 tok/s"
+CLAIM_8BIT_PREFILL = 6580.0   # "... 6,600 tok/s prompt processing"
 CLAIM_FOLLOWUP_TTFT_MS = 50.0  # "typically 30-50 ms to first token in an agent loop": the upper end is the claim checked
 
+PERF_EFFORT = "high"          # reasoning effort of every throughput request (the README states it)
 GEN_TOKENS = 512              # as in the README's benchmark; every run must reach at least MIN_TOKENS
 MIN_TOKENS = 300
 SEEDS_QUICK, SEEDS_FULL = [11, 12], [11, 12, 13]
@@ -57,7 +59,7 @@ def claim(st, ctx, name, measured, claimed, unit, higher_is_better=True, how="")
 
 def warm_up(ctx):
     chat(req("Say hello.", 200, stream=True))
-    chat(req(PERF_PROMPTS[5], 200, temperature=0.6, seed=1, stream=True))
+    chat(req(PERF_PROMPTS[5], 200, temperature=0.6, seed=1, stream=True, effort=PERF_EFFORT))
     chat(req(" ".join(sentences(120, 424242)) + "\n\nSay ok.", 8, stream=True))
 
 
@@ -66,7 +68,7 @@ def decode_runs(st, ctx, label, temperature, prompts, seeds):
     runs = []
     for pi in prompts:
         for seed in seeds:
-            p = req(PERF_PROMPTS[pi], GEN_TOKENS, temperature=temperature, seed=seed, stream=True)
+            p = req(PERF_PROMPTS[pi], GEN_TOKENS, temperature=temperature, seed=seed, stream=True, effort=PERF_EFFORT)
             c = chat(p, timeout=300)
             if not (c.ok and c.decode_tps):
                 st.fail(f"{label}: benchmark request failed", c.brief()[:300], repro(p, "HTTP 200 stream", c.brief()))
@@ -192,7 +194,7 @@ def spec0(st, ctx):
     if ratios:
         st.num("speed-up from speculative decoding (same prompt, same seed)", f"x{median(ratios):.2f} (min x{min(ratios):.2f}, max x{max(ratios):.2f})")
         st.check("seeded sampling produced the same text with and without speculation in every benchmark run", same == len(ratios), f"{same}/{len(ratios)} identical 512-token texts",
-                 repro(req(PERF_PROMPTS[0], GEN_TOKENS, temperature=0.6, seed=seeds[0]), "identical text on servers started with and without --spec 0", f"{len(ratios) - same} of {len(ratios)} differ"))
+                 repro(req(PERF_PROMPTS[0], GEN_TOKENS, temperature=0.6, seed=seeds[0], effort=PERF_EFFORT), "identical text on servers started with and without --spec 0", f"{len(ratios) - same} of {len(ratios)} differ"))
 
 
 def eightbit(st, ctx):
@@ -209,7 +211,7 @@ def eightbit(st, ctx):
 
 def _concurrent(n, seed0, tokens=GEN_TOKENS, clients=None):
     clients = clients or n
-    res = run_parallel([lambda i=i: chat(req(PERF_PROMPTS[i % len(PERF_PROMPTS)], tokens, temperature=0.6, seed=seed0 + i, stream=True), timeout=600) for i in range(clients)])
+    res = run_parallel([lambda i=i: chat(req(PERF_PROMPTS[i % len(PERF_PROMPTS)], tokens, temperature=0.6, seed=seed0 + i, stream=True, effort=PERF_EFFORT), timeout=600) for i in range(clients)])
     good = [c for c in res if getattr(c, "ok", False) and c.completion_tokens]
     if len(good) != clients:
         return None, res

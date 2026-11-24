@@ -4443,13 +4443,623 @@ Above 32 rows both measurements use the full head, and those points moved too. T
 
 ---
 
+## Step 69 — Reading prompts faster without changing a bit: a yardstick, more blocks side by side, and a buffer sized by a formula with a dip (2026-11-24)
+
+**What we did**
+
+**The starting point.** Step 68 measured prompt processing on new text and withdrew a claim. This engine read new prompts of 4.7K / 18.8K / 33.5K tokens at 3,328 / 2,850 / 2,465 tokens/s. vLLM read them at 2,478 / 6,800 / 8,714 and Strata at 7,282 / 6,517 / 5,835. Step 68 also named the causes: the dense kernels are compute-bound at the sizes of a prompt step, and the full-attention work grows with the context. This step works on both, and on everything else that a prompt step runs. Every change leaves every output bit-identical: `scripts/verify.sh` passed after each commit, including the NLL fingerprint of Step 68 (0.9007 and 0.9068). At the end the same three prompts are read at 7,690 / 7,020 / 6,040 tokens/s. Step 70 then gives up bit-identity for prompts, on purpose and behind a switch. This step shows how far the exact arithmetic goes.
+
+**A yardstick: what the tensor cores do alone.** Until now a kernel's time had been compared with the time to read its weights (Steps 22 and 65). A kernel well above that floor was called compute-bound, and the word suggested that the arithmetic was the limit. The arithmetic itself had never been measured. A small benchmark, `mmalim`, now does that: a kernel whose loop holds tensor-core operations on registers and nothing else. It has no loads, no stores and no synchronisation. An operation here is one execution of the MMA instruction by a warp (Step 13). The instruction's name gives its shape: `m16n8k16` produces 16 rows by 8 columns of results, each a sum of 16 products.
+
+| Instruction | Time per operation, per multiprocessor | The whole card |
+|---|---|---|
+| bf16, `m16n8k16` (dense matrices, attention) | 2.85 ns | 244 TFLOP/s |
+| 4-bit, `m16n8k64` (experts) | 1.45 ns | about 1,900 TFLOP/s |
+
+"Per multiprocessor" means that one SM (Step 32), filled with warps that do nothing else, completes one operation every 2.85 ns. The engine's kernels were then put into the same unit: their time, divided by the operations they issue, per multiprocessor.
+
+| Kernel | ns per operation, per multiprocessor |
+|---|---|
+| The bf16 tensor cores alone | 2.85 |
+| Dense matrices | 16 |
+| Attention | 14–34 |
+| Experts (4-bit; the tensor cores alone: 1.45) | 24 |
+
+Every kernel was several times above what its arithmetic needs. So the arithmetic was never the limit, not even in the kernels that Steps 65 and 68 called compute-bound. What an operation costs is what stands around it:
+
+- *Memory instructions.* Every load of an operand and every store of a result. A GPU thread pays for a load whether the data is cached or not (Step 10).
+- *The start of a block and its epilogue.* Starting a block costs time before its first instruction (Step 10). The epilogue is what a block does after its last multiply: its warps synchronise, exchange partial sums through shared memory, add them and store the result.
+- *Waiting.* A warp executes one stream of instructions. While it waits for one of its own loads, it does nothing else (Step 65).
+
+This reorganised the work. The question for a kernel was no longer "how can it read fewer bytes" or "how can it multiply less". It became "what does a warp do between two operations, and what is it waiting for".
+
+**The principle that kept paying.** There are two ways to bring a kernel closer to the yardstick. One is to issue fewer memory instructions per operation. The other is to have more warps at work at the same moment, each independent of the others. A multiprocessor holds many warps and runs another one whenever one of them waits. A wait therefore costs nothing as long as some other warp has work. Both ways were tried all through this step. The first paid sometimes. The second paid almost every time, and several changes that removed loads made a kernel slower. The dead ends are listed with their numbers further down, because they carry this lesson as much as the successes do.
+
+**The dense matrices: a kernel for many rows (`k_gemm_bf16_bulk`).** Step 65 gave the dense matrices a kernel that takes its activations ready packed (`k_gemm_bf16p`): one 8-byte load of activations per operation. Its packed buffer was ordered by token. A block handles 16 weight rows and needs every token's activations for them, so at 64 rows every block read 295 KB of activations. The attention projection has 538 blocks. Together they read four times as many bytes of activations as the matrix has bytes of weights.
+
+A weight tile's work is cut into 16 column segments. Each segment gives a partial sum, and the 16 partial sums are added in segment order. That order is part of the result's bits (Step 65).
+
+*First attempt, not kept: staging in shared memory.* Each block copied the activations of a column segment into its shared memory and multiplied from there. The best form took 48 µs at 64 rows, where the packed kernel took 83. Two things limited it. A block has at most about 99 KB of shared memory (48 KB by default, as in Step 66, and more only when a kernel asks for it), which rules out some matrix shapes. And staging is itself a load and a store per two operations: memory instructions again.
+
+*What was kept.* Three changes together:
+
+1. The activations are packed slice-major (`k_pack_bf16s`): the buffer is ordered by slice (Step 65: 16 columns of the matrix), and within a slice the operands of all column groups lie side by side. One 16-byte load holds the operands of two column groups, so one load serves two operations.
+2. A warp walks through the slices in order. The warps of a multiprocessor then work in a window of a few KB of the buffer, not in 295 KB.
+3. A weight tile gets 4 warps in the big matrices and 16 in the small ones. Each warp takes its share of the 16 column segments.
+
+The kernel is used from 9 rows, where packing starts (Step 65).
+
+| Micro-benchmark, per launch | Before | After |
+|---|---|---|
+| Attention projection, 64 rows | 84 µs | 30 µs |
+| Output head, 64 rows | 1,453 µs | 625 µs |
+| Output head, 32 rows | 776 µs | 596 µs |
+
+Reading the projection's weights alone takes 26 µs. At 64 rows the kernel is now 4 µs above that floor. Prompt-only steps over an 8K prompt went from 3,060 to 3,980 tokens/s.
+
+*Why the bits are the same.* Each output is still the sum, in segment order, of sixteen partial sums, and each partial sum is the same chain of tensor-core operations over the same operands. Only the place where a thread finds its operand changed.
+
+*Three variations that were dropped:*
+
+| Variation | Result |
+|---|---|
+| Nothing shared between warps: one warp walks all 144 slices of its tile | 59–69 µs against 30 |
+| Loading three slices ahead of the multiplies | 29.0 against 30.4 µs, which is noise level |
+| 128 tokens per launch through the same blocks | 66 against 55 µs for 128 rows |
+
+The first one is the instructive one. A warp that shares nothing needs no synchronisation and no exchange, so it has the smallest epilogue. It was twice as slow. Its 144 loads form one serial chain, and the chain of loads is what a warp waits for. With four warps per tile, each warp waits for a quarter of that chain, and the four wait at the same time.
+
+**Attention in groups of 8 rows (`k_attn_scores_g` and its companions).** A tensor-core operation has 8 columns. Since Step 37 the three query heads of one row filled 3 of them, and every row had blocks of its own that read all keys and all values of its conversation. The 128 rows of a prompt step read the same keys 128 times in every layer visit.
+
+Rows of one conversation see the same keys. So a block now takes up to 8 consecutive rows of a conversation, called a row group here. Their 24 (row, head) pairs are the columns of 3 operations per key tile, and the keys are read once for all of them. Which row may see which key is still decided per element afterwards. A step's rows are cut into groups at every 8th row and wherever a conversation's run begins.
+
+| Sliding-window attention, 128 rows | Before | After |
+|---|---|---|
+| Scores | 61 µs | 18 µs |
+| Value sum | 63 µs | 34 µs |
+
+Prompt steps: 4,590 tokens/s. Each score and each output value comes from the same chain of operations over the same operands as with one row per block, so the bits are the same.
+
+For small steps the grouped form is slower, because it puts fewer warps to work: a step of 8 rows took 11.01 ms where the ungrouped form takes 10.55. It was first used from 16 rows. A later measurement found it 2% slower at exactly 16, and it is now used from 17.
+
+**Full attention stops at the conversation's length.** A step's CUDA graph is recorded per context bucket (Step 15): up to 1,024 tokens, up to 2,048, and so on in powers of two, because a recorded graph fixes every grid. The full-attention kernels worked through the whole bucket. A conversation just past a power of two paid for the whole bucket above it:
+
+| Context | 256-row step, before | Now |
+|---|---|---|
+| 32K | 96 ms | |
+| 40K | 135 ms | 106 ms |
+
+Now a score block that lies past the last row's key group returns before it does anything, the softmax stops there, and the value loop ends there. The value loop used to multiply zeros beyond that point. The time of a step against the context was a staircase and is now a line: about 1.5 ms per 1K tokens of context for a 256-row step. The bits are the same, because the slots past a row hold nothing: masked scores, which change neither the maximum nor the sum, and probability 0, which adds zeros.
+
+**Steps of 512 rows, and experts as wide tasks.** Step 66 stopped at 256 rows per prompt step and estimated 6–9% for more. Prompt steps now have 512 rows. The experts changed with it. A task had been one expert with up to 8 of its tokens (Step 13). A wide task is one expert with up to 64 of its columns, that is, tokens. Three things follow:
+
+- The activations of a wide task are gathered once into operand layout (`k_xgather4`). A thread then loads 16 bytes per operation, where it issued 5 loads before.
+- One warp per weight tile runs the column segments one after another and adds their partial sums in segment order (`k_expert4_wide`).
+- An expert's weights are read once for up to 64 tokens.
+
+The expert stage of a 512-row step went from 28 to 25 ms. It is bound by the bytes of the weights: about 113 of a layer's 128 experts are read per visit, the count that Step 66 had predicted for 512 rows. A first wide kernel that still synchronised after every column group gained nothing. It gained only when the accumulators stayed in registers with a fixed trip count, and then little, because the stage is memory-bound.
+
+Steps of 1,024 rows were measured here at +3% for 430 MB more memory, and were not kept at this point. The dense and attention kernels still dominated a prompt step, and a bigger step does nothing for them (Step 66).
+
+**The sliding-window attention, restructured.** The grouped kernels had kept the shape of the one-row kernels of Step 37: many small blocks, each with a few operations per warp and then an epilogue. By the yardstick they were far from the tensor cores. The three kernels were rebuilt so that a block does enough work to be worth starting:
+
+| Kernel | Before | Now |
+|---|---|---|
+| Scores (`k_attn_scores_l`) | A block per 8 key groups | A block per (row group, set of keys). The queries are staged in shared memory once, and the block's warps share out the key groups. |
+| Softmax (`k_attn_soft_l`) | A block of 1,024 threads per (row, head) | One or two warps per (row, head) |
+| Value sum (`k_attn_pv_l`) | A block per 16 dimensions, with 8 warps that each run a chain of key groups and then exchange their sums | One warp per 16 dimensions. It runs the 8 chains one after another and adds their partial sums in chain order. |
+
+The softmax also writes its probabilities directly as the operands of the value kernel (more on that below).
+
+| Sliding-window attention, 128 rows | Before | After |
+|---|---|---|
+| Scores | 18 µs | 18 µs |
+| Softmax | 26 µs | 11 µs |
+| Value sum | 34 µs | 23 µs |
+
+Prompt steps: 4,880 tokens/s.
+
+*The order of the sums.* The new softmax has one or two warps where the old one had 32. A floating-point sum depends on the order of its additions (Steps 38 and 43), so the new kernel goes through the old kernel's work in the old kernel's order: the same value per thread of the old block, the same reduction within each of its warps, and the warp totals added in the same order. This is what Step 65 did for the gate.
+
+*Two side measurements.* Removing the per-element divisions from the score kernel changed nothing. More warps per block help the scores (28.8 µs with 8 warps, 17.9 with 18) and hurt the value sum.
+
+**Small steps must not pay.** The rule since Step 49 is that single-stream decoding never pays for something else. After the restructure it did, a little. The task-list kernel (Step 65) cleared shared memory sized for 512 rows on every step, and the tables that describe the row groups were uploaded for every step, grouped or not. The task list is now sized by the step, and the group tables are uploaded only for steps that use groups. Small steps were then compared with the published build of Step 68 in the same session (Step 67: compare A and B in the same session):
+
+| Rows | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| Step 68 build, ms | 5.88 | 6.77 | 8.18 | 10.51 |
+| This build, ms | 5.89 | 6.76 | 8.2 | 10.55 |
+
+**A profile at half-time.** A 512-row prompt step at short context took about 105 ms at this point:
+
+| Part | Time |
+|---|---|
+| Dense matrices | 26 ms |
+| Experts | 25 ms |
+| Full attention (grows by 3 ms per 1K tokens of context) | 18 ms |
+| Loop glue | 16 ms |
+| Attention preparation | 13 ms |
+| Sliding-window attention | about 9 ms |
+
+vLLM reads long prompts at about 14K tokens/s (Step 68). To match that, the same step would have to take 37 ms. The profile picked the next candidates: the attention preparation, which issued 16 separate loads per element of the position bias, and the full attention, whose value kernel stood at 34 ns per operation.
+
+**Attention preparation: the right number of threads.** `k_attn_prep` (Step 14) computes, among other things, each row's relative-position bias (Step 4) for each head. It ran a block of 1,024 threads per (row, head), and each thread did 16 multiply-adds. Starting such a block cost more than its work. The number of threads per block now follows the step:
+
+| Rows in the step | Threads per block |
+|---|---|
+| Up to 4 | 1,024 |
+| Up to 16 | 512 |
+| Up to 48 | 256 |
+| More | 128 |
+
+At 128 rows the kernel went from 44 to 13 µs. A step with few rows has few blocks and keeps the wide ones. The alternative that looked better on paper was to store the position table by distance, so that a thread needs four 16-byte loads where it needed sixteen loads. It took 54 µs against the 13 µs of the kernel with the new thread counts, and was dropped.
+
+**Full attention: probabilities stored as operands.** In the value sum, a warp multiplies a tile of values by the probabilities of 16 keys for 8 columns (Step 37). The softmax wrote the probabilities row by row, as [row][key]. A warp's operand for one operation then came in eight pieces from eight separate places in memory. Now the softmax writes the probabilities in the layout in which the value kernel's threads take them, and a warp's operand is one coalesced load (Step 21) of 256 bytes. It is the idea of Step 21 for the third time: first the weights, then the activations (Step 65), now the probabilities.
+
+| Full attention, value sum | Before | After |
+|---|---|---|
+| Per 16 rows, 30K tokens of context | 189 µs | 55 µs |
+| Per 16 rows, 2K tokens of context | 24 µs | 11 µs |
+| Cost of context for a 256-row step | about 1.1 ms per 1K tokens | about 0.55 ms |
+
+The layout is used only for steps in which every run starts at a row that is a multiple of 8. A step that reads one prompt is such a step. Other steps keep the layout by row, because their column sets would not fit the scratch buffer.
+
+Two more attempts on the full attention went the other way. Several key groups per warp in the score kernel took 73 / 86 / 131 µs with 4 / 8 / 16 groups, against 57 with one. Loading several key groups ahead in the 1,024-thread value kernel was 25% slower, because of the registers it needs (Step 65).
+
+**Dense launches with chunks side by side.** A dense kernel takes at most 64 rows per launch (Step 42), so a step of 128 rows launched it twice, one launch after the other. A launch can now carry up to 8 chunks of 64 tokens. Its grid has a second dimension: a set of blocks per chunk. Each chunk is packed separately and computed by exactly the blocks that would compute it alone, so the bits are the same. What changes is that the blocks of different chunks run at the same time. A multiprocessor then holds more warps to cover each other's waits, and a tile's weights come from the cache for every chunk but the first that asks for them.
+
+A step of 128 rows went from 42.4 to 35.8 ms. Chunks of 32 or of 16 tokens were slower. Compare this with the dropped variation further up, 128 tokens through the same blocks: more columns for each warp made the kernel slower, and more blocks next to each other made it faster.
+
+**Steps of 1,024 rows.** The first trial of this step size had been made while the dense and attention kernels dominated a prompt step. After the work above, the expert stage was the largest part: about 25 of 90 ms at 512 rows. And the experts are what a bigger step helps, because each expert's weights are read once for more rows (Step 66). Tried again at this point, on an 8K-token prompt:
+
+| Rows per prompt step | Tokens/s |
+|---|---|
+| 512 | 6,669 |
+| 1,024 | 7,019 (+5%) |
+
+It was kept. A prompt-only step has up to 1,024 rows. The attention still runs in sub-batches (Step 66), and in the full-attention visits their size now follows the context: up to 128 rows at short context, 16 rows beyond 16K. Per-row scratch buffers that nothing used any more were removed in the same change, so the net cost is about 0.56 GiB: with the desktop of the day, one slot holds about 219K tokens where it held about 233K. The host's estimate of the engine's fixed memory at start-up had been counting too little and was corrected to 20,460 MiB.
+
+**Results.** Prompt-only steps over an 8K prompt, in the developer tool, as the notes of the day recorded them:
+
+| After | Tokens/s |
+|---|---|
+| The start of this step | 3,060 |
+| The bulk dense kernel | 3,980 |
+| Attention in groups of 8 rows | 4,590 |
+| The sliding-window restructure | 4,880 |
+
+The 512-row steps have no line in this table. Their figure was taken with another step size and another text, and cannot be compared with these.
+
+Step times with the output head, as the server runs them, in ms:
+
+| Rows | 1 | 8 | 16 | 24 | 32 | 64 | 128 |
+|---|---|---|---|---|---|---|---|
+| Before this step | 5.88 | 10.46 | 14.45 | 17.42 | 20.66 | 34.92 | 60.22 |
+| After the attention work | 5.89 | 10.6 | 14.5 | 17.3 | 19.3 | 28.1 | 42.4 |
+| With chunks side by side | | | | | | | 35.8 |
+
+Steps of 32 rows and more became 7–30% shorter before the chunks. Those are the steps of 4 and more streams, so this work on prompts also serves decoding with several streams.
+
+Prompt processing through the server, on new random text (`coldprefill.py` of Step 68), tokens/s. The columns for vLLM and Strata are Step 68's measurements:
+
+| New prompt tokens | Step 68 build | After the attention work | With chunks and 1,024-row steps | vLLM | Strata |
+|---|---|---|---|---|---|
+| 4.7K | 3,328 | 6,372 | 7,690 | 2,478 | 7,282 |
+| 19K | 2,850 | 5,958 | 7,020 | 6,800 | 6,517 |
+| 34K (Strata: 28K) | 2,465 | 5,267 | 6,040 | 8,714 | 5,835 |
+
+The answers are the same bit for bit, at more than twice the speed. The engine is now ahead of both others at 4.7K and 19K, and behind vLLM at 34K.
+
+**What "bit-identical across step sizes" means, and why the project insists on it.** A row is one token of one conversation at one position. The engine can process it in many kinds of step: alone, with 7 drafts, among 1,024 rows of its own prompt, or next to rows of other conversations. Bit-identical across step sizes means that everything the row produces, the keys and values it writes and the prediction that is read from it, has the same bits in every one of these steps (Step 43). There are three reasons to insist on it.
+
+1. *The server chooses the steps, not the user.* How a prompt is cut into steps depends on what else is running and on what the prefix cache holds (Steps 52 and 54). If the result depended on the cut, the same request would get different answers on a busy and on an idle server.
+2. *Other features stand on it.* Speculation verifies drafts in a larger step and promises the text that single-row steps would give (Steps 25 to 27). The prefix cache continues from state that an earlier request left behind in steps of other sizes. Seeded sampling promises the same text for the same seed.
+3. *It makes tests exact.* A test of a bit-identical change compares for equality, and any difference is a bug. A test of a change that is "the same up to rounding" has to decide how much difference is acceptable, and a real bug can hide below that line (Step 38).
+
+Each kernel change in this step therefore had to be "the same operations on the same operands in the same order" (Step 65), and each section above says why it is.
+
+**How it is checked.** `scripts/verify.sh` after every commit:
+
+| Check | What it compares |
+|---|---|
+| Batch sizes | Greedy tokens with steps of 128, 100, 56, 48, 38, 37, 30, 24, 9, 8 and 1 rows against steps of 16 |
+| Prompt-only steps | `INK_PRE` (Step 66) with steps of 1,024, 512, 256, 200 and 129 rows; the tokens after them must equal those of the 16-row run |
+| Kernel families | The older packed kernel (`INK_BULK_MIN=999`) and the plain one (with `INK_PACK_MIN=999` as well) against the bulk kernel |
+| Several conversations | The interleaving test (Steps 51 and 68), also with prompt steps shared by several conversations |
+| Fingerprint | The NLL in both modes, 0.9007 and 0.9068, compared to the last digit |
+
+**The independent review.** A review read the whole range of commits of this step. Every claim of bit-identity that it checked holds: the order of the dense kernel's chains, the row-group tables over 3,000 simulated steps, the orders of the softmax and of the value sum, the bounds of the full attention, the expert tasks, and the limit of 1,024 rows.
+
+It found one real crash. The full-attention scores go into a scratch buffer. How many rows a sub-batch has depends on the context, as described above: many rows at short context, few at long context, so that rows × context stays within the buffer. The buffer itself was sized by that same product, taken at the largest context the server was started for. The assumption behind it: the largest context needs the largest buffer.
+
+That holds when the largest context is a power of two. Between two powers of two it does not. The number of rows falls in steps, at powers of two, and the context grows smoothly. Just below a power of two the row count is already the small one, and the context has not yet reached the size that goes with it. The product dips. With `--ctx 30k` the formula gave a buffer of 68 MiB. A step at short context, in the same server, writes 72. It would have written past the end of the buffer.
+
+The fix sizes the buffer by the largest product over the cases that can occur, not by the product at the largest context (`gsub_bytes`). In mathematical terms the formula was not monotone: it does not always grow when its input grows. And 30K is an ordinary context for a user to ask for.
+
+Two smaller findings:
+
+- Three environment variables for experiments, `INK_BULK_MIN`, `INK_GEMM_CHUNKS` and `INK_ATTN_GROUP`, could select kernels that no longer cover every step size. They were corrected.
+- The check "plain kernels against packed ones" of Step 65 compared the bulk kernel with itself. It turned packing off with `INK_PACK_MIN=999`, but since this step the bulk kernel takes over from 9 rows and that variable no longer decides which kernel runs. The check passed and proved nothing. It now uses the two settings in the table above. This is the second test in this log that could not fail (Step 66).
+
+**Quirks we hit**
+
+- **"Compute-bound" had been said for two steps without a measurement of the computing.** Steps 65 and 68 called the dense kernels compute-bound at 64 rows, at an effective 31–45 TFLOP/s. The tensor cores alone do 244. The kernels were bound by the instructions around the arithmetic.
+- **Fewer loads made a kernel slower, twice.** The position table by distance needed a quarter of the loads and took 54 µs against 13. Staging in shared memory replaced loads from global memory by a load and a store.
+- **A step size was rejected and then kept on the same day.** 1,024 rows measured +3% for 430 MB while the dense and attention kernels dominated the step. Once the experts were its largest part, the same step size measured +5% (6,669 → 7,019 tokens/s on an 8K prompt) and was kept, for about 0.56 GiB net.
+- **The operand layout for probabilities depends on where runs start.** Steps whose runs do not start at multiples of 8 rows keep the older layout. Both give the same bits.
+- **The grouped attention is the slow form for small steps**: 11.01 against 10.55 ms at 8 rows, and still 2% slower at 16. Its threshold is 17 rows.
+- **A cost for small steps came from a buffer sized for big ones.** Clearing shared memory for 512 rows on every step was invisible in a prompt benchmark. The same-session comparison of small steps showed it.
+- **The context that fits became smaller.** About 0.56 GiB went to the 1,024-row steps, and the corrected start-up estimate also lowers the context that the server offers (Step 58).
+
+**Why you should care**
+
+- Before optimising a kernel that looks compute-bound, measure the arithmetic alone: the instruction in a loop on registers. Put the kernel into the same unit, here ns per operation per multiprocessor. The ratio says how much is left, and that it is not arithmetic.
+- "Compute-bound" can mean bound by the arithmetic or bound by the instructions around it. Only a yardstick tells the two apart. Here it was always the second.
+- A waiting warp costs nothing if another warp has work. Prefer many independent warps with short chains of loads to one warp with a long chain.
+- Removing loads is not a gain in itself. What counts is what a warp waits for. Measure every such change; two of them made things slower here.
+- More blocks side by side beat more work per block: chunks of 64 tokens next to each other in one launch were faster than one launch after another, and 128 tokens through the same blocks were slower.
+- A block has to do enough work to be worth starting. Match the threads of a block to its work, and do it per step size.
+- Batch along the dimension that shares its reads. Rows of one conversation share keys and values, so 8 of them in one block read the keys once.
+- Store data in the layout in which its consumer loads it. It worked for weights, for activations and now for probabilities.
+- Bound the work by what exists, not by the size class it falls into. A conversation of 40K tokens should not pay for a bucket of 64K.
+- An idea that did not pay can pay after its surroundings have changed. A bigger step helps the experts, and it paid once the experts were the largest part of the step. Keep the measurement, know which part the idea helps, and try again when that part has become the large one.
+- A form that wins at 128 rows can lose at 8. After work on large steps, measure the small ones in the same session against the previous build.
+- Bit-identity turns a test into a comparison for equality. Hold on to it as long as it costs little, and say exactly why each change keeps it: same operations, same operands, same order.
+- Size a buffer by the maximum over every case that writes to it. A formula evaluated at the largest parameter is enough only if it never decreases, and a rule that changes at powers of two usually makes it dip between them. Test with parameters that are not round numbers.
+- When a kernel replaces another, look again at every test that compares two variants and at every switch for experiments. A switch that no longer switches anything turns a comparison into a thing compared with itself.
+- Keep the dead ends with their numbers. Here they are the evidence for the principle.
+
+**Jargon**
+
+- **Chunk (of a dense launch)**: the up to 64 tokens that one set of blocks of a dense kernel handles; a launch can carry up to 8 chunks, whose blocks run at the same time.
+- **Epilogue (of a kernel or block)**: what a block does after its last multiply: synchronising its warps, exchanging and adding partial sums, storing the result; for a block with little work it can cost more than the multiplies.
+- **Monotone (function)**: never decreasing when its input grows; a buffer sized by a formula evaluated at the largest input is large enough only if the formula is monotone.
+- **Per-multiprocessor time (ns per operation per SM)**: a kernel's time multiplied by the number of multiprocessors and divided by the tensor-core operations it issues; it puts kernels of different sizes on one scale and next to what the tensor cores do alone (2.85 ns for bf16 here).
+- **Row group (attention)**: up to 8 consecutive rows of one conversation that share an attention block, so that the keys and values are read once for all of them; their (row, head) pairs are the columns of the multiplies.
+- **Slice-major layout**: packed activations ordered by slice first and by token within a slice, so that a warp that walks through the slices reads a contiguous stretch and one load holds the operands of two column groups.
+- **Wide task (experts)**: one expert with up to 64 of the tokens routed to it, handled by one set of blocks with the activations gathered once into operand layout; the earlier task had up to 8 tokens.
+- **Yardstick kernel**: a benchmark kernel that executes only the instruction of interest on registers, with no memory access, to measure the hardware's ceiling for that instruction.
+
+---
+
+## Step 70 — A second, faster arithmetic for prompts: fused attention, a bias that looked like noise, and what a fair benchmark needs (2026-11-24)
+
+**What we did**
+
+**The starting point.** Step 69 ended with prompts read at 7,690 / 7,020 / 6,040 tokens/s at 4.7K / 19K / 34K tokens, bit for bit as before, and with vLLM still ahead at 34K. Each attention kernel had been tuned. What could not be changed was their structure: a kernel that must give the same bits as the decode kernels has to add the same numbers in the same order, and that order comes from kernels designed for a single row (Step 37). Scores go to a scratch buffer, a softmax runs over the buffer, and a third kernel reads the probabilities back.
+
+This step adds a second set of kernels for prompts, called the fast prompt path. They compute the same mathematics in another order, and their results differ from the exact kernels' in the last bits. The fast path is the default. `--exact-prompts` turns it off. The step then repeats the three-engine comparison of Step 68, and corrects two things in how such a comparison is set up.
+
+**Why give up bit-identity, and where.** Step 69 listed what bit-identity gives: one answer per request, features that stand on it, and tests that compare for equality. It is not given up lightly, and not everywhere.
+
+The fast kernels run only in prompt-only steps (Step 66). Nobody reads a prediction from such a step. What it produces is state: the keys and values that later steps attend to. The fused attention described below needs one thing more, a step whose rows all belong to one conversation. A prompt-only step shared by several prompts keeps the exact attention kernels and takes only the fast gate. Every step with the output head, which means all generation, runs the exact kernels as before. So everything this log has shown about generation still holds bit for bit: speculation does not change greedy output, and a seed gives the same text with and without drafting.
+
+The decision for the project was: fast by default, exact on request. What that means for a user:
+
+| | Default (fast path) | `--exact-prompts` |
+|---|---|---|
+| New prompt of 4.7K / 19K / 34K tokens, tokens/s | 8,443 / 8,294 / 7,950 | 7,551 / 6,739 / 5,871 |
+| One prompt, cut into prompt-only steps of different sizes | Same bits | Same bits |
+| One row, read by a prompt-only step and by a step with the head | Differs in the last bits | Same bits |
+| One request, cached or not, alone or not | The answer can differ | The same answer, bit for bit |
+| Quality on text | Same within noise (below) | The reference |
+
+The fourth line is the price, and it needs an explanation. Two examples of how the same request can reach different kernels:
+
+- *Alone or not.* A step is prompt-only when no conversation is generating (Step 66). On an idle server a prompt is read by the fast kernels. If another conversation is generating at that moment, the prompt's rows share steps that have the head, and those run the exact kernels.
+- *Cached or not.* A reply that the model generated was computed by steps with the head, and its keys and values sit in the prefix cache (Step 54). If the same conversation is later read from the start, the earlier reply is part of the prompt and is read by the fast kernels.
+
+In both cases the state differs in its last bits. Mostly that changes nothing in the text. At a position where two tokens are close (Step 68 called it numerically unstable) it can decide between them, and from there on the two texts differ. Measured after a prompt read both ways: about 97% of the greedy tokens are the same. That is the level at which this engine's greedy tokens agree with vLLM's. Neither answer is the wrong one. Both come from the model's mathematics with different rounding, as the answers of two engines do.
+
+What a user loses is reproducibility: the guarantee that a request at temperature 0 has one answer whatever the server did before and does alongside. That matters to someone who compares outputs between runs, in a test, in an evaluation or while looking for a bug. `--exact-prompts` restores all of it, and its help text gives the cost as "about a quarter slower on long prompts". The test suite of Step 63 runs its bit-for-bit comparisons with that switch.
+
+**What the exact path writes.** For every (row, head, key) the exact kernels write a score to the scratch buffer, read it twice for the softmax, write a probability and read it back for the value sum. That is 16 bytes of memory traffic per (row, head, key), in three launches per sub-batch. Step 69 showed that memory instructions, not arithmetic, are what these kernels pay for. A row at 30K tokens of context has 30K keys for each of its 24 heads.
+
+**The fused kernel.** `k_attn_fused_part` does scores, softmax and value sum in one kernel. A warp takes 16 rows of one head through a run of key tiles, and everything stays in registers. Nothing goes to memory but the result. A kernel that merges stages is called fused (Step 14); the gain here is not the saved launches but the saved traffic.
+
+The difficulty is the form in which a tensor-core operation takes and returns its numbers. One operation computes D += A × B:
+
+```
+A: 16 rows × 16 columns        B: 16 rows × 8 columns        D: 16 rows × 8 columns
+
+The 32 threads of the warp are numbered by g = 0..7 and q = 0..3. Thread (g, q) holds
+
+  of A:   rows g and g+8,             columns 2q, 2q+1, 8+2q, 9+2q     8 values
+  of B:   rows 2q, 2q+1, 8+2q, 9+2q,  column g                         4 values
+  of D:   rows g and g+8,             columns 2q, 2q+1                 4 values
+```
+
+A thread's share of a result D is not its share of a B operand. It holds two rows and two columns of D, and B wants four rows of one column from it. In the exact kernels the scores are a D, and the next multiply takes the probabilities as a B:
+
+| | A | B | D |
+|---|---|---|---|
+| Exact, scores | Key tile [key][dimension] | Queries [dimension][row and head] | Scores [key][row and head] |
+| Exact, value sum | Value tile [dimension][key] | Probabilities [key][row and head] | Output [dimension][row and head] |
+
+To go from that D to that B, the threads must exchange values, or the values must pass through memory. The exact path passes them through memory anyway. A first fused version exchanged them between lanes (Step 65: a lane is a thread's place in its warp), and it was slower than the exact kernels. More on that below.
+
+The layout that made it work swaps the roles. The queries become the A operand:
+
+| | A | B | D |
+|---|---|---|---|
+| Fused, scores | Queries [row][dimension] | Key tile, read as [dimension][key] | Scores [row][key] |
+| Fused, value sum | Probabilities [row][key] | Value tile, read as [key][dimension] | Output [row][dimension] |
+
+Two things fall into place.
+
+1. *The stored tiles need no conversion.* A key tile is stored as [key][dimension] in the layout of an A operand (Step 37): thread (g, q) loads keys g and g+8 with dimensions 2q, 2q+1, 8+2q and 9+2q. Its four values of key g are exactly its share of a B operand whose column is key g. Its four values of key g+8 are its share of a second B operand. So one stored tile serves as two B operands, for keys 0–7 and for keys 8–15, with the registers the thread already has. The same holds for a value tile.
+2. *The scores land where the next multiply wants them.* The two operations give scores for keys 0–7 and for keys 8–15. Thread (g, q) then holds rows g and g+8 with keys 2q, 2q+1, 8+2q and 9+2q. That is exactly its share of an A operand [row][key]. The probabilities go straight into the value multiply. Nothing is exchanged between lanes and nothing touches memory.
+
+For one tile of 16 keys the warp loads the keys' 128 dimensions (8 stored tiles), multiplies, turns the scores into probabilities, loads the values (8 stored tiles) and multiplies again. Its queries are staged in shared memory once.
+
+**A softmax without a first pass.** The softmax of a row is exp(score − M) for every key, divided by the sum of these, where M is the largest score. Subtracting M keeps the exponential from overflowing. It also means that M must be known before the first probability is computed, which is why the exact path stores all scores and reads them twice.
+
+M is not needed for the mathematics, though. Any reference value in its place gives the same result, because it cancels in the division. It only has to keep the numbers in a range where floating point is exact enough. So the fused kernel computes its probabilities as it goes, against a reference score per row, and this is called a streaming softmax here:
+
+- The reference starts as the largest score of the row's first tile.
+- A later score may exceed the reference by up to 16. Its "probability" is then as large as e^16. That costs no precision: a float holds such a number as exactly as one below 1.
+- When a score exceeds the reference by more than 16, the reference moves to that score, and everything the row has summed so far is multiplied by one correction factor. This is rare after the first tile.
+
+**Two instructions.** Two PTX instructions shorten the loop:
+
+```
+ex2.approx.ftz.f32     2 to the power x, approximately, in one instruction
+cvt.rn.bf16x2.f32      two floats rounded to bf16 and packed into one 32-bit word
+```
+
+The exponential e^x is computed as 2 to the power x × log2(e). "Approximate" means that the last bits are not guaranteed, which only a path that has given up bit-identity may accept. The second instruction is a native conversion instruction like those of Step 34. It rounds two probabilities and delivers them in the form in which the A operand takes them.
+
+**The sum of probabilities, from a multiplication by ones.** Each row needs the sum of its probabilities, to divide by at the end. A row's probabilities are spread over four threads, so a sum would need an exchange between them. The kernel does one more tensor-core operation in place of that: the probabilities times a B operand that holds only ones. Every thread of the row then has the whole sum. This form has a second property, which the quality section below depends on: it adds up the probabilities as rounded to bf16, the same values that go into the value multiply.
+
+**Chunks, and a finishing kernel.** A row at long context has too many keys for one warp. The keys are cut into chunks, 64 tiles (1,024 keys) in the full-attention visits and 12 tiles in the sliding window, and each chunk gets a warp of its own. A warp writes, for each of its rows, the reference, the sum and the partial outputs. A second kernel, `k_attn_fused_fin`, brings the chunks of a row to one reference, adds them, divides by the sum, applies the model's sink and gate (Step 15) and writes the attention output.
+
+**What the card taught on the way.** Each of these four was a measured dead end first.
+
+1. *A lone warp is slow whatever it does.* A warp on its own executes about one instruction per 15–25 clock cycles (a cycle is one tick of the processor's clock). A multiprocessor is fast only when many warps take turns on it. How many fit is decided by registers: a multiprocessor has a fixed stock of them, and every thread of a kernel takes as many as the compiler gave that kernel. These warps are heavy. Each thread holds 64 accumulators (the running sums of its part of the output) and 168 registers in all, and 12 such warps fit on a multiprocessor. With so few, the kernel sits at about 2.2 times the tensor cores' ceiling (Step 69). No arrangement of blocks changed that: one warp per block, or 3, 6 or 12 warps in a block that share the keys through the cache, or loads one tile ahead. All were within 10% of each other.
+2. *The first version was slower than the exact kernels.* It kept the exact kernels' roles: 24 (row, head) columns per warp, and the probabilities exchanged between lanes. It needed 224 registers per thread. Fewer registers, through the layout above, were what made the kernel worth having.
+3. *The finishing kernel was a hidden floor.* Every measurement of the pair included the finishing kernel, and for a while it was the floor under all of them: each thread computed 64 sigmoids (the function in the model's gate) one after another, which cost 30 µs. It now has a warp per 16 output dimensions. Only after that did the measurements show the main kernel.
+4. *What remains is the number of instructions per tile.* Most tiles of a long context lie far behind every row of the step: every key is visible to every row, and the position bias does not reach that far. Those tiles take a path with no masks and no bias. That path, with the two instructions above, is worth 25%.
+
+| Attention per 128 rows | Exact kernels | Fused |
+|---|---|---|
+| Sliding window | 51 µs | 32 µs |
+| Full attention, 8K tokens of context | 364 µs | 110–150 µs |
+| Full attention, 30K tokens of context | 1,100 µs | 420 µs |
+
+**The quality check: a bias, not noise.** The fast path changes results, so it needs the check of a lossy change (Step 35): the NLL on text, against the exact path. The measurement is the NLL of the text that follows a 30,720-token prompt. With the prompt read by the exact kernels it is 1.0868. With the prompt read by the first version of the fused kernel it came out a few thousandths higher.
+
+Is that a problem? Judged by its size, no. Harmless changes of rounding move this metric as well (Step 38), and the comparison after the fix, below, has differences of up to 0.014 on other texts. A difference of this size is exactly what would be waved through as noise.
+
+What gave it away was not the size but the sign. The fused kernel cuts a row's keys into chunks, and the number of chunks can be chosen: 4, 8 or 16 in full attention, and 1, 2 or 3 in the sliding window. Each chunking adds the same numbers in a different order. So each one is a different realisation of the rounding noise: the same computation with its accidents rolled again. Five chunkings:
+
+| Prompt read by | NLL of the text after it |
+|---|---|
+| The exact kernels | 1.0868 |
+| The fused kernel, first version, five chunkings | 1.0930, 1.0986, 1.0904, 1.0946, 1.0910 |
+
+The five differ among themselves. That spread is the noise. And all five lie above the exact figure, by 0.004 to 0.012. If the distance to the exact path were noise too, a sum of accidental rounding differences, some of the five would lie below it. A difference that keeps its sign while the accidents change is not made of accidents. It has a cause that acts the same way every time. That is a bias.
+
+The cause was a mismatch between the two halves of one division. A row's output is
+
+```
+output  =  sum over keys of (probability × value)  /  sum over keys of probability
+```
+
+The top goes through the tensor cores, which take the probabilities rounded to bf16. The first version computed the bottom from the probabilities before rounding. Take a row in which one key dominates. The output should be that key's value. It was the value times (rounded probability / unrounded probability), which is close to 1 and is not 1. The exact path cannot make this error. Its reference is the true maximum, so its largest probability is exactly 1, and 1 is the same number rounded or not. In the streaming softmax the largest probability is whatever the reference makes it, and it rounds like any other number.
+
+The fix is the multiplication by ones described above. The bottom is now the sum of the rounded probabilities, the very values in the top. For a dominant key the rounding cancels in the division.
+
+After the fix, the same text and four chunkings:
+
+| Prompt read by | NLL of the text after it |
+|---|---|
+| The exact kernels | 1.0868 |
+| The fused kernel, sum of the rounded probabilities, four chunkings | 1.0878, 1.0893, 1.0901, 1.0906 |
+
+The distance fell to between 0.001 and 0.004. All four are still above the exact figure, though, and this one text cannot say what that remainder is. The chunkings vary the rounding inside the fused kernel. They do not vary what the fused and the exact path differ in as a whole, and on a single text that difference lands on one side or the other. So the comparison was repeated on six other texts, fast path minus exact path, in nats per token:
+
+| Text | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|---|
+| NLL difference | +0.0049 | +0.0055 | −0.0143 | −0.0055 | −0.0027 | +0.0074 |
+
+Three up and three down. Both signs is what noise looks like. After a prompt read by the fast path, about 97% of the greedy tokens agree with the exact path.
+
+One more experiment: a slack of zero, where the reference moves at every new maximum and the largest probability is exactly 1 as in the exact path, changed nothing measurable. The slack of 16 stayed.
+
+**Step-size independence in the fast mode.** The fast path gave up identity with the exact kernels. It did not have to give up identity with itself. A prompt is cut into steps by the scheduler, and if the fast path's result depended on the cut, even an idle server would not be reproducible. So the kernel was written so that what it computes for a row depends on that row alone:
+
+| Rule in the kernel | What it rules out |
+|---|---|
+| Chunks start at fixed keys (every 64 tiles in full attention, every 12 in the window) | Partial sums that cover different keys in different steps |
+| Each row moves its own reference, by its own scores | A row's result depending on the rows that share its warp |
+| Far and near tiles use one formula | A result depending on which tiles count as far, which follows from where the step cut the rows |
+| Masked keys add exact zeros | A result depending on keys that only later rows of the warp can see |
+
+`scripts/verify.sh` reads the same prompt in prompt-only steps of 1,024, 512, 200, 129, 37 and 5 rows and compares what follows: the six outputs must be identical. It also holds the fast path to the exact one with three checks that have thresholds, since equality is not available: the fused attention and the fast gate against the exact kernels on the same inputs, where the difference must stay at rounding level; at least 450 of 500 greedy tokens equal after a fast-read prompt (about 485 are expected); and the NLL after a prompt read both ways, which may differ by less than 0.03.
+
+**The loop gate on the tensor cores.** The gate of the loop controller (Step 65) computes, for every token and channel, two dot products of the token's 64 controller values with 64 learned values of the channel. Step 65 gave each thread whole dot products to add up, 64 products each. Seen as a whole, tokens × channels of 64-term dot products is a matrix product, and all its inputs are bf16 values. So the tensor cores can do it: 16 tokens × 8 channels per multiplication (`k_gate3_fast`). The tanh is computed as 1 − 2 / (1 + 2^(2x × log2 e)), with the approximate instruction for the power of two.
+
+| Gate, 128 rows | Time |
+|---|---|
+| Exact kernel | 36 µs |
+| On the tensor cores | 10 µs |
+
+The results are within 1e-7 of the exact kernel's. They are not identical: the tensor cores add the 64 products in their own order, not in the order that Step 65 wrote down, and the tanh is approximate. So this kernel belongs to the fast path. Prompt steps gained 4%.
+
+**Tried and dropped: the position-bias table on the tensor cores.** The same idea was applied to the relative-position bias in the attention preparation (Step 69). The rounding was identical in all but a few values, and the whole preparation took 11.6 µs per 128 rows against 12.8. End to end nothing moved. A second arithmetic costs a second code path and its tests, and a gain of that size does not pay for them.
+
+**Recorded graphs of big steps.** The engine records a CUDA graph per step shape and keeps the 48 most recently used (Steps 11 and 59). With the graphs of that time, 48 of them levelled off around 260 MiB, so a limit on the count was also a limit on the memory. A prompt step of 1,024 rows broke that assumption:
+
+| Prompt steps of | Recorded graph | Tokens/s with the graph | Without it |
+|---|---|---|---|
+| 1,024 rows | 7,460 launches, 20 MiB | 8,295 | 8,288 |
+| 300 rows | | 6,247 | 5,858 (the graph is worth 6.5%) |
+
+A graph saves the cost of issuing launches one by one (Step 11), and in a step of that size this cost no longer shows. Steps of more than 512 rows now launch their kernels directly. And the cache is bounded in bytes, 260 MiB, not only in entries.
+
+For a bound in bytes the engine must know what a graph takes. The obvious way is to read the card's free memory before and after recording one. That fails exactly when it matters. When a graph is dropped, CUDA does not hand its memory back to the card; it keeps it and reuses it for the next graph. From then on the free memory does not move when a graph is recorded, and the difference reads zero. The engine now estimates a graph's size from its number of launches, at 2.6–3.4 KB per launch as measured.
+
+**The second review.** An independent review read the fast path. It found no defect in the kernels. Two of its checks are worth copying:
+
+- It simulated the chunked streaming softmax in 64-bit floating point (float64) and compared it with a plain softmax: they agree to 1.7e-14. In 64-bit arithmetic rounding is negligible, so this shows that the algorithm itself, with its chunks, moving references and corrections, is the same mathematics. What separates the real kernel from the exact path is then rounding and nothing else.
+- It confirmed that a row's result depends on that row alone.
+
+Fixed after it: the kernel comparison in `verify.sh` ran on 92 real rows where it claimed 128; two debugging switches could make the kernel write past the scratch buffer, and were removed; unused load-ahead variants of the kernel were removed; and the key under which a step's graph is stored was split for decode steps too, as it had been for prompt steps. A recorded graph fixes which kernels run, so every choice between kernels has to be part of that key.
+
+**Prompt steps after this.** In the developer tool, with steps of 1,024 rows:
+
+| Prompt | Exact path | Fast path |
+|---|---|---|
+| 8K tokens | 7,200 tokens/s | 8,300 |
+| 34K tokens | 5,800 tokens/s | 7,900 |
+
+**The three-engine series, redone.** Everything since Step 68 changed this engine's numbers, so the comparison was run again: same card, same afternoon, same harness, 10 runs per cell and the median (Step 68's rules; scripts and raw samples in `.session/`, `series.sh` and `final3/`). Two things about the set-up changed, and both are lessons.
+
+*First: the reasoning effort is set on every request, to the same level.* The model takes a reasoning effort, which says how much it should think before it answers. In the API it is the field `reasoning_effort`, and the model receives it as a line of text in the prompt (Step 3). The series of Step 68 sent `"none"` for the decode and prompt tests and `"low"` for the tool-call test. "None" reads like a switch that is off, the same on every engine. It is not. It is a line in the prompt that asks for no thinking, and the model may still do a little of it. And at "none", or with the field left out, each engine falls back to a default of its own. This engine's default for a request that sets nothing is 0.9, "high", which is the model's default. The engines were then not asked for the same amount of thinking, and thinking tokens are generated tokens like any others (Step 68). So the earlier series did not compare equal work. Every request of the new series sets `reasoning_effort: "high"`.
+
+*Second: the cache precision is made equal, in both directions.* vLLM is usually run on this card with an 8-bit KV cache, which is lossy. This engine's default is a lossless 16-bit cache (Step 47). Step 68 compared the two as they are usually run. That is a fair description of what a user gets, and an unfair basis for saying why one is faster. So vLLM was also run with a 16-bit cache, and this engine also with `--kv 8`.
+
+**Decode.** Tokens per second in total over all streams:
+
+| Streams | Kuroshio | vLLM + DSpark (8-bit cache) | vLLM, no drafter | Strata |
+|---|---|---|---|---|
+| 1 | **249.5** | 219.9 | 167.0 | 121.8 |
+| 2 | **419.3** | 348.6 | 236.0 | 180.3 |
+| 4 | **559.0** | 509.1 | 387.5 | 272.8 |
+| 8 † | 760.9 | **790.6** | 661.3 | 390.4 |
+| 16 † | 1,062.3 | **1,306.6** | 1,068.3 | Did not finish |
+
+† As in Step 68, these rows use the benchmark-only switch for more than 4 slots. The conversations then share 127K tokens of context at 8 slots and 31K at 16.
+
+The single-stream row is tokens over the whole request (Step 68). Timed from the first visible token, Strata would show 280, Kuroshio 253 and vLLM 228. Single-stream runs of this engine ranged from 230 to 269 over the ten runs.
+
+**Strata at 16 streams.** With 16 parallel requests Strata stopped answering. Every request stayed at reading the prompt until the harness gave up, after 15 to 30 minutes. It was tried three times in all, one of them with the effort at "none", and it hung each time. So the effort setting is not the cause. A day earlier, in Step 68's series, it had completed this cell at 562 tokens/s. The cause is not known. The cell says "did not finish". It is not a zero, and it is not the figure of the day before.
+
+**The same comparison at equal cache precision.**
+
+| Streams | Kuroshio, 16-bit (default) | vLLM + DSpark, 16-bit | Kuroshio, `--kv 8` | vLLM + DSpark, 8-bit |
+|---|---|---|---|---|
+| 1 | 249.5 | 218.8 | 266.7 | 219.9 |
+| 2 | 419.3 | 357.9 | 426.1 | 348.6 |
+| 4 | 559.0 | 505.4 | 545.5 | 509.1 |
+| 8 | 760.9 | 754.2 | 739.7 | 790.6 |
+| 16 | 1,062.3 | 1,053.7 | 1,067.3 | 1,306.6 |
+| New prompt of 4.7K / 19K / 34K tokens | 8,443 / 8,294 / 7,950 | 2,669 / 7,298 / 9,422 | 7,486 / 7,122 / 6,533 | 2,603 / 7,052 / 9,258 |
+
+With a 16-bit cache vLLM refuses its usual limit of 94K tokens: it needs 7.64 GiB for the cache and has 5.94. That column ran with the limit lowered to 41K.
+
+Read the first two columns, then the last two.
+
+- *At 16 bits the two engines are level at 8 and 16 streams*: 761 against 754, and 1,062 against 1,054. Below that this engine leads. So vLLM's lead at many streams is its 8-bit cache. Step 68 had written "vLLM scales better beyond 4 streams" and had explained it by the time of a step. Two things are different now: this engine's large steps are shorter (Step 69), and the comparison has the column it lacked.
+- *This engine's 8-bit cache does not buy speed.* With `--kv 8` it is no slower at decoding (the +3% of Step 47 no longer holds), and no faster at many streams, where vLLM's 8-bit cache gains. The reason is in Step 47: the cache stores 8 bits, and the attention kernels convert every tile back to 16 bits before they multiply. For the same reason `--kv 8` reads prompts 11–18% slower.
+
+**Prompt processing.** New random text, tokens/s:
+
+| New prompt tokens | Kuroshio (fast path, default) | Kuroshio, `--exact-prompts` | vLLM | Strata |
+|---|---|---|---|---|
+| 4.7K | **8,443** | 7,551 | 2,603 | 7,466 |
+| 19K | **8,294** | 6,739 | 7,052 | 6,679 |
+| 34K (Strata: 28K) | 7,950 | 5,871 | **9,258** | 5,939 |
+
+Two more configurations of this engine. With `--kv 8 --dense 8` it decodes at 265.4 tokens/s and reads prompts at 6,579 / 6,289 / 5,826: the 8-bit dense matrices of Step 35 were not part of the prompt work, and theirs is now the slower path. With `--spec 0`, no speculation, it decodes at 161.0 against 167.0 for vLLM without its drafter.
+
+**Tool calls.** The test of Step 68, 5 passes of 24 prompts. 2,000 tokens are allowed per call, so that thinking at effort high does not cut a call short.
+
+| Engine | Well-formed, of 24: median (range) |
+|---|---|
+| Kuroshio | 24 |
+| vLLM + DSpark | 16 (13–16) |
+| vLLM, no drafter | 13 (13–15) |
+| Strata | 2 |
+
+**The longest conversation.** One stream, run for real: a document with three facts in it, then questions about them (the needle test of Step 41). All three facts were retrieved in every row of the table.
+
+| Configuration | Context limit, tokens | Prompt that was run | First token after |
+|---|---|---|---|
+| Kuroshio, default | 210,944 | 208,854 | 40.8 s |
+| Kuroshio, `--no-draft` | 266,240 | 258,311 | 54.8 s |
+| Kuroshio, `--kv 8` | 358,400 | 351,301 | 155 s |
+| Kuroshio, `--kv 8 --dense 8 --no-draft` | 524,288 | 518,832 | 314 s |
+| vLLM, 8-bit cache | 132,096 | 126,726 | 19.4 s |
+| vLLM, 16-bit cache | About 44K by its own estimate | Not run | |
+| Strata | 32,768 | 22,806 | 4 s |
+
+This engine's totals are lower than before: 211K tokens at 1 slot and 176K at 4, where they were 240K and 200K, and 358K and 326K with `--kv 8`. The 1,024-row prompt steps and the corrected memory accounting of Step 69 took the difference.
+
+**Where this engine still loses.** Three places, all in the tables above:
+
+1. *Prompts of 34K tokens, against vLLM*: 7,950 against 9,258 tokens/s, and 9,422 with vLLM's 16-bit cache. vLLM reads a prompt in one pass after a fixed start (Step 68), so its rate keeps rising with the length.
+2. *8 and 16 streams, against vLLM's 8-bit cache*: 761 against 791, and 1,062 against 1,307.
+3. *Reading long prompts with `--kv 8`*: 155 s to the first token for 351K tokens, about 2,300 tokens/s on average, where the 16-bit cache reads 209K tokens at about 5,100.
+
+The last two have one cause, the conversion of 8-bit tiles to 16 bits at every use. The planned next step is attention that multiplies the 8-bit tiles natively on the tensor cores. So far it has one number, a ceiling from the yardstick of Step 69:
+
+| Instruction, alone on registers | Time per operation, per multiprocessor | Products in each result |
+|---|---|---|
+| 16-bit (bf16), `m16n8k16` | 2.85 ns | 16 |
+| 8-bit, `m16n8k32` | 1.45 ns | 32 |
+| 4-bit, `m16n8k64` | 1.45 ns | 64 |
+
+The 8-bit operation takes half the time of the 16-bit one and adds up twice as many products: four times the arithmetic per unit of time. That is what the tensor cores can do, not what a kernel does (Step 69). Nothing is built yet. Such a kernel would also take the queries and the probabilities in 8 bits, and what that costs in quality is the next thing to measure.
+
+**Quirks we hit**
+
+- **The gain of the fast path grows with the prompt.** 8,443 against 7,551 tokens/s at 4.7K, 7,950 against 5,871 at 34K. The attention is the part that grows with the context, and it is the part that was fused.
+- **The exact kernels became the test oracle of the fast ones.** The fast path could be checked kernel by kernel, on the same inputs, because the exact path stays in the build.
+- **The reference of the streaming softmax is not the maximum.** Nothing in the mathematics needs it to be. The one place where the exact maximum had been doing quiet work, a largest probability of exactly 1, showed up as the bias.
+- **Loading the next tile ahead made a lone warp faster and the kernel no faster.** It costs registers, and registers are warps per multiprocessor.
+- **`--kv 8` at one stream measured 266.7 tokens/s against 249.5 for the default.** Single-stream runs move by more than that with the text (230–269 for the default), so the table supports "no slower" and nothing more.
+- **vLLM's context limit had to be found by trying.** Its estimate of what fits depended on what it was asked for: asked for 1M tokens it reported 335K, and asked for 335K it refused. It started at 132,096. Its 16-bit limit, about 44K by its own estimate, was not probed further, because another program on the machine took the card during the probe.
+- **The 8-bit dense mode is now the slower way to read prompts**, 6,579 against 8,443 tokens/s at 4.7K. Step 35 built it as the faster one. It did not take part in Steps 69 and 70.
+- **Follow-up questions in the long-conversation test** took 0.2–0.5 s on this engine and on vLLM, which keep the conversation cached. Strata read its prompt again each time, 4.3 s.
+
+**Why you should care**
+
+- Give up exactness in one named place, by a decision, with a switch back. Say what it costs in the user's terms: here, the same request can get a different answer depending on what was cached and what ran alongside.
+- Exactness is worth most where results are read and compared. Steps that only build state for later can trade it for speed, if a metric shows that quality holds.
+- A kernel that writes its intermediate results to memory pays for them twice, once to write and once to read. Fusing the stages keeps them in registers.
+- Choose which input plays which role in an instruction so that the result lands in the layout the next instruction takes. Here a swap of A and B removed every exchange and both conversions.
+- A two-pass algorithm that needs a maximum first can often run in one pass with a moving reference, if the reference cancels in the final result.
+- Approximate hardware instructions are for paths that have already given up bit-identity, and only there.
+- A multiprocessor is fast through many warps. Registers per thread decide how many fit, so a kernel with many accumulators has a ceiling that no arrangement of blocks lifts.
+- When every variant of a kernel measures the same, suspect something else inside the measurement. Here it was the kernel that runs after it.
+- To tell bias from noise, repeat the measurement while changing something that should not matter, here the number of chunks. Noise changes its sign. A bias keeps it: five of five results on one side. Size alone does not tell: this bias was no larger than the differences that noise leaves between texts.
+- A bias has a cause, and it is often an asymmetry: two numbers that should be treated alike and are not. In a ratio, the top and the bottom must see the same rounding.
+- After a fix for a bias, differences in both directions are the sign that only noise is left. One text may not show both directions; vary the text as well as the computation.
+- A path that is not exact can still be deterministic. Decide what it must not depend on, here the step size, write the rules into the kernel, and test them with equality.
+- Separate the algorithm from its rounding by simulating it in higher precision. Agreement to 1.7e-14 says the mathematics is right, and what is left is rounding.
+- A lossy path needs checks with thresholds, and the exact path to compare with: per kernel, per token and on a quality metric.
+- Bound a cache in the unit that runs out. A count of entries stops being a bound when an entry can be much larger than the ones the count was chosen for.
+- Do not measure memory use by the change in free memory when an allocator in between reuses what was freed. Estimate from something you can count.
+- In a comparison, set every parameter that changes the work, on every engine, explicitly. A default is a different value on each, and "none" is a value too.
+- Compare at equal settings in both directions before explaining a lead. Here vLLM's lead at many streams turned out to be its cache precision, and this engine's own 8-bit cache turned out not to help its speed.
+- Report a cell that did not finish as "did not finish", with what was tried.
+- List where you lose next to where you win. For the remedy, say which part is measured, here a ceiling for the instruction, and which part is a plan.
+
+**Jargon**
+
+- **A and B operand (tensor-core instruction)**: the two inputs of D += A × B; each of the warp's 32 threads holds a fixed part of A, of B and of the result D, and the three parts differ, so which data plays A and which plays B decides whether a result can feed the next multiply without rearranging.
+- **Accumulator**: a register that holds a running sum across the iterations of a loop; a kernel with many of them per thread needs many registers.
+- **Bias (systematic error)**: an error with a cause that acts in the same way in every measurement, so that it keeps its sign when incidental things change; noise, by contrast, changes sign and size from one measurement to the next.
+- **Clock cycle**: one tick of a processor's clock, the unit in which the time of an instruction is counted.
+- **Exact prompt path / fast prompt path**: the two sets of kernels that can read a prompt; the exact path gives the same bits as generation, the fast path gives results that differ in the last bits and is quicker (`--exact-prompts` selects the first).
+- **Float64 (double precision)**: 64-bit floating point, with about 16 significant decimal digits; simulating an algorithm in it shows whether the algorithm is right apart from rounding.
+- **Fused attention**: scores, softmax and value sum in one kernel, with the intermediate results kept in registers instead of written to a scratch buffer between kernels.
+- **Reasoning effort**: a per-request setting that tells the model how much to think before it answers; the model receives it as text in the prompt, and an engine that is not given one applies a default of its own.
+- **Streaming softmax**: a softmax computed in one pass, against a reference score that moves when a much larger score appears, with what has been summed rescaled at that moment; the reference cancels in the final division.
+- **Warps per multiprocessor (occupancy)**: how many warps of a kernel can be resident on one multiprocessor at once, limited by the registers each thread needs; with few warps, the multiprocessor has nothing to run while one of them waits.
+
+---
+
 ## Glossary
 
 Alphabetical. Later entries extend this list.
 
+- **A and B operand (tensor-core instruction)**: the two inputs of D += A × B; each of the warp's 32 threads holds a fixed part of A, of B and of the result D, and the three parts differ, so which data plays A and which plays B decides whether a result can feed the next multiply without rearranging.
 - **A/B test**: running two versions under the same conditions and comparing the measurements.
 - **A/B test with interleaving**: an A/B test where runs of the two versions alternate, so that slow drift in the machine affects both equally.
 - **Acceptance rate (speculative decoding)**: the share of draft tokens that the full model confirms, overall or per draft position; it decides how many tokens one verify step yields.
+- **Accumulator**: a register that holds a running sum across the iterations of a loop; a kernel with many of them per thread needs many registers.
 - **Activation**: an intermediate value the model computes for a token while it runs, as opposed to a fixed weight.
 - **Admission / queueing**: admission is letting a waiting request start, here by giving it a free slot; queueing is holding requests in order of arrival until that is possible.
 - **Aggregate throughput**: the tokens per second of all concurrent streams added together.
@@ -4467,6 +5077,7 @@ Alphabetical. Later entries extend this list.
 - **Batch-size invariance**: the property that the output does not depend on how many tokens are processed per forward call.
 - **Batch size T**: here, the number of consecutive tokens of one sequence processed in a single forward call.
 - **BF16 (bfloat16)**: a 16-bit floating-point format; it is the top 16 bits of a 32-bit float, so it has the same range but much less precision.
+- **Bias (systematic error)**: an error with a cause that acts in the same way in every measurement, so that it keeps its sign when incidental things change; noise, by contrast, changes sign and size from one measurement to the next.
 - **Bit-exact**: producing identical results down to the last bit.
 - **Bitmask**: a word or a few words in which each bit stands for one item of a set (here one token), so that membership costs one bit and a whole set is tested, counted or walked through with a few instructions.
 - **Black-box test**: a test that uses a program only through its public interface, as a user would, with no access to its internals.
@@ -4482,6 +5093,8 @@ Alphabetical. Later entries extend this list.
 - **Ceiling**: the best speed the hardware could reach in theory for a workload.
 - **Channel (thread communication)**: a queue through which one thread sends values to another, so the two need not share memory; sending fails once the receiving side is gone.
 - **Chat template**: the recipe that turns a list of chat messages into the exact text and special tokens the model was trained on.
+- **Chunk (of a dense launch)**: the up to 64 tokens that one set of blocks of a dense kernel handles; a launch can carry up to 8 chunks, whose blocks run at the same time.
+- **Clock cycle**: one tick of a processor's clock, the unit in which the time of an instruction is counted.
 - **Coalesced access**: neighbouring threads of a warp reading neighbouring bytes, so the warp's loads are served as one contiguous stretch of memory instead of many scattered ones.
 - **Cold**: measured with nothing cached from an earlier request.
 - **Cold vs warm memory**: memory is warm when it was read recently and may still sit in the processor's caches, and cold when it has to come all the way from main (here GPU) memory.
@@ -4520,16 +5133,20 @@ Alphabetical. Later entries extend this list.
 - **E2M1**: a 4-bit floating-point format with 1 sign bit, 2 exponent bits and 1 mantissa bit; its values are 0, 0.5, 1, 1.5, 2, 3, 4 and 6, positive or negative.
 - **E4M3**: an 8-bit floating-point format with 1 sign bit, 4 exponent bits and 3 mantissa bits; the value format of MXFP8.
 - **Embeddings**: the table that turns each token ID into its starting vector.
+- **Epilogue (of a kernel or block)**: what a block does after its last multiply: synchronising its warps, exchanging and adding partial sums, storing the result; for a block with little work it can cost more than the multiplies.
 - **Error bound (rigorous)**: a number that the difference between an approximate and an exact value is proved never to exceed, as opposed to an estimate of how large the difference usually is; only a proved bound allows results to be ruled out without loss.
+- **Exact prompt path / fast prompt path**: the two sets of kernels that can read a prompt; the exact path gives the same bits as generation, the fast path gives results that differ in the last bits and is quicker (`--exact-prompts` selects the first).
 - **Expected gain / marginal cost**: the expected gain of an action is what it yields on average, here the probability that a draft ends up producing a token; its marginal cost is what one more unit adds to the total, here the time of one more row in the step.
 - **Expert**: one of the alternative MLPs in a mixture-of-experts layer.
 - **Fall-back path**: the slower, simpler way a program takes when its fast way cannot handle a case, here the full head after the candidate list has overflowed; normal inputs rarely reach it, so it needs a test that forces it.
 - **FFI (foreign function interface) / bindings**: the declarations that let one language (here Rust) call functions compiled from another (here CUDA C++).
 - **Fingerprint (of a computation)**: a number, such as the NLL on a fixed text, that changes whenever the arithmetic changes in any way; a script that compares it exactly turns "bit-identical" from a promise into a check.
+- **Float64 (double precision)**: 64-bit floating point, with about 16 significant decimal digits; simulating an algorithm in it shows whether the algorithm is right apart from rounding.
 - **FLOPS / TFLOPS**: floating-point operations per second; TFLOPS is 10¹² of them.
 - **FMA / fused multiply-add and contraction**: an FMA computes a × b + c in one instruction with a single rounding; contraction is the compiler replacing a separate multiply and add by an FMA, which can change the last bit of the result.
 - **Forward pass**: one run of the model's arithmetic from input tokens to output scores.
 - **FP16**: 16-bit floating-point arithmetic.
+- **Fused attention**: scores, softmax and value sum in one kernel, with the intermediate results kept in registers instead of written to a scratch buffer between kernels.
 - **Fusion (kernel)**: merging several small GPU kernels that run one after another into a single kernel, to pay the fixed launch latency once.
 - **Gate (attention)**: a factor between 0 and 1 per output element, computed from the current token, that scales an attention head's output.
 - **GB/s**: gigabytes per second, the unit of memory bandwidth.
@@ -4583,6 +5200,7 @@ Alphabetical. Later entries extend this list.
 - **MMA instruction**: "matrix multiply-accumulate", the instruction that drives a tensor core; all 32 threads of a warp execute it together.
 - **mmap**: an operating-system call that makes a file appear as a region of memory, loading pages from disk only when they are touched.
 - **Model card**: the README published with a model.
+- **Monotone (function)**: never decreasing when its input grows; a buffer sized by a formula evaluated at the largest input is large enough only if the formula is monotone.
 - **Mutation check (of a test)**: breaking on purpose the thing a test is meant to guard, in the code or in a model of it, and confirming that the test then fails; a test that still passes does not test that thing.
 - **MXFP8**: an 8-bit floating-point format (E4M3 values) with one power-of-two scale per block of 32 values; the stored format of some weights, and from Step 33 on also used for activations and for matrices converted at load.
 - **NaN**: "not a number", a special floating-point value that marks an undefined result; any arithmetic with a NaN gives NaN, including 0 × NaN.
@@ -4607,6 +5225,7 @@ Alphabetical. Later entries extend this list.
 - **Page cache**: the operating system's in-RAM copy of recently read file data.
 - **Parameters / weights**: the numbers a model learned in training.
 - **Parser (tool-call / reasoning)**: the part of a server that turns the model's raw text into the API's structured fields, such as `tool_calls` and `reasoning_content`.
+- **Per-multiprocessor time (ns per operation per SM)**: a kernel's time multiplied by the number of multiprocessors and divided by the tensor-core operations it issues; it puts kernels of different sizes on one scale and next to what the tensor cores do alone (2.85 ns for bf16 here).
 - **Perplexity / NLL**: NLL (negative log-likelihood) is the average, over the tokens of a text, of minus the log-probability the model gave to the actual next token, in nats per token; perplexity is e to the power of the NLL; lower is better for both.
 - **Per-token context cost**: the bytes of VRAM the engine reserves for each token of context capacity; here mostly the keys and values of the full-attention layer visits.
 - **pip wheel**: a pre-built Python package.
@@ -4626,6 +5245,7 @@ Alphabetical. Later entries extend this list.
 - **Quantisation**: storing numbers in fewer bits to save memory; normally applied to weights ahead of time, and in this model also to activations at run time (see W4A4).
 - **Range (of repeated runs)**: the lowest and the highest result of a series of runs; reported with the median, it shows how far a single run can be trusted.
 - **Raw completion**: generating from given token ids with the output returned as plain text, control tokens included, without the chat template's formatting or a parser; it shows what the model itself produced.
+- **Reasoning effort**: a per-request setting that tells the model how much to think before it answers; the model receives it as text in the prompt, and an engine that is not given one applies a default of its own.
 - **Reasoning tokens (thinking)**: the tokens a model generates to work through a problem before its answer; a server may stream them, return them separately, or hide them, and it usually counts them in the usage figures either way.
 - **Reduction**: combining many values into one, such as a sum or a maximum.
 - **Reduction tree (order of a sum)**: adding many values pairwise in rounds, halving their number each time, instead of one after another; in floating point the result depends on which values are paired, so two kernels must use the same tree to give the same bits.
@@ -4643,6 +5263,7 @@ Alphabetical. Later entries extend this list.
 - **RoPE (rotary position embedding)**: the common way of telling attention where tokens are, by rotating query and key vectors by a position-dependent angle; not used by the main model, but used by the DSpark drafter (Step 19).
 - **Router**: the small network that chooses which experts process a token.
 - **Row (of a step)**: one token of one conversation at one position, processed in an engine step; a step is a list of up to 128 rows.
+- **Row group (attention)**: up to 8 consecutive rows of one conversation that share an attention block, so that the keys and values are read once for all of them; their (row, head) pairs are the columns of the multiplies.
 - **Row-major**: the usual way to store a matrix, one whole row after another.
 - **rpath**: a directory recorded inside a program that tells the loader where to find its shared libraries.
 - **Run (of rows)**: a stretch of consecutive rows in a step that belong to the same conversation at consecutive positions.
@@ -4655,6 +5276,7 @@ Alphabetical. Later entries extend this list.
 - **Server-sent events (SSE)**: a simple way to stream over HTTP: the server keeps the response open and writes one `data: ...` line per piece.
 - **Shared memory (CUDA)**: a small, fast scratch memory visible to all threads of one block.
 - **Single-stream**: serving one request at a time.
+- **Slice-major layout**: packed activations ordered by slice first and by token within a slice, so that a warp that walks through the slices reads a contiguous stretch and one load holds the operands of two column groups.
 - **Sliding-window attention**: attention limited to a fixed number of recent tokens (1024 here).
 - **Slot (conversation slot)**: one of a fixed number of places for a conversation in the engine, each with its own caches and histories; a request occupies one from its first prompt token to its last output token.
 - **Slowloris**: an attack, or a broken client, that keeps server connections busy by sending a request very slowly, a byte at a time, so that each read succeeds just before its timeout; the defence is a deadline for the whole request.
@@ -4669,6 +5291,7 @@ Alphabetical. Later entries extend this list.
 - **Stateful stage**: a stage of a step that reads or writes data kept from one step to the next, such as cached keys and values; it must receive its rows in an order and in portions that keep that data valid, while a stage without state can take any number of rows at once.
 - **Stop sequence**: a string given with a request at which generation ends; the string itself is not part of the reply.
 - **Stream (CUDA)**: a queue of GPU work that runs in the order it was submitted.
+- **Streaming softmax**: a softmax computed in one pass, against a reference score that moves when a much larger score appears, with what has been summed rescaled at that moment; the reference cancels in the final division.
 - **Stride (strided assignment)**: the fixed distance between the items one worker takes; with stride N, worker w takes items w, w + N, w + 2N, ..., so which worker handles an item does not depend on how many items there are.
 - **Sub-batch**: a portion of a step's rows that one stage processes on its own, portion after portion, while the other stages process all rows together; here the attention of a step with more than 128 rows runs in sub-batches of at most 128.
 - **SwiGLU**: the non-linearity inside each expert MLP: the first matrix produces two vectors and one is used to gate the other.
@@ -4709,7 +5332,10 @@ Alphabetical. Later entries extend this list.
 - **W4A4**: 4-bit weights and 4-bit activations; the experts' inputs are quantised at run time as well as their stored weights.
 - **Warp**: 32 GPU threads of a block that execute the same instruction at the same time; the smallest unit the GPU schedules.
 - **Warp shuffle**: an instruction that lets a thread read a register value from another thread of its warp directly, without going through memory.
+- **Warps per multiprocessor (occupancy)**: how many warps of a kernel can be resident on one multiprocessor at once, limited by the registers each thread needs; with few warps, the multiprocessor has nothing to run while one of them waits.
 - **Whole-request throughput**: generated tokens divided by the time from sending the request to the end of the reply; unlike throughput from the first visible token, it includes work the server does before streaming, such as hidden thinking.
+- **Wide task (experts)**: one expert with up to 64 of the tokens routed to it, handled by one set of blocks with the activations gathered once into operand layout; the earlier task had up to 8 tokens.
 - **Worst-case bound (of a grid)**: the largest number of work items that any input can produce, used to size something that must be fixed in advance, such as a kernel's grid in a recorded CUDA graph; the looser the bound, the more blocks are launched that find nothing to do.
+- **Yardstick kernel**: a benchmark kernel that executes only the instruction of interest on registers, with no memory access, to measure the hardware's ceiling for that instruction.
 - **Zero-copy**: using data where it already lies instead of first copying it into another buffer.
 - **Zero-initialisation**: filling newly allocated memory with zeros before first use, so that every element holds a known, finite value.
