@@ -291,16 +291,16 @@ __global__ void k_tasks(const int* ids, int N, int* tasks, int* ntasks) {
     // (dynamic shared memory, TASKS_SHARED bytes: more than a kernel gets without asking)
     extern __shared__ unsigned int tsh[]; unsigned int (*mask)[TMAX / 32] = (unsigned int (*)[TMAX / 32])tsh; unsigned int (*slot)[TMAX / 8] = (unsigned int (*)[TMAX / 8])(tsh + NE * (TMAX / 32));
     __shared__ int wsum_[NE / 32];
-    int e = threadIdx.x;
-    for (int w = 0; w < TMAX / 32; w++) mask[e][w] = 0;
-    for (int w = 0; w < TMAX / 8; w++) slot[e][w] = 0;
+    int e = threadIdx.x; const int MW = (N / TOPK + 31) / 32, SW = (N / TOPK + 7) / 8;      // words in use: a small step should not pay for 512 rows
+    for (int w = 0; w < MW; w++) mask[e][w] = 0;
+    for (int w = 0; w < SW; w++) slot[e][w] = 0;
     __syncthreads();
     for (int n = e; n < N; n += NE) {
         int id = ids[n], t = n / TOPK; if ((unsigned)id >= (unsigned)NE) continue;        // (NaN router scores can leave a pick unset)
         atomicOr(&slot[id][t >> 3], (unsigned)(n % TOPK) << (4 * (t & 7))); atomicOr(&mask[id][t >> 5], 1u << (t & 31));
     }
     __syncthreads();
-    int cnt = 0; for (int w = 0; w < TMAX / 32; w++) cnt += __popc(mask[e][w]);
+    int cnt = 0; for (int w = 0; w < MW; w++) cnt += __popc(mask[e][w]);
     int mine = (cnt + 7) / 8;                              // tasks of this expert: 8 tokens each
     // Tasks are numbered by expert: a running sum over the 128 threads, inside each warp by shuffles.
     int incl = mine;
@@ -309,7 +309,7 @@ __global__ void k_tasks(const int* ids, int N, int* tasks, int* ntasks) {
     __syncthreads();
     int rank = incl - mine; for (int w = 0; w < (e >> 5); w++) rank += wsum_[w];
     int k = 0;                                           // tokens in ascending order, as before
-    for (int w = 0; w < TMAX / 32; w++) {
+    for (int w = 0; w < MW; w++) {
         unsigned int m = mask[e][w];
         while (m) {
             int t = w * 32 + __ffs(m) - 1; m &= m - 1;
@@ -377,16 +377,16 @@ static inline int max_wtasks(int N) { return (N + (WCOLS - 1) * std::min(NE, N))
 __global__ void k_tasks_w(const int* ids, int N, int* tasks, int* ntasks) {
     extern __shared__ unsigned int tsh[]; unsigned int (*mask)[TMAX / 32] = (unsigned int (*)[TMAX / 32])tsh; unsigned int (*slot)[TMAX / 8] = (unsigned int (*)[TMAX / 8])(tsh + NE * (TMAX / 32));
     __shared__ int wsum_[NE / 32][2];
-    int e = threadIdx.x;
-    for (int w = 0; w < TMAX / 32; w++) mask[e][w] = 0;
-    for (int w = 0; w < TMAX / 8; w++) slot[e][w] = 0;
+    int e = threadIdx.x; const int MW = (N / TOPK + 31) / 32, SW = (N / TOPK + 7) / 8;      // words in use: a small step should not pay for 512 rows
+    for (int w = 0; w < MW; w++) mask[e][w] = 0;
+    for (int w = 0; w < SW; w++) slot[e][w] = 0;
     __syncthreads();
     for (int n = e; n < N; n += NE) {
         int id = ids[n], t = n / TOPK; if ((unsigned)id >= (unsigned)NE) continue;
         atomicOr(&slot[id][t >> 3], (unsigned)(n % TOPK) << (4 * (t & 7))); atomicOr(&mask[id][t >> 5], 1u << (t & 31));
     }
     __syncthreads();
-    int cnt = 0; for (int w = 0; w < TMAX / 32; w++) cnt += __popc(mask[e][w]);
+    int cnt = 0; for (int w = 0; w < MW; w++) cnt += __popc(mask[e][w]);
     int mine = (cnt + WCOLS - 1) / WCOLS, mcg = (cnt + 7) / 8;      // this expert's tasks, and its column groups of 8
     int incl = mine, icg = mcg;
     for (int o = 1; o < 32; o <<= 1) { int v = __shfl_up_sync(0xffffffffu, incl, o), c = __shfl_up_sync(0xffffffffu, icg, o); if ((e & 31) >= o) { incl += v; icg += c; } }
@@ -394,7 +394,7 @@ __global__ void k_tasks_w(const int* ids, int N, int* tasks, int* ntasks) {
     __syncthreads();
     int rank = incl - mine, cg0 = icg - mcg; for (int w = 0; w < (e >> 5); w++) { rank += wsum_[w][0]; cg0 += wsum_[w][1]; }
     int k = 0;
-    for (int w = 0; w < TMAX / 32; w++) {
+    for (int w = 0; w < MW; w++) {
         unsigned int m = mask[e][w];
         while (m) {
             int t = w * 32 + __ffs(m) - 1; m &= m - 1;
@@ -1932,7 +1932,7 @@ void gemm_fp8(const Fp8Mat& f, int C, int T, const uint8_t* xcode, const uint8_t
 // packing pays (INK_PACK_MIN to experiment; a large value turns it off).
 const int XPK_C = 4608;
 static uint2* g_xpk[3];
-static int g_attn_group = getenv("INK_ATTN_GROUP") ? atoi(getenv("INK_ATTN_GROUP")) : 16;   // rows from which attention runs in groups of 8 (at most GSUB)
+static int g_attn_group = getenv("INK_ATTN_GROUP") ? atoi(getenv("INK_ATTN_GROUP")) : 17;   // rows from which attention runs in groups of 8 (at most GSUB)
 static int g_xwide = getenv("INK_XWIDE") ? atoi(getenv("INK_XWIDE")) : 48;          // rows from which experts run as wide tasks
 static int g_pack_min = getenv("INK_PACK_MIN") ? atoi(getenv("INK_PACK_MIN")) : 9;
 static int g_bulk_min = getenv("INK_BULK_MIN") ? atoi(getenv("INK_BULK_MIN")) : 9;    // from here on: k_gemm_bf16_bulk (a large value: the older packed kernel)
@@ -2903,10 +2903,12 @@ int ink_step(void* ep, int T, const int* tokens, const int* seqs, const int* pos
     }
     for (int k = (T + 15) / 16; k < TMAX / 16 + 2; k++) gb[k] = ngrp;
     cso[0] = 0; for (int k = 0; k < ngrp; k++) cso[k + 1] = cso[k] + (grp[k].n * 3 + 7) / 8;
-    CK(cudaMemcpyAsync(e->grp, grp, ngrp * sizeof(Grp), cudaMemcpyHostToDevice, g_stream));
-    CK(cudaMemcpyAsync(e->gb, gb, sizeof(gb), cudaMemcpyHostToDevice, g_stream));
-    CK(cudaMemcpyAsync(e->rowg, rowg, T * 4, cudaMemcpyHostToDevice, g_stream));
-    CK(cudaMemcpyAsync(e->cso, cso, (ngrp + 1) * 4, cudaMemcpyHostToDevice, g_stream));
+    if (T >= g_attn_group) {                              // (smaller steps use the one-row attention kernels: no groups, no uploads)
+        CK(cudaMemcpyAsync(e->grp, grp, ngrp * sizeof(Grp), cudaMemcpyHostToDevice, g_stream));
+        CK(cudaMemcpyAsync(e->gb, gb, sizeof(gb), cudaMemcpyHostToDevice, g_stream));
+        CK(cudaMemcpyAsync(e->rowg, rowg, T * 4, cudaMemcpyHostToDevice, g_stream));
+        CK(cudaMemcpyAsync(e->cso, cso, (ngrp + 1) * 4, cudaMemcpyHostToDevice, g_stream));
+    } else cls = 0;
     CK(cudaMemcpyAsync(e->excl, xq, (TMAX + T) * 4, cudaMemcpyHostToDevice, g_stream));
     float sp[2 * TMAX];
     for (int t = 0; t < T; t++) { float tp = temps ? temps[t] : e->def_temp; unsigned sd = seeds ? seeds[t] : e->def_seed; sp[2 * t] = tp > 0 ? 1.0f / tp : 0.0f; memcpy(&sp[2 * t + 1], &sd, 4); }
