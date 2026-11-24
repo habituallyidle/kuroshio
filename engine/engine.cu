@@ -874,6 +874,70 @@ template <int NCG, int U> __global__ void k_gemm_bf16p(const uint16_t* W, int C,
     }
 }
 
+// Activations for k_gemm_bf16_bulk: slice-major, two column groups per 16 bytes. Entry (kb, pair, lane) holds, for
+// the thread at `lane` (g = lane / 4, q = lane % 4), the tensor-core B operand of column groups 2 pair and 2 pair + 1
+// for slice kb: what that thread needs for two operations, in one load. Tokens >= T are zeros.
+__global__ void k_pack_bf16s(const float* x, int xstride, int C, int T, int NP, uint4* out) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x; if (e >= (C / 16) * NP * 32) return;
+    int lane = e & 31, pair = (e >> 5) % NP, kb = (e >> 5) / NP, g = lane >> 2, q = lane & 3; uint32_t v[4] = {0, 0, 0, 0};
+    for (int h = 0; h < 2; h++) {
+        int t = (2 * pair + h) * 8 + g; if (t >= T) continue;
+        const float* r = x + (size_t)t * xstride + kb * 16 + 2 * q; float2 lo = *(const float2*)r, hi = *(const float2*)(r + 8);
+        v[2 * h] = pack_bf16(lo.x, lo.y); v[2 * h + 1] = pack_bf16(hi.x, hi.y);
+    }
+    out[e] = make_uint4(v[0], v[1], v[2], v[3]);
+}
+// k_gemm_bf16p for prompt-sized batches (33 to 64 tokens per launch). What limits these kernels is the number of
+// memory instructions, not the arithmetic: the packed kernel loads 8 bytes of activations per tensor-core operation,
+// and its 16 warps per tile read all tokens' activations at once (295 KB per block at 64 tokens, out of the
+// second-level cache). Here one load serves two operations (k_pack_bf16s), and a warp walks the slices in order, so
+// the warps of a core work in a window of a few KB of activations.
+// A block is BT tiles of 16 weight rows; SP warps per tile each take every SP-th column segment.
+// Same results bit for bit: each output is still the sum, in segment order, of sixteen partial sums, and each
+// partial sum is the same chain of tensor-core operations over the same operands.
+template <int NCG, int BT, int SP> __global__ void k_gemm_bf16_bulk(const uint16_t* W, int C, int T, const uint4* x0, const uint4* x1, const uint4* x2, int r1, int r2,
+                            float* out, int R, int round) {
+    __shared__ float ex[BT * SP * 32 * 4];                // one column group's partial sums of the round, to be added in segment order
+    const int NP = (NCG + 1) / 2;
+    int n0 = (r1 + 15) / 16, n1 = (r2 - r1 + 15) / 16, n2 = (R - r2 + 15) / 16;       // 16-row tiles per input range
+    int b0n = (n0 + BT - 1) / BT, b1n = (n1 + BT - 1) / BT;                           // blocks per range: a block never straddles two
+    int blk = blockIdx.x, tile0, ntile, r0, gt0, rend; const uint4* xb;
+    if (blk < b0n) { tile0 = blk * BT; ntile = n0; r0 = 0; rend = r1; xb = x0; gt0 = 0; }
+    else if (blk < b0n + b1n) { tile0 = (blk - b0n) * BT; ntile = n1; r0 = r1; rend = r2; xb = x1; gt0 = n0; }
+    else { tile0 = (blk - b0n - b1n) * BT; ntile = n2; r0 = r2; rend = R; xb = x2; gt0 = n0 + n1; }
+    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, q = lane & 3, g = lane >> 2, bt = warp / SP, j = warp % SP;
+    int KB = C / 16, kseg = KB / 16, tile = tile0 + bt;
+    const bool work = tile < ntile;
+    const uint4* wt = (const uint4*)((const uint8_t*)W + ((size_t)(gt0 + tile) * KB) * 512 + lane * 16);
+    float tot[NCG][4]; for (int cg = 0; cg < NCG; cg++) for (int i = 0; i < 4; i++) tot[cg][i] = 0;
+    for (int r = 0; r < 16 / SP; r++) {
+        float d[2 * NP][4]; for (int cg = 0; cg < 2 * NP; cg++) for (int i = 0; i < 4; i++) d[cg][i] = 0;
+        if (work) {
+            const int kb0 = (r * SP + j) * kseg;
+            for (int u = 0; u < kseg; u++) {
+                uint4 w = wt[(size_t)(kb0 + u) * 32]; const uint4* xs = xb + (size_t)(kb0 + u) * NP * 32 + lane;
+                for (int p = 0; p < NP; p++) {
+                    uint4 b = xs[p * 32];
+                    mma_bf16(d[2 * p], w.x, w.y, w.z, w.w, b.x, b.y);
+                    if (2 * p + 1 < NCG) mma_bf16(d[2 * p + 1], w.x, w.y, w.z, w.w, b.z, b.w);
+                }
+            }
+        }
+        if (SP == 1) { for (int cg = 0; cg < NCG; cg++) for (int i = 0; i < 4; i++) tot[cg][i] += d[cg][i]; }
+        else for (int cg = 0; cg < NCG; cg++) {          // the round's SP partial sums meet in warp j = 0 of their tile
+            for (int i = 0; i < 4; i++) ex[(warp * 32 + lane) * 4 + i] = d[cg][i];
+            __syncthreads();
+            if (j == 0) for (int jj = 0; jj < SP; jj++) for (int i = 0; i < 4; i++) tot[cg][i] += ex[((warp + jj) * 32 + lane) * 4 + i];
+            __syncthreads();
+        }
+    }
+    if (work && j == 0) for (int cg = 0; cg < NCG; cg++) for (int i = 0; i < 4; i++) {
+        int t = cg * 8 + 2 * q + (i & 1), row = r0 + tile * 16 + g + (i >> 1) * 8;
+        if (t >= T || row >= rend) continue;
+        out[(size_t)t * R + row] = round ? bf16r(tot[cg][i]) : tot[cg][i];
+    }
+}
+
 // MXFP8 activation quantiser emitting E4M3 codes and one exponent byte per 32 values (6.3).
 __device__ __forceinline__ void q8_block(const float* x, uint8_t* code, uint8_t* sc) {
     float bm = 0; for (int i = 0; i < 32; i++) bm = fmaxf(bm, fabsf(x[i]));
@@ -1526,6 +1590,7 @@ void gemm_fp8(const Fp8Mat& f, int C, int T, const uint8_t* xcode, const uint8_t
 const int XPK_C = 4608;
 static uint2* g_xpk[3];
 static int g_pack_min = getenv("INK_PACK_MIN") ? atoi(getenv("INK_PACK_MIN")) : 9;
+static int g_bulk_min = getenv("INK_BULK_MIN") ? atoi(getenv("INK_BULK_MIN")) : 9;    // from here on: k_gemm_bf16_bulk (a large value: the older packed kernel)
 void gemv_scratch() {
     if (g_xpk[0]) return;
     for (int i = 0; i < 3; i++) { CK(cudaMalloc(&g_xpk[i], (size_t)64 * (XPK_C / 4) * sizeof(uint2))); CK(cudaMemset(g_xpk[i], 0, (size_t)64 * (XPK_C / 4) * sizeof(uint2))); }
@@ -1540,6 +1605,35 @@ void gemv(int R, int T, const uint16_t* W, int C, int T2, const float* x0, const
     }
     int nb = (r1 + 15) / 16 + (r2 - r1 + 15) / 16 + (R - r2 + 15) / 16;
     // One kernel per number of 8-token column groups: a step of 17 tokens should not pay for 32.
+    if (T >= g_bulk_min && C <= XPK_C) {                  // prompt-sized batches: k_gemm_bf16_bulk
+        const float* xs[3] = {x0, x1, x2}; const uint4* xp[3]; bool packed[3] = {false, false, false}; const int NP = ((T + 7) / 8 + 1) / 2;
+        for (int i = 0; i < 3; i++) {
+            bool used = i == 0 ? r1 > 0 : i == 1 ? r2 > r1 : R > r2;
+            int same = -1; for (int j = 0; j < i; j++) if (packed[j] && xs[j] == xs[i]) same = j;
+            if (!used) xp[i] = (const uint4*)g_xpk[i];    // never read
+            else if (same >= 0) xp[i] = xp[same];
+            else { k_pack_bf16s<<<((C / 16) * NP * 32 + 255) / 256, 256, 0, g_stream>>>(xs[i], xstride, C, T, NP, (uint4*)g_xpk[i]); xp[i] = (const uint4*)g_xpk[i]; packed[i] = true; }
+        }
+        int nt0 = (r1 + 15) / 16, nt1 = (r2 - r1 + 15) / 16, nt2 = (R - r2 + 15) / 16;
+        // One warp per (tile, column segment in turn). Big matrices: 4 warps per tile (more would only queue); small
+        // ones: all 16 segments at once, or there are too few warps to keep the GPU busy. (Measured at 64 tokens:
+        // 8,600 rows 30 us with 4, 43 with 16; 2,304 rows 31 and 17; the 200,058-row head 625 and 796.)
+        #define BULKS(SP) { \
+            int nbb = nt0 + nt1 + nt2; \
+            switch ((T + 7) / 8) { \
+                case 1: k_gemm_bf16_bulk<1, 1, SP><<<nbb, SP * 32, 0, g_stream>>>(W, C, T, xp[0], xp[1], xp[2], r1, r2, out, R, round); break; \
+                case 2: k_gemm_bf16_bulk<2, 1, SP><<<nbb, SP * 32, 0, g_stream>>>(W, C, T, xp[0], xp[1], xp[2], r1, r2, out, R, round); break; \
+                case 3: k_gemm_bf16_bulk<3, 1, SP><<<nbb, SP * 32, 0, g_stream>>>(W, C, T, xp[0], xp[1], xp[2], r1, r2, out, R, round); break; \
+                case 4: k_gemm_bf16_bulk<4, 1, SP><<<nbb, SP * 32, 0, g_stream>>>(W, C, T, xp[0], xp[1], xp[2], r1, r2, out, R, round); break; \
+                case 5: k_gemm_bf16_bulk<5, 1, SP><<<nbb, SP * 32, 0, g_stream>>>(W, C, T, xp[0], xp[1], xp[2], r1, r2, out, R, round); break; \
+                case 6: k_gemm_bf16_bulk<6, 1, SP><<<nbb, SP * 32, 0, g_stream>>>(W, C, T, xp[0], xp[1], xp[2], r1, r2, out, R, round); break; \
+                case 7: k_gemm_bf16_bulk<7, 1, SP><<<nbb, SP * 32, 0, g_stream>>>(W, C, T, xp[0], xp[1], xp[2], r1, r2, out, R, round); break; \
+                default: k_gemm_bf16_bulk<8, 1, SP><<<nbb, SP * 32, 0, g_stream>>>(W, C, T, xp[0], xp[1], xp[2], r1, r2, out, R, round); break; \
+            } }
+        if (nt0 + nt1 + nt2 > 300) BULKS(4) else BULKS(16)
+        #undef BULKS
+        return;
+    }
     if (T >= g_pack_min && C <= XPK_C) {                  // bigger batches: pack each distinct input once
         const float* xs[3] = {x0, x1, x2}; const uint2* xp[3]; bool packed[3] = {false, false, false};
         for (int i = 0; i < 3; i++) {

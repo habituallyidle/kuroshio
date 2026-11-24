@@ -722,6 +722,9 @@ fn main() -> Result<()> {
                 eprintln!("prompt step of {} rows at {p0}: {:.2} ms", c.len(), t0.elapsed().as_secs_f64() * 1e3);
                 out.extend(std::iter::repeat(0u32).take(c.len()));
             }
+            if skip > 0 && std::env::var("INK_PROF").is_ok() {
+                eng.prof_report((skip / pre[1].clamp(1, engine::PMAX)).max(1)); // per prompt step
+            }
             eng.set_pos(skip);
             for c in ids[skip..n].chunks(chunk) {
                 out.extend(eng.forward(c, None));
