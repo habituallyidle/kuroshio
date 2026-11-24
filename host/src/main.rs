@@ -499,8 +499,8 @@ fn main() -> Result<()> {
             let ctx: usize = args.get(2).map(|s| s.parse()).transpose()?.unwrap_or(1500);
             let dir = weights_dir()?;
             let chat = chat::Chat::load(&dir)?;
-            let ids = chat.encode(&std::fs::read_to_string("docs/ARCHITECTURE.md")?)?;
-            let mut eng = engine::Engine::load(&dir, 8192)?;
+            let ids = chat.encode(&std::fs::read_to_string(std::env::var("INK_TEXT").unwrap_or_else(|_| "docs/ARCHITECTURE.md".into()))?)?;
+            let mut eng = engine::Engine::load(&dir, std::env::var("INK_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(8192))?;
             eng.forward(&ids[..ctx], None);
             // INK_MB_T=1,8,16: the batch sizes to time
             let ts: Vec<usize> = std::env::var("INK_MB_T").ok().map_or(vec![1, 8], |v| v.split(',').filter_map(|x| x.parse().ok()).collect());
