@@ -166,7 +166,7 @@ const GRAPH_ROOM_MIB: usize = 320;
 fn vram_base(slots: usize) -> usize {
     let on = |k: &str| std::env::var(k).is_ok();
     let (kv8, dense8, draft) = (on("INK_KV_FP8"), on("INK_FP8"), !on("INK_NO_DRAFT"));
-    let fixed = 19900 * MIB - if dense8 { 800 * MIB } else { 0 } - if draft { 0 } else { 1100 * MIB };
+    let fixed = 20120 * MIB - if dense8 { 800 * MIB } else { 0 } - if draft { 0 } else { 1100 * MIB };
     let per_slot = if kv8 { 141 } else { 246 } * MIB + if on("INK_NO_PREFIX_CACHE") { 0 } else if kv8 { 136 } else { 231 } * MIB;
     fixed + slots * per_slot
 }

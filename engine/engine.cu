@@ -26,7 +26,7 @@
 namespace {
 cudaStream_t g_stream = nullptr;
 const int D = 2304, H = 24, HKV = 8, DH = 128, DR = 16, EXT = 1024, NE = 128, TOPK = 8, I2 = 1152;
-const int V0 = 200058, NVIS = 48, TMAX = 256;              // TMAX: most rows of one step (a prompt batch)
+const int V0 = 200058, NVIS = 48, TMAX = 512;               // TMAX: most rows of one step (a prompt batch)
 const int HMAX = 128;                                     // most rows of a step that uses the output head (decoding); also the size of an attention
                                                           // sub-batch: a bigger step runs its attention in halves (see forward_body)
 const int QKVR = 8600;                                   // rows of the fused q|r|gate|sink|k|v projection
@@ -287,13 +287,17 @@ __global__ void k_tasks(const int* ids, int N, int* tasks, int* ntasks) {
     // Per expert: which tokens picked it (a bit each: an expert is picked at most once per token) and as which of
     // their 8 picks. Filled by the threads in parallel, 8 picks each at most, so the cost does not grow with the
     // batch the way a scan of all picks by every expert's thread did (20 us at 128 tokens against 5 now, 48 times per step).
-    __shared__ unsigned int mask[NE][TMAX / 32]; __shared__ unsigned char slot[NE][TMAX]; __shared__ int wsum_[NE / 32];
+    // (slot: 4 bits per token, 8 tokens to a word; a byte each would not fit a block's 48 KB with 512 tokens)
+    // (dynamic shared memory, TASKS_SHARED bytes: more than a kernel gets without asking)
+    extern __shared__ unsigned int tsh[]; unsigned int (*mask)[TMAX / 32] = (unsigned int (*)[TMAX / 32])tsh; unsigned int (*slot)[TMAX / 8] = (unsigned int (*)[TMAX / 8])(tsh + NE * (TMAX / 32));
+    __shared__ int wsum_[NE / 32];
     int e = threadIdx.x;
     for (int w = 0; w < TMAX / 32; w++) mask[e][w] = 0;
+    for (int w = 0; w < TMAX / 8; w++) slot[e][w] = 0;
     __syncthreads();
     for (int n = e; n < N; n += NE) {
         int id = ids[n], t = n / TOPK; if ((unsigned)id >= (unsigned)NE) continue;        // (NaN router scores can leave a pick unset)
-        slot[id][t] = (unsigned char)(n % TOPK); atomicOr(&mask[id][t >> 5], 1u << (t & 31));
+        atomicOr(&slot[id][t >> 3], (unsigned)(n % TOPK) << (4 * (t & 7))); atomicOr(&mask[id][t >> 5], 1u << (t & 31));
     }
     __syncthreads();
     int cnt = 0; for (int w = 0; w < TMAX / 32; w++) cnt += __popc(mask[e][w]);
@@ -311,7 +315,7 @@ __global__ void k_tasks(const int* ids, int N, int* tasks, int* ntasks) {
             int t = w * 32 + __ffs(m) - 1; m &= m - 1;
             int* tk = tasks + (rank + k / 8) * TASKW;
             if ((k & 7) == 0) { tk[0] = e; tk[1] = min(8, cnt - k); }
-            tk[2 + (k & 7)] = t * TOPK + slot[e][t]; k++;
+            tk[2 + (k & 7)] = t * TOPK + ((slot[e][t >> 3] >> (4 * (t & 7))) & 15); k++;
         }
     }
     if (e == NE - 1) *ntasks = rank + mine;
@@ -321,6 +325,8 @@ __global__ void k_tasks(const int* ids, int N, int* tasks, int* ntasks) {
 // kernels' grids are this tall, not N: at 128 tokens that is 240 task rows instead of 1,024, mostly empty, each
 // costing a block start.
 static inline int max_tasks(int N) { return (N + 7 * std::min(NE, N)) / 8; }
+
+const size_t TASKS_SHARED = (size_t)NE * (TMAX / 32 + TMAX / 8) * 4;
 
 // Expert GEMM on the tensor cores. One warp = 16 weight rows (operand A); columns (operand B) = the tokens
 // of this task. Grid: (R/128, max tasks). x_per_slot: the activation row is per (token, slot), else per token.
@@ -354,6 +360,100 @@ __global__ void k_expert4_mma(const uint8_t* W, const uint8_t* S, const float* w
         int n = task[2 + c]; float sc = xamax[x_per_slot ? n : n / TOPK] * ws, lo = 0, hi = 0;
         for (int w2 = 0; w2 < nsplit; w2++) { lo += sh[warp + w2][lane][q]; hi += sh[warp + w2][lane][2 + q]; }
         out[(size_t)n * R + r0 + j] = bf16r(lo * sc); out[(size_t)n * R + r0 + j + 8] = bf16r(hi * sc);
+    }
+}
+
+// =====================================================================================================
+// Experts for prompt-sized batches. With 512 rows an expert is picked about 36 times per layer visit, and the task
+// list above cuts that into five tasks of 8 columns, each reading the expert's weights again: the weights go by
+// five times, and every operation costs five loads (weights, their scales, two halves of the activations, their
+// scales). Here a task is an expert with up to 64 of its columns (k_tasks_w), the activations of a task are
+// gathered first into the operand layout, 16 bytes per thread and operation (k_xgather4), and a block reads each
+// slice of weights once for all its column groups. The chain of operations behind every output value is the one
+// k_expert4_mma performs, so results are the same bit for bit.
+// =====================================================================================================
+const int WCOLS = 64, TASKWW = 3 + WCOLS;                 // wide task: expert, columns, first column group, then the picks
+static inline int max_wtasks(int N) { return (N + (WCOLS - 1) * std::min(NE, N)) / WCOLS; }
+__global__ void k_tasks_w(const int* ids, int N, int* tasks, int* ntasks) {
+    extern __shared__ unsigned int tsh[]; unsigned int (*mask)[TMAX / 32] = (unsigned int (*)[TMAX / 32])tsh; unsigned int (*slot)[TMAX / 8] = (unsigned int (*)[TMAX / 8])(tsh + NE * (TMAX / 32));
+    __shared__ int wsum_[NE / 32][2];
+    int e = threadIdx.x;
+    for (int w = 0; w < TMAX / 32; w++) mask[e][w] = 0;
+    for (int w = 0; w < TMAX / 8; w++) slot[e][w] = 0;
+    __syncthreads();
+    for (int n = e; n < N; n += NE) {
+        int id = ids[n], t = n / TOPK; if ((unsigned)id >= (unsigned)NE) continue;
+        atomicOr(&slot[id][t >> 3], (unsigned)(n % TOPK) << (4 * (t & 7))); atomicOr(&mask[id][t >> 5], 1u << (t & 31));
+    }
+    __syncthreads();
+    int cnt = 0; for (int w = 0; w < TMAX / 32; w++) cnt += __popc(mask[e][w]);
+    int mine = (cnt + WCOLS - 1) / WCOLS, mcg = (cnt + 7) / 8;      // this expert's tasks, and its column groups of 8
+    int incl = mine, icg = mcg;
+    for (int o = 1; o < 32; o <<= 1) { int v = __shfl_up_sync(0xffffffffu, incl, o), c = __shfl_up_sync(0xffffffffu, icg, o); if ((e & 31) >= o) { incl += v; icg += c; } }
+    if ((e & 31) == 31) { wsum_[e >> 5][0] = incl; wsum_[e >> 5][1] = icg; }
+    __syncthreads();
+    int rank = incl - mine, cg0 = icg - mcg; for (int w = 0; w < (e >> 5); w++) { rank += wsum_[w][0]; cg0 += wsum_[w][1]; }
+    int k = 0;
+    for (int w = 0; w < TMAX / 32; w++) {
+        unsigned int m = mask[e][w];
+        while (m) {
+            int t = w * 32 + __ffs(m) - 1; m &= m - 1;
+            int* tk = tasks + (rank + k / WCOLS) * TASKWW;
+            if (k % WCOLS == 0) { tk[0] = e; tk[1] = min(WCOLS, cnt - k); tk[2] = cg0 + k / 8; }
+            tk[3 + k % WCOLS] = t * TOPK + ((slot[e][t >> 3] >> (4 * (t & 7))) & 15); k++;
+        }
+    }
+    if (e == NE - 1) *ntasks = rank + mine;
+}
+// The activations of every wide task as tensor-core operands: out[((column group) * KB + slice) * 32 + lane] =
+// { the two 4-byte halves of the thread's operand, its 4 scale bytes, 0 }. Grid (8, wide tasks), 256 threads.
+__global__ void k_xgather4(const int* tasks, const int* ntasks, const uint8_t* xcode, const uint8_t* xscale, int x_per_slot, int C, uint4* out) {
+    if ((int)blockIdx.y >= *ntasks) return;
+    const int* task = tasks + blockIdx.y * TASKWW; int ncols = task[1], cg = blockIdx.x; if (cg * 8 >= ncols) return;
+    int KB = C / 64, nblk = C / 16; uint4* o = out + ((size_t)(task[2] + cg) * KB) * 32;
+    for (int e = threadIdx.x; e < KB * 32; e += 256) {
+        int kb = e >> 5, lane = e & 31, i = lane & 3, c = cg * 8 + (lane >> 2); uint4 v = make_uint4(0, 0, 0, 0);
+        if (c < ncols) {
+            int n = task[3 + c], xj = x_per_slot ? n : n / TOPK; const uint8_t* xc = xcode + (size_t)xj * (C / 2) + 4 * i + kb * 32;
+            v = make_uint4(*(const uint32_t*)xc, *(const uint32_t*)(xc + 16), *(const uint32_t*)(xscale + (size_t)xj * nblk + kb * 4), 0);
+        }
+        o[e] = v;
+    }
+}
+// One warp per 16 weight rows: it goes through the nsplit column segments in turn and adds their partial sums in
+// order, which is what k_expert4_mma's nsplit warps and its exchange through shared memory compute. No block-wide
+// synchronisation, and a warp does hundreds of operations instead of nine: the tensor cores can do one FP4 operation
+// in 1.5 ns per core, and with nine operations per warp the kernel spent 24 ns on each, nearly all of it on starting
+// and finishing blocks.
+__global__ void k_expert4_wide(const uint8_t* W, const uint8_t* S, const float* wamax, float inv_den, const int* tasks, const int* ntasks,
+                               const uint4* XB, const float* xamax, int x_per_slot, int R, int C, float* out, int nsplit) {
+    if ((int)blockIdx.y >= *ntasks) return;
+    const int* task = tasks + blockIdx.y * TASKWW; const int e = task[0], ncols = task[1], ncg = (ncols + 7) / 8;
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, i = lane & 3, j = lane >> 2, rgi = blockIdx.x * (blockDim.x >> 5) + warp, r0 = rgi * 16;
+    if (rgi >= R / 16) return;
+    int KB = C / 64, kseg = KB / nsplit;
+    const uint4* wt = (const uint4*)(W + (((size_t)e * (R / 16) + rgi) * KB) * 512 + lane * 16);
+    const uint32_t* st = (const uint32_t*)(S + (((size_t)e * (R / 16) + rgi) * KB) * 64 + (j * 2 + (lane & 1)) * 4);
+    const uint4* xb = XB + ((size_t)task[2] * KB) * 32 + lane;
+    float tot[WCOLS / 8][4]; for (int cg = 0; cg < WCOLS / 8; cg++) for (int q = 0; q < 4; q++) tot[cg][q] = 0;
+    for (int sgm = 0; sgm < nsplit; sgm++) {
+        float d[WCOLS / 8][4]; for (int cg = 0; cg < WCOLS / 8; cg++) for (int q = 0; q < 4; q++) d[cg][q] = 0;
+        for (int it = 0; it < kseg; it++) {
+            int kb = sgm * kseg + it; uint4 w = wt[(size_t)kb * 32]; uint32_t sa = st[(size_t)kb * 16];
+            #pragma unroll
+            for (int cg = 0; cg < WCOLS / 8; cg++) if (cg < ncg) { uint4 b = xb[((size_t)cg * KB + kb) * 32]; mma_fp4(d[cg], w.x, w.y, w.z, w.w, b.x, b.y, sa, b.z); }   // (a fixed trip count keeps d in registers)
+        }
+        for (int cg = 0; cg < WCOLS / 8; cg++) for (int q = 0; q < 4; q++) tot[cg][q] += d[cg][q];
+    }
+    float ws = wamax[e] * (inv_den * (1.0f / 1536.0f));
+    #pragma unroll
+    for (int cg = 0; cg < WCOLS / 8; cg++) {
+        if (cg >= ncg) break;
+        for (int q = 0; q < 2; q++) {                    // this lane holds columns 2i, 2i+1 of the group, rows j and j+8
+            int c = cg * 8 + 2 * i + q; if (c >= ncols) continue;
+            int n = task[3 + c]; float sc = xamax[x_per_slot ? n : n / TOPK] * ws;
+            out[(size_t)n * R + r0 + j] = bf16r(tot[cg][q] * sc); out[(size_t)n * R + r0 + j + 8] = bf16r(tot[cg][2 + q] * sc);
+        }
     }
 }
 
@@ -562,7 +662,7 @@ __global__ void k_attn_prep(const float* proj, const float* qscale, const float*
 
 // Router top-8 for all T tokens, then the expert task list, in one single-block launch.
 __global__ void k_route_tasks(const float* logit, const float* rbias, int T, int* ids, float* gamma, int* tasks, int* ntasks) {
-    __shared__ float sel[NE]; __shared__ float sg[TOPK]; __shared__ int sid[TMAX * TOPK]; __shared__ int nt[NE];
+    __shared__ float sel[NE]; __shared__ float sg[TOPK]; __shared__ int sid[HMAX * TOPK]; __shared__ int nt[NE];   // (launched for one token only)
     int e = threadIdx.x;
     for (int t = 0; t < T; t++) {
         float l = logit[(size_t)t * NE + e];
@@ -573,7 +673,7 @@ __global__ void k_route_tasks(const float* logit, const float* rbias, int T, int
         if (e < TOPK) { float s = 0; for (int k = 0; k < TOPK; k++) s += sg[k]; gamma[t * TOPK + e] = sg[e] / s * 8.0f; }
         __syncthreads();
     }
-    int N = T * TOPK, cols[TMAX], cnt = 0;
+    int N = T * TOPK, cols[HMAX], cnt = 0;
     for (int n = 0; n < N; n++) if (sid[n] == e) cols[cnt++] = n;
     nt[e] = (cnt + 7) / 8; __syncthreads();
     int rank = 0; for (int j = 0; j < e; j++) rank += nt[j];
@@ -1706,6 +1806,7 @@ void gemm_fp8(const Fp8Mat& f, int C, int T, const uint8_t* xcode, const uint8_t
 const int XPK_C = 4608;
 static uint2* g_xpk[3];
 static int g_attn_group = getenv("INK_ATTN_GROUP") ? atoi(getenv("INK_ATTN_GROUP")) : 16;   // rows from which attention runs in groups of 8 (at most GSUB)
+static int g_xwide = getenv("INK_XWIDE") ? atoi(getenv("INK_XWIDE")) : 48;          // rows from which experts run as wide tasks
 static int g_pack_min = getenv("INK_PACK_MIN") ? atoi(getenv("INK_PACK_MIN")) : 9;
 static int g_bulk_min = getenv("INK_BULK_MIN") ? atoi(getenv("INK_BULK_MIN")) : 9;    // from here on: k_gemm_bf16_bulk (a large value: the older packed kernel)
 void gemv_scratch() {
@@ -1861,7 +1962,7 @@ struct Engine {
     // scratch
     float *stack[5], *prelude_partial, *bank[2], *prelude_dests, *inputs, *msg, *xin, *proj, *dk, *dv, *qc, *bias, *att_sc, *att_l, *att_y,
           *attn_raw, *attn_out, *mixtmp, *pair, *hbuf, *gx, *mlp_in, *rlogit, *gamma, *xq, *xamax, *gu, *act, *aq, *aamax, *down, *moe_out, *y, *out, *logits;
-    int *tok, *ids, *arg, *tasks, *ntasks; Row* rows;      // rows: per-row conversation and position of the current step
+    int *tok, *ids, *arg, *tasks, *ntasks, *tasksw = nullptr; uint4* xb = nullptr; Row* rows;   // tasksw, xb: wide expert tasks and their gathered activations      // rows: per-row conversation and position of the current step
     Grp* grp = nullptr; int* gb = nullptr;                 // the step's row groups for attention (see k_attn_scores_g)
     uint8_t* snap = nullptr; size_t snap_bytes = 0; bool vis_global[NVIS] = {}, snap_ok[MAXSEQ] = {}; int last_T = 0;   // prefix-cache snapshots: [conversations][snap_bytes]
     int* qrow = nullptr; float* rowz = nullptr; ResPart* rparts = nullptr;   // per row: index of the sampled draft it verifies (-1: none); normaliser of p; scratch
@@ -2129,6 +2230,8 @@ size_t ink_vram_free() { size_t fr = 0, tot = 0; CK(cudaMemGetInfo(&fr, &tot)); 
 void* ink_new(int max_ctx, int nseq, int reserve_mib) {
     auto* e = new Engine(); CK(cudaStreamCreate(&g_stream));
     gemv_scratch();
+    CK(cudaFuncSetAttribute(k_tasks, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)TASKS_SHARED));
+    CK(cudaFuncSetAttribute(k_tasks_w, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)TASKS_SHARED));
     e->max_ctx = std::max(CTX_STEP, (max_ctx + CTX_STEP - 1) / CTX_STEP * CTX_STEP); e->nseq = std::min(MAXSEQ, std::max(1, nseq));
     e->reserve_bytes = (size_t)std::max(0, reserve_mib) << 20;
     return e;
@@ -2373,6 +2476,7 @@ void ink_finalize(void* ep) {
     CK(cudaMalloc(&e->h_pi, (size_t)FAST_T * HEAD_PARTS * 2 * 4)); CK(cudaMalloc(&e->h_win, 2 * FAST_T * 4)); CK(cudaMalloc(&e->h_l1, 2 * FAST_T * 4));
     CK(cudaMalloc(&e->h_l2, CAND_CAP * 4)); CK(cudaMalloc(&e->h_cnt, 4)); CK(cudaMemset(e->h_cnt, 0, 4)); CK(cudaMemset(e->h_l2, 0, CAND_CAP * 4));
     CK(cudaMalloc(&e->tasks, T * TOPK * TASKW * 4)); CK(cudaMalloc(&e->ntasks, 4));
+    CK(cudaMalloc(&e->tasksw, (size_t)max_wtasks(TMAX * TOPK) * TASKWW * 4)); CK(cudaMalloc(&e->xb, (size_t)max_tasks(TMAX * TOPK) * (D / 64) * 32 * sizeof(uint4)));
     CK(cudaMalloc(&e->xcode, T * (D / 2))); CK(cudaMalloc(&e->xscale, T * (D / 16)));
     CK(cudaMalloc(&e->xcode8, T * D)); CK(cudaMalloc(&e->acode8, T * TOPK * I2));
     CK(cudaMalloc(&e->acode, T * TOPK * (I2 / 2))); CK(cudaMalloc(&e->ascale, T * TOPK * (I2 / 16)));
@@ -2562,10 +2666,13 @@ static void forward_body(Engine* e, int T, int gchunks, int hm, int cls) {
             // ---- MoE (5, 6)
             gemv(NE, T, L.router, D, T, e->mlp_in, e->mlp_in, e->mlp_in, D, NE, NE, e->rlogit, NE, 0);
             prof("router gemv");
+            const bool wide = T >= g_xwide && !L.fp8;   // big batches: tasks of up to 64 columns per expert (k_expert4_wide)
+            const int NTW = max_wtasks(N); static const int XWB = getenv("INK_XWB") ? atoi(getenv("INK_XWB")) : 8;   // warps (16-row tiles) per block of the wide kernel
             if (T == 1) k_route_tasks<<<1, NE, 0, g_stream>>>(e->rlogit, L.rbias, T, e->ids, e->gamma, e->tasks, e->ntasks);
             else {                                       // one block per token routes in parallel, then one block groups by expert
                 k_route<<<T, NE, 0, g_stream>>>(e->rlogit, L.rbias, e->ids, e->gamma);
-                k_tasks<<<1, NE, 0, g_stream>>>(e->ids, T * TOPK, e->tasks, e->ntasks);
+                if (wide) k_tasks_w<<<1, NE, TASKS_SHARED, g_stream>>>(e->ids, T * TOPK, e->tasksw, e->ntasks);
+                else k_tasks<<<1, NE, TASKS_SHARED, g_stream>>>(e->ids, T * TOPK, e->tasks, e->ntasks);
             }
             prof("router");
             if (L.fp8) {
@@ -2578,12 +2685,18 @@ static void forward_body(Engine* e, int T, int gchunks, int hm, int cls) {
                 if (q4_native) k_quant4f<<<T + pf_blocks(pq, D / 4), D / 4, 0, g_stream>>>(e->mlp_in, D, e->xamax, e->xcode, e->xscale, pq);
                 else k_quant4c<<<T + pf_blocks(pq, 256), 256, 0, g_stream>>>(e->mlp_in, D, e->xamax, e->xcode, e->xscale, pq);
                 prof("x quant4");
-                k_expert4_mma<<<dim3(D / 32, NTK), 256, 0, g_stream>>>(L.w13, L.w13s, L.w13amax, L.inv_den13, e->tasks, e->ntasks, e->xcode, e->xscale, e->xamax, 0, D, D, e->gu, 4);
+                if (wide) {
+                    k_xgather4<<<dim3(WCOLS / 8, NTW), 256, 0, g_stream>>>(e->tasksw, e->ntasks, e->xcode, e->xscale, 0, D, e->xb);
+                    k_expert4_wide<<<dim3(D / 16 / XWB, NTW), XWB * 32, 0, g_stream>>>(L.w13, L.w13s, L.w13amax, L.inv_den13, e->tasksw, e->ntasks, e->xb, e->xamax, 0, D, D, e->gu, 4);
+                } else k_expert4_mma<<<dim3(D / 32, NTK), 256, 0, g_stream>>>(L.w13, L.w13s, L.w13amax, L.inv_den13, e->tasks, e->ntasks, e->xcode, e->xscale, e->xamax, 0, D, D, e->gu, 4);
                 prof("x mma w13");
                 if (q4_native) k_swiglu_quant4f<<<N + pf_blocks(ps, I2 / 4), I2 / 4, 0, g_stream>>>(e->gu, e->gamma, e->aamax, e->acode, e->ascale, ps);
                 else k_swiglu_quant4<<<N + pf_blocks(ps, 256), 256, 0, g_stream>>>(e->gu, e->gamma, e->aamax, e->acode, e->ascale, ps);
                 prof("x swiglu+quant");
-                k_expert4_mma<<<dim3(D / 64, NTK), 256, 0, g_stream>>>(L.w2, L.w2s, L.w2amax, L.inv_den2, e->tasks, e->ntasks, e->acode, e->ascale, e->aamax, 1, D, I2, e->down, 2);
+                if (wide) {
+                    k_xgather4<<<dim3(WCOLS / 8, NTW), 256, 0, g_stream>>>(e->tasksw, e->ntasks, e->acode, e->ascale, 1, I2, e->xb);
+                    k_expert4_wide<<<dim3(D / 16 / XWB, NTW), XWB * 32, 0, g_stream>>>(L.w2, L.w2s, L.w2amax, L.inv_den2, e->tasksw, e->ntasks, e->xb, e->aamax, 1, D, I2, e->down, 2);
+                } else k_expert4_mma<<<dim3(D / 64, NTK), 256, 0, g_stream>>>(L.w2, L.w2s, L.w2amax, L.inv_den2, e->tasks, e->ntasks, e->acode, e->ascale, e->aamax, 1, D, I2, e->down, 2);
                 prof("x mma w2");
             }
             prof("experts fp8");
@@ -2899,7 +3012,7 @@ void ink_microbench(void* ep, int T) {
     if (T == 1) mbench("route top-8 + task list", 0, [&](int r) { Layer& L = e->L[r % 24]; k_route_tasks<<<1, NE, 0, g_stream>>>(e->rlogit, L.rbias, T, e->ids, e->gamma, e->tasks, e->ntasks); });
     else {
         mbench("route top-8", 0, [&](int r) { Layer& L = e->L[r % 24]; k_route<<<T, NE, 0, g_stream>>>(e->rlogit, L.rbias, e->ids, e->gamma); });
-        mbench("task list", 0, [&](int) { k_tasks<<<1, NE, 0, g_stream>>>(e->ids, T * TOPK, e->tasks, e->ntasks); });
+        mbench("task list", 0, [&](int) { k_tasks<<<1, NE, TASKS_SHARED, g_stream>>>(e->ids, T * TOPK, e->tasks, e->ntasks); });
     }
     mbench("quantise x to NVFP4", 0, [&](int) { k_quant4c<<<T, 256, 0, g_stream>>>(e->mlp_in, D, e->xamax, e->xcode, e->xscale, PF{nullptr, 0, T}); });
     mbench("quantise x to NVFP4 (native cvt)", 0, [&](int) { k_quant4f<<<T, D / 4, 0, g_stream>>>(e->mlp_in, D, e->xamax, e->xcode, e->xscale, PF{nullptr, 0, T}); });

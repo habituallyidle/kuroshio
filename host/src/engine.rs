@@ -35,7 +35,7 @@ pub const VOCAB: usize = 200_058;
 /// Most rows of a step that uses the output head (the engine calls this HMAX; its own TMAX is `PMAX` here).
 pub const TMAX: usize = 128;
 /// Most rows of a step that does not use the output head (prompt rows only).
-pub const PMAX: usize = 256;
+pub const PMAX: usize = 512;
 /// Whether drafts for a conversation at this temperature are sampled from the drafter's distribution (and accepted
 /// with probability min(1, p/q)) instead of being its most likely tokens. Off unless asked for (`--sampled-drafts`,
 /// INK_SAMPLED_DRAFTS=1): on Inkling 2 Mini it was measured to be no faster than most-likely-token drafts once the
